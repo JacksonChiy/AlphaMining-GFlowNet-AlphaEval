@@ -20,6 +20,8 @@ class LightGBMConfig:
     learning_rate: float = 0.03
     n_estimators: int = 500
     seed: int = 42
+    prediction_start_date: str | None = None
+    prediction_end_date: str | None = None
 
 
 class LightGBMFusion:
@@ -65,9 +67,27 @@ class LightGBMFusion:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        start = self.config.min_train_days
-        while start < len(dates):
-            test_end = min(start + self.config.refit_interval_days, len(dates))
+        prediction_start_index, prediction_end_index = self._prediction_indices(
+            dates,
+            self.config.min_train_days,
+            self.config.prediction_start_date,
+            self.config.prediction_end_date,
+        )
+        print(
+            "[LightGBM] rolling_setup "
+            f"merged_rows={len(data):,} dates={len(dates)} factors={len(self.feature_names)} "
+            f"min_train_days={self.config.min_train_days} "
+            f"prediction_start={self.config.prediction_start_date} "
+            f"prediction_end={self.config.prediction_end_date}",
+            flush=True,
+        )
+
+        start = prediction_start_index
+        window_index = 0
+        while start < prediction_end_index:
+            test_end = min(
+                start + self.config.refit_interval_days, prediction_end_index
+            )
             # Purge `horizon` dates so no training label overlaps the prediction period.
             train_end = start - self.config.horizon
             train_start = max(0, train_end - self.config.train_window_days)
@@ -79,8 +99,22 @@ class LightGBMFusion:
             train = data[data["date"].isin(train_dates)].dropna(subset=["target"])
             test = data[data["date"].isin(test_dates)].copy()
             if train.empty or test.empty:
+                print(
+                    f"[LightGBM] window_skipped start_index={start} "
+                    f"train_rows={len(train)} test_rows={len(test)}",
+                    flush=True,
+                )
                 start = test_end
                 continue
+            window_index += 1
+            print(
+                f"[LightGBM] window_start index={window_index:03d} "
+                f"train={pd.Timestamp(train_dates[0]).date()}.."
+                f"{pd.Timestamp(train_dates[-1]).date()} rows={len(train):,} "
+                f"test={pd.Timestamp(test_dates[0]).date()}.."
+                f"{pd.Timestamp(test_dates[-1]).date()} rows={len(test):,}",
+                flush=True,
+            )
             model = lgb.LGBMRegressor(
                 objective="regression_l2",
                 n_estimators=self.config.n_estimators,
@@ -111,11 +145,22 @@ class LightGBMFusion:
                 "test_rows": float(len(test)),
             })
             self.models.append(model)
+            print(
+                f"[LightGBM] window_complete index={window_index:03d} "
+                f"rank_ic={self.metrics[-1]['rank_ic']:.6f}",
+                flush=True,
+            )
             start = test_end
 
         if not predictions:
+            available_start = str(pd.Timestamp(dates[0]).date()) if len(dates) else "N/A"
+            available_end = str(pd.Timestamp(dates[-1]).date()) if len(dates) else "N/A"
             raise ValueError(
-                "No rolling prediction window was produced. Provide more dates or reduce min_train_days."
+                "No rolling prediction window was produced. "
+                f"merged_dates={len(dates)}, available={available_start}..{available_end}, "
+                f"min_train_days={self.config.min_train_days}, "
+                f"prediction_start_date={self.config.prediction_start_date}. "
+                "The price/factor matrix must include the training history before the prediction start."
             )
         prediction = pd.concat(predictions, ignore_index=True)
         prediction["prediction_rank"] = prediction.groupby("date", observed=True)["prediction_score"].rank(
@@ -148,6 +193,25 @@ class LightGBMFusion:
         if not np.isfinite(std) or std <= 1e-12:
             return pd.Series(0.0, index=values.index)
         return (values - values.mean()) / std
+
+    @staticmethod
+    def _prediction_indices(
+        dates: np.ndarray,
+        min_train_days: int,
+        prediction_start_date: str | None,
+        prediction_end_date: str | None,
+    ) -> tuple[int, int]:
+        index = pd.DatetimeIndex(dates)
+        start = min_train_days
+        if prediction_start_date is not None:
+            start = max(
+                start,
+                int(index.searchsorted(pd.Timestamp(prediction_start_date), side="left")),
+            )
+        end = len(index)
+        if prediction_end_date is not None:
+            end = int(index.searchsorted(pd.Timestamp(prediction_end_date), side="right"))
+        return start, end
 
     @staticmethod
     def load(path: str | Path) -> dict[str, object]:

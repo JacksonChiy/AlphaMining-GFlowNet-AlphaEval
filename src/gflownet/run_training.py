@@ -10,7 +10,7 @@ import torch
 from src.gflownet.model import GFlowNetPolicy, PolicyConfig
 from src.gflownet.reward import RewardEvaluator
 from src.gflownet.trainer import GFlowNetTrainer, TrainerConfig, save_alpha_pool
-from src.utils import create_experiment, load_config, seed_everything
+from src.utils import create_experiment, load_config, seed_everything, slice_date_range
 
 
 def gpu_report(require_a100: bool = False) -> dict[str, str | bool | float]:
@@ -51,7 +51,19 @@ def run(config_path: str, require_a100: bool = True, pool_size: int = 100) -> Pa
         f"stocks={data['code'].nunique()}",
         flush=True,
     )
-    evaluator = RewardEvaluator(data, **config["reward"])
+    mining_data = slice_date_range(
+        data,
+        config["dataset"].get("mining_start_date"),
+        config["dataset"].get("mining_end_date"),
+        label="GFlowNet mining data",
+    )
+    print(
+        f"[GFlowNet] mining_data rows={len(mining_data)} "
+        f"dates={mining_data['date'].nunique()} "
+        f"start={mining_data['date'].min()} end={mining_data['date'].max()}",
+        flush=True,
+    )
+    evaluator = RewardEvaluator(mining_data, **config["reward"])
     policy_values = dict(config["model"])
     policy_values.pop("name", None)
     model = GFlowNetPolicy(PolicyConfig(**policy_values))
@@ -72,7 +84,25 @@ def run(config_path: str, require_a100: bool = True, pool_size: int = 100) -> Pa
     loaded = GFlowNetTrainer.load_checkpoint("checkpoints/gflownet_best.pt", evaluator)
     print(f"[GFlowNet] alpha_pool_generation_start target_size={pool_size}", flush=True)
     pool = loaded.generate_pool(size=pool_size)
-    metadata, _ = save_alpha_pool(pool, data, min_coverage=evaluator.min_coverage)
+    metadata, factor_matrix = save_alpha_pool(
+        pool, data, min_coverage=evaluator.min_coverage
+    )
+    oos_start = config["dataset"].get("out_of_sample_start_date")
+    oos_end = config["dataset"].get("out_of_sample_end_date")
+    if oos_start is not None or oos_end is not None:
+        oos_matrix = slice_date_range(
+            factor_matrix,
+            oos_start,
+            oos_end,
+            label="out-of-sample factor matrix",
+        )
+        oos_path = Path("results/alpha_factor_matrix_oos.pkl")
+        oos_matrix.to_pickle(oos_path)
+        print(
+            f"[GFlowNet] oos_factor_matrix rows={len(oos_matrix)} "
+            f"dates={oos_matrix['date'].nunique()} path={oos_path}",
+            flush=True,
+        )
     metadata.to_csv(experiment_dir / "factor_results.csv", index=False)
     print(
         f"[GFlowNet] alpha_pool_generation_complete factors={len(metadata)} "

@@ -5,7 +5,7 @@ import argparse
 import pandas as pd
 
 from src.alpha_eval import AlphaEval, AlphaEvalConfig
-from src.utils import load_config
+from src.utils import load_config, slice_date_range
 
 
 def main() -> None:
@@ -21,6 +21,18 @@ def main() -> None:
     values["horizon"] = int(config["dataset"]["horizon"])
     price = pd.read_pickle(args.price)
     factors = pd.read_pickle(args.factors)
+    price = slice_date_range(
+        price,
+        config["dataset"].get("mining_start_date"),
+        config["dataset"].get("mining_end_date"),
+        label="AlphaEval price data",
+    )
+    factors = slice_date_range(
+        factors,
+        config["dataset"].get("mining_start_date"),
+        config["dataset"].get("mining_end_date"),
+        label="AlphaEval factor data",
+    )
     metadata = pd.read_csv(args.metadata)
     result = AlphaEval(price, factors, AlphaEvalConfig(**values)).evaluate(metadata, args.output)
     print(result.head(20).to_string(index=False))
@@ -28,4 +40,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
