@@ -12,7 +12,7 @@ from src.alpha_eval import AlphaEval, AlphaEvalConfig
 from src.data_loader import prepare_price_csv
 from src.gflownet.run_training import run as run_gflownet
 from src.model import LightGBMConfig, LightGBMFusion
-from src.utils import load_config
+from src.utils import load_config, slice_date_range
 
 
 def main() -> None:
@@ -49,7 +49,21 @@ def main() -> None:
     metadata = pd.read_csv("results/alpha_pool.csv")
     eval_values = dict(config["alpha_eval"])
     eval_values["horizon"] = config["dataset"]["horizon"]
-    evaluation = AlphaEval(price, factor_matrix, AlphaEvalConfig(**eval_values)).evaluate(metadata)
+    mining_price = slice_date_range(
+        price,
+        config["dataset"].get("mining_start_date"),
+        config["dataset"].get("mining_end_date"),
+        label="AlphaEval price data",
+    )
+    mining_factors = slice_date_range(
+        factor_matrix,
+        config["dataset"].get("mining_start_date"),
+        config["dataset"].get("mining_end_date"),
+        label="AlphaEval factor data",
+    )
+    evaluation = AlphaEval(
+        mining_price, mining_factors, AlphaEvalConfig(**eval_values)
+    ).evaluate(metadata)
     selected = evaluation.loc[evaluation["dpp_selected"].astype(bool), "factor"].tolist()
     prediction = LightGBMFusion(LightGBMConfig(**config["lightgbm"])).fit_predict(
         price, factor_matrix, selected, "results/lightgbm"

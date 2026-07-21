@@ -35,7 +35,7 @@
 - PyTorch 版本；
 - A100 强制校验结果。
 
-Notebook 默认 `FAST_MODE=True`，使用 `configs/quick_training_config.yaml` 快速生成首个模型：分块读取大型 CSV，仅保留 2024 年以来的数据，并以前置的 2023 年下半年成交额选择 800 只股票，避免使用回测期未来数据选择股票池；GFlowNet 使用 8 个 epoch、每轮 16 条轨迹，最终生成 20 个因子。流程验证完成后把 `FAST_MODE=False`，即可切换到 `configs/training_config.yaml` 的正式全量训练。
+Notebook 默认 `FAST_MODE=True`，使用 `configs/quick_training_config.yaml` 快速生成首个模型：分块读取 2021 年以来的数据，并使用 2020 年下半年成交额选择 800 只股票；GFlowNet Reward 和 AlphaEval 只使用 2021–2022 年，避免样本外泄漏。选出的表达式会在 2021–2026 完整序列上重新计算，以保留时间序列算子的历史预热；LightGBM 使用 2023 年以前的数据建立初始模型，只输出 2023 年以后的预测分数供回测。GFlowNet 使用 8 个 epoch、每轮 16 条轨迹，最终生成 20 个因子。流程验证完成后把 `FAST_MODE=False`，即可切换到 `configs/training_config.yaml` 的正式全量训练。
 
 本地数据准备与单元测试：
 
@@ -176,6 +176,7 @@ results/gflownet_training_metrics.csv
 results/gflownet_trajectory_metrics.csv
 results/alpha_pool.csv
 results/alpha_factor_matrix.pkl
+results/alpha_factor_matrix_oos.pkl
 results/alpha_eval_result.csv
 results/lightgbm/lgbm_model.joblib
 results/lightgbm/model_metrics.csv
