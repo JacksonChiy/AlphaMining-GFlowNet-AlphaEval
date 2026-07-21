@@ -29,9 +29,8 @@ def _daily_corr(work: pd.DataFrame, method: str, min_cross_section: int) -> pd.S
     valid = work.dropna(subset=["factor", "target"])
     counts = valid.groupby("date", observed=True).size()
     valid = valid[valid["date"].isin(counts[counts >= min_cross_section].index)]
-    return valid.groupby("date", observed=True).apply(
-        lambda x: x["factor"].corr(x["target"], method=method),
-        include_groups=False,
+    return valid.groupby("date", observed=True)[["factor", "target"]].apply(
+        lambda x: x["factor"].corr(x["target"], method=method)
     ).dropna()
 
 
@@ -160,7 +159,7 @@ class AlphaEval:
             cutoff = group["factor"].quantile(1.0 - self.config.top_quantile)
             return float(group.loc[group["factor"] >= cutoff, "target"].mean() - group["target"].mean())
 
-        returns = work.dropna().groupby("date", observed=True).apply(daily, include_groups=False).dropna()
+        returns = work.dropna().groupby("date", observed=True)[["factor", "target"]].apply(daily).dropna()
         std = float(returns.std(ddof=1)) if len(returns) > 1 else 0.0
         return float(returns.mean() / std * math.sqrt(252 / self.config.horizon)) if std > 0 else 0.0
 
@@ -192,9 +191,10 @@ class AlphaEval:
 
     def _dpp_kernel(self, result: pd.DataFrame) -> tuple[np.ndarray, pd.DataFrame]:
         values = self.data[self.factor_names].copy()
-        values = values.groupby(self.data["date"], observed=True).transform(
-            lambda x: (x - x.mean()) / x.std(ddof=1) if x.std(ddof=1) > 0 else 0.0
-        ).fillna(0.0)
+        grouped = values.groupby(self.data["date"], observed=True)
+        means = grouped.transform("mean")
+        stds = grouped.transform("std").replace(0.0, np.nan)
+        values = ((values - means) / stds).replace([np.inf, -np.inf], np.nan).fillna(0.0)
         matrix = values.to_numpy(float)
         norms = np.linalg.norm(matrix, axis=0)
         matrix = matrix / np.where(norms > EPS, norms, 1.0)
@@ -219,4 +219,3 @@ class AlphaEval:
         series = pd.Series(values, dtype=float)
         std = series.std(ddof=0)
         return (series - series.mean()) / std if std > EPS else pd.Series(0.0, index=series.index)
-

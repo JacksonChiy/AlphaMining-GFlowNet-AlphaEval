@@ -40,8 +40,11 @@ class LightGBMFusion:
     ) -> pd.DataFrame:
         try:
             import lightgbm as lgb
-        except ImportError as exc:
-            raise RuntimeError("Install requirements.txt before LightGBM training") from exc
+        except (ImportError, OSError) as exc:
+            raise RuntimeError(
+                "LightGBM could not be loaded. Install requirements.txt; on macOS also install "
+                "the OpenMP runtime (for example, `brew install libomp`)."
+            ) from exc
 
         keys = ["date", "code"]
         all_factors = [column for column in factors.columns if column not in keys]
@@ -95,9 +98,8 @@ class LightGBMFusion:
             test["prediction_score"] = model.predict(test[self.feature_names])
             predictions.append(test[keys + ["target", "prediction_score"]])
             valid = test.dropna(subset=["target", "prediction_score"])
-            daily_ic = valid.groupby("date", observed=True).apply(
-                lambda x: x["prediction_score"].corr(x["target"], method="spearman"),
-                include_groups=False,
+            daily_ic = valid.groupby("date", observed=True)[["prediction_score", "target"]].apply(
+                lambda x: x["prediction_score"].corr(x["target"], method="spearman")
             ).dropna()
             self.metrics.append({
                 "train_start": str(pd.Timestamp(train_dates[0]).date()),
@@ -147,4 +149,3 @@ class LightGBMFusion:
     @staticmethod
     def load(path: str | Path) -> dict[str, object]:
         return joblib.load(Path(path))
-

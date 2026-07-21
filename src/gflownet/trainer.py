@@ -52,7 +52,10 @@ class GFlowNetTrainer:
             weight_decay=config.weight_decay,
         )
         self.amp_enabled = bool(config.mixed_precision and self.device.type == "cuda")
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp_enabled)
+        if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+            self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp_enabled)
+        else:  # PyTorch 2.2 compatibility
+            self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp_enabled)
         self.vocabulary = Vocabulary()
         self.rng = np.random.default_rng(config.seed)
         self.history: list[dict[str, float]] = []
@@ -204,4 +207,3 @@ def save_alpha_pool(
     metadata.to_csv(metadata_path, index=False)
     matrix.to_pickle(matrix_path)
     return metadata, matrix
-
