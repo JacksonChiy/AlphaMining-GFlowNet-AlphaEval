@@ -59,11 +59,34 @@ def test_training_prints_epoch_metrics(
     output = capsys.readouterr().out
 
     assert "[GFlowNet] training_start" in output
+    assert "[GFlowNet] epoch_start epoch=001/001" in output
+    assert "[GFlowNet] trajectory epoch=001/001 step=001/001" in output
+    assert "global_step=00001/00001" in output
+    assert "progress=100.00%" in output
+    assert "expression=" in output
+    assert "tb_loss=" in output
     assert "epoch=001/001" in output
     assert "mean_reward=" in output
     assert "checkpoint=saved" in output
     assert "[GFlowNet] training_complete" in output
     assert checkpoint.exists()
+    assert len(trainer.trajectory_history) == 1
+    assert {
+        "epoch",
+        "step",
+        "global_step",
+        "progress_pct",
+        "expression",
+        "action_count",
+        "reward",
+        "rank_ic",
+        "long_ir",
+        "risk_penalty",
+        "log_pf",
+        "tb_loss",
+        "trajectory_seconds",
+        "elapsed_seconds",
+    }.issubset(trainer.trajectory_history[0])
     assert {
         "learning_rate",
         "gradient_norm",
