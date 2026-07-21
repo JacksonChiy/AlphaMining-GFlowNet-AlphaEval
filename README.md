@@ -35,6 +35,8 @@
 - PyTorch 版本；
 - A100 强制校验结果。
 
+Notebook 默认 `FAST_MODE=True`，使用 `configs/quick_training_config.yaml` 快速生成首个模型：分块读取大型 CSV，仅保留 2024 年以来的数据，并以前置的 2023 年下半年成交额选择 800 只股票，避免使用回测期未来数据选择股票池；GFlowNet 使用 8 个 epoch、每轮 16 条轨迹，最终生成 20 个因子。流程验证完成后把 `FAST_MODE=False`，即可切换到 `configs/training_config.yaml` 的正式全量训练。
+
 本地数据准备与单元测试：
 
 ```bash

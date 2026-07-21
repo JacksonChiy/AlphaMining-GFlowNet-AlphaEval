@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from src.data_loader import PriceDataPreprocessor
+from src.data_loader import PriceDataPreprocessor, prepare_price_csv
 
 
 def test_alias_mapping_missing_and_adjustment() -> None:
@@ -34,3 +34,36 @@ def test_missing_required_column_is_explicit() -> None:
     else:
         raise AssertionError("Expected a validation error")
 
+
+def test_total_turnover_mapping_and_fast_universe_filter(tmp_path) -> None:
+    rows = []
+    for date in pd.date_range("2023-12-01", periods=4):
+        for code, turnover in (("A", 100.0), ("B", 300.0), ("C", 200.0)):
+            rows.append({
+                "order_book_id": code,
+                "date": date,
+                "open": 10.0,
+                "high": 11.0,
+                "low": 9.0,
+                "close": 10.5,
+                "volume": 10.0,
+                "total_turnover": turnover,
+            })
+    source = tmp_path / "price.csv"
+    pd.DataFrame(rows).to_csv(source, index=False)
+
+    result = prepare_price_csv(
+        source,
+        tmp_path / "daily.pkl",
+        tmp_path / "report.json",
+        start_date="2023-12-03",
+        max_stocks=2,
+        universe_start_date="2023-12-01",
+        universe_end_date="2023-12-02",
+        chunksize=5,
+    )
+
+    assert set(result["code"]) == {"B", "C"}
+    assert set(result["date"]) == set(pd.date_range("2023-12-03", periods=2))
+    assert "amount" in result.columns
+    assert np.allclose(result["vwap"], result["amount"] / result["volume"])
