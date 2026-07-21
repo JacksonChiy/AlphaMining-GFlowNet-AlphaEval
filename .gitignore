@@ -15,6 +15,7 @@ checkpoints/*.ckpt
 results/
 experiments/*/
 !experiments/README.md
+alphamining_colab_outputs.zip
 
 # Local market data
 data/*.csv
@@ -31,4 +32,3 @@ data/*.parquet
 
 # Temporary files
 tmp/
-
