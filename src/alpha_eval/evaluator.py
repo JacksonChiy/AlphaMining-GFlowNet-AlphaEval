@@ -122,7 +122,8 @@ class AlphaEval:
         ic = float(pearson.mean()) if len(pearson) else 0.0
         ric = float(rank_ic.mean()) if len(rank_ic) else 0.0
         ric_std = float(rank_ic.std(ddof=1)) if len(rank_ic) > 1 else 0.0
-        icir = ric / ric_std * math.sqrt(252 / self.config.horizon) if ric_std > 0 else 0.0
+        periods = 252 / (self.config.horizon - 1)
+        icir = ric / ric_std * math.sqrt(periods) if ric_std > 0 else 0.0
         rolling = rank_ic.rolling(
             self.config.rolling_window,
             min_periods=min(10, self.config.rolling_window),
@@ -161,7 +162,7 @@ class AlphaEval:
 
         returns = work.dropna().groupby("date", observed=True)[["factor", "target"]].apply(daily).dropna()
         std = float(returns.std(ddof=1)) if len(returns) > 1 else 0.0
-        return float(returns.mean() / std * math.sqrt(252 / self.config.horizon)) if std > 0 else 0.0
+        return float(returns.mean() / std * math.sqrt(252 / (self.config.horizon - 1))) if std > 0 else 0.0
 
     def _perturbation_robustness(self, work: pd.DataFrame, baseline: float, factor_name: str) -> float:
         seed = self.config.seed + sum(map(ord, factor_name))

@@ -129,8 +129,8 @@ and training history.
 `alpha_eval_result.csv` includes at least `factor`, `IC`, `RankIC`, `ICIR`,
 `Sharpe`, `complexity`, and `score`, plus rolling-IC, robustness, RRE and DPP
 diagnostics. LightGBM uses a rolling window with a five-trading-day purge gap,
-predicts future five-day return, saves its latest model, and emits daily scores
-and ranks.
+predicts `close(t+5) / close(t+1) - 1`, saves its latest model, and emits daily
+scores and ranks.
 
 ## Backtest
 
