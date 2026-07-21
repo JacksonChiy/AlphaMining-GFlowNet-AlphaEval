@@ -5,8 +5,10 @@ import pandas as pd
 import pytest
 import sys
 from types import SimpleNamespace
+import json
 
 from src.model import LightGBMConfig, LightGBMFusion
+from src.gflownet import execute_saved_alpha_pool
 from src.utils import slice_date_range
 
 
@@ -80,3 +82,28 @@ def test_fit_predict_outputs_only_configured_oos_dates(
     assert prediction["signal_date"].max() == daily_prices["date"].max()
     assert prediction["signal_date"].nunique() == 40
     assert (tmp_path / "prediction_score.csv").exists()
+
+
+def test_saved_alpha_pool_executes_full_history_before_oos_slice(
+    daily_prices: pd.DataFrame, tmp_path
+) -> None:
+    metadata = pd.DataFrame({
+        "factor": ["factor_001"],
+        "tokens": [json.dumps(["ts_mean", "W5", "close"])],
+    })
+    metadata_path = tmp_path / "alpha_pool.csv"
+    metadata.to_csv(metadata_path, index=False)
+    oos_start = daily_prices["date"].drop_duplicates().iloc[60]
+
+    full, oos = execute_saved_alpha_pool(
+        daily_prices,
+        metadata_path,
+        tmp_path / "full.pkl",
+        tmp_path / "oos.pkl",
+        str(oos_start.date()),
+    )
+
+    assert oos is not None
+    assert oos["date"].min() == oos_start
+    assert oos.loc[oos["date"] == oos_start, "factor_001"].notna().all()
+    assert len(full) == len(daily_prices)
