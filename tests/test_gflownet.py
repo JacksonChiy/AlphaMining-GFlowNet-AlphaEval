@@ -32,6 +32,33 @@ def test_transformer_policy_output_shape() -> None:
     assert model(ids, features).shape == (1, len(ACTION_TOKENS))
 
 
+def test_batched_trajectory_sampling_preserves_gradients(daily_prices: pd.DataFrame) -> None:
+    policy = GFlowNetPolicy(
+        PolicyConfig(hidden_dim=16, num_layers=1, num_heads=4, max_sequence_length=16)
+    )
+    trainer = GFlowNetTrainer(
+        policy,
+        RewardEvaluator(daily_prices, horizon=5, min_cross_section=5),
+        TrainerConfig(
+            epochs=1,
+            trajectories_per_epoch=4,
+            mixed_precision=False,
+            max_depth=2,
+            max_nodes=3,
+            reward_workers=1,
+        ),
+        device="cpu",
+    )
+
+    trajectories = trainer.sample_trajectories(4)
+    objective = -torch.stack([log_pf for _, log_pf, _ in trajectories]).mean()
+    objective.backward()
+
+    assert len(trajectories) == 4
+    assert all(expression is not None and tokens for expression, _, tokens in trajectories)
+    assert any(parameter.grad is not None for parameter in policy.parameters())
+
+
 def test_training_prints_epoch_metrics(
     daily_prices: pd.DataFrame,
     tmp_path,
@@ -50,6 +77,7 @@ def test_training_prints_epoch_metrics(
             mixed_precision=False,
             max_depth=2,
             max_nodes=3,
+            reward_workers=1,
         ),
         device="cpu",
     )
@@ -60,6 +88,9 @@ def test_training_prints_epoch_metrics(
 
     assert "[GFlowNet] training_start" in output
     assert "[GFlowNet] epoch_start epoch=001/001" in output
+    assert "[GFlowNet] batch_sampling_start epoch=001" in output
+    assert "[GFlowNet] batch_sampling_complete epoch=001" in output
+    assert "[GFlowNet] reward_progress completed=001/001" in output
     assert "[GFlowNet] trajectory epoch=001/001 step=001/001" in output
     assert "global_step=00001/00001" in output
     assert "progress=100.00%" in output
@@ -90,6 +121,8 @@ def test_training_prints_epoch_metrics(
     assert {
         "learning_rate",
         "gradient_norm",
+        "sampling_seconds",
+        "reward_seconds",
         "epoch_seconds",
         "elapsed_seconds",
         "gpu_allocated_gb",

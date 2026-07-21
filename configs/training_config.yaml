@@ -19,6 +19,7 @@ training:
   weight_decay: 0.0001
   reward_temperature: 1.0
   mixed_precision: true
+  reward_workers: 4
   seed: 42
 
 reward:
@@ -49,4 +50,3 @@ backtest:
   top_n: 30
   rebalance_days: 5
   slippage: 0.001
-
