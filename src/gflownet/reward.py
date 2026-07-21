@@ -10,10 +10,14 @@ from src.expression import Expression
 
 
 def make_forward_return(data: pd.DataFrame, horizon: int = 5) -> pd.Series:
-    """Close-to-close forward label, used only by evaluation/training reward."""
+    """Return from t+1 to t+horizon, used only as an evaluation/training label."""
+    if horizon <= 1:
+        raise ValueError("horizon must be greater than 1 for a t+1 to t+horizon label")
     ordered = data.sort_values(["code", "date"], kind="stable")
-    future = ordered.groupby("code", observed=True)["close"].shift(-horizon)
-    label = future / ordered["close"] - 1.0
+    grouped_close = ordered.groupby("code", observed=True)["close"]
+    entry = grouped_close.shift(-1)
+    exit_ = grouped_close.shift(-horizon)
+    label = exit_ / entry - 1.0
     return label.reindex(data.index)
 
 
@@ -92,7 +96,7 @@ class RewardEvaluator:
             return float(selected.mean() - group["_target"].mean()) if len(selected) else np.nan
 
         excess = work.groupby("date", observed=True)[["factor", "_target"]].apply(long_excess).dropna()
-        periods = 252.0 / self.horizon
+        periods = 252.0 / (self.horizon - 1)
         excess_std = float(excess.std(ddof=1)) if len(excess) > 1 else 0.0
         long_ir = float(excess.mean() / excess_std * math.sqrt(periods)) if excess_std > 0 else 0.0
         annualized = float(excess.mean() * periods) if len(excess) else 0.0

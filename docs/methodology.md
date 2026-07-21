@@ -3,8 +3,9 @@
 ## Point-in-time boundary
 
 At date `t`, an expression may use only same-day or earlier OHLCV/VWAP. The
-forward return from `t` to `t+5` is created only inside reward, AlphaEval and
-LightGBM modules. RQAlphaPlus trades a score only when `signal_date < trade_date`.
+future-return label is `close(t+5) / close(t+1) - 1` and is created only inside
+reward, AlphaEval and LightGBM modules. RQAlphaPlus trades a score only when
+`signal_date < trade_date`.
 
 Rolling functions are grouped by security after stable sorting. Cross-sectional
 rank/z-score/demean operations are grouped by date. Missing prices are only
@@ -49,4 +50,3 @@ Mining, AlphaEval, hyperparameter selection and performance reporting should use
 separate time periods in a production study. The code purges overlapping labels
 from each LightGBM fold, but the user must reserve a final untouched evaluation
 period. The report's proprietary data universe and Barra data are not inferred.
-
