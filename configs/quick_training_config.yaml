@@ -3,19 +3,25 @@ dataset:
   output: data/daily_price.pkl
   horizon: 5
   required_columns: [date, code, open, high, low, close, volume]
+  start_date: '2024-01-01'
+  end_date: null
+  max_stocks: 800
+  universe_start_date: '2023-07-01'
+  universe_end_date: '2023-12-31'
+  chunksize: 500000
 
 model:
   name: GFlowNet
-  hidden_dim: 256
-  num_layers: 4
-  num_heads: 8
+  hidden_dim: 128
+  num_layers: 2
+  num_heads: 4
   dropout: 0.1
   max_sequence_length: 32
 
 training:
-  epochs: 100
-  trajectories_per_epoch: 32
-  learning_rate: 0.0001
+  epochs: 8
+  trajectories_per_epoch: 16
+  learning_rate: 0.0002
   weight_decay: 0.0001
   reward_temperature: 1.0
   mixed_precision: true
@@ -31,19 +37,19 @@ reward:
   coverage_penalty_power: 2.0
 
 alpha_eval:
-  rolling_window: 60
+  rolling_window: 40
   perturbation_std: 0.05
-  dpp_k: 50
+  dpp_k: 20
   seed: 42
 
 lightgbm:
   horizon: 5
-  train_window_days: 756
-  min_train_days: 504
-  refit_interval_days: 20
+  train_window_days: 504
+  min_train_days: 252
+  refit_interval_days: 40
   num_leaves: 31
-  learning_rate: 0.03
-  n_estimators: 500
+  learning_rate: 0.05
+  n_estimators: 200
   seed: 42
 
 backtest:
@@ -54,4 +60,4 @@ backtest:
   slippage: 0.001
 
 pipeline:
-  pool_size: 100
+  pool_size: 20
