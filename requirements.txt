@@ -11,6 +11,5 @@ seaborn>=0.13,<1
 pytest>=8,<9
 jupyter>=1,<2
 
-# RQAlphaPlus is licensed software and is installed separately from the
-# authorized Ricequant channel. See docs/rqalpha_plus_setup.md.
-
+# RQAlphaPlus 是授权软件，需要通过米筐授权渠道独立安装。
+# 配置方法见 docs/rqalpha_plus_setup.md。
