@@ -1,0 +1,52 @@
+dataset:
+  file: data/price.csv
+  output: data/daily_price.pkl
+  horizon: 5
+  required_columns: [date, code, open, high, low, close, volume]
+
+model:
+  name: GFlowNet
+  hidden_dim: 256
+  num_layers: 4
+  num_heads: 8
+  dropout: 0.1
+  max_sequence_length: 32
+
+training:
+  epochs: 100
+  trajectories_per_epoch: 32
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  reward_temperature: 1.0
+  mixed_precision: true
+  seed: 42
+
+reward:
+  top_quantile: 0.10
+  horizon: 5
+  risk_aversion: 1.0
+  min_cross_section: 20
+
+alpha_eval:
+  rolling_window: 60
+  perturbation_std: 0.05
+  dpp_k: 50
+  seed: 42
+
+lightgbm:
+  horizon: 5
+  train_window_days: 756
+  min_train_days: 504
+  refit_interval_days: 20
+  num_leaves: 31
+  learning_rate: 0.03
+  n_estimators: 500
+  seed: 42
+
+backtest:
+  initial_cash: 1000000
+  benchmark: 000300.XSHG
+  top_n: 30
+  rebalance_days: 5
+  slippage: 0.001
+

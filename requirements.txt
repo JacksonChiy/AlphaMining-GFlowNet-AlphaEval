@@ -1,0 +1,16 @@
+numpy>=1.26,<3
+pandas>=2.1,<3
+scipy>=1.11,<2
+scikit-learn>=1.4,<2
+torch>=2.2
+lightgbm>=4.3,<5
+PyYAML>=6.0,<7
+joblib>=1.3,<2
+matplotlib>=3.8,<4
+seaborn>=0.13,<1
+pytest>=8,<9
+jupyter>=1,<2
+
+# RQAlphaPlus is licensed software and is installed separately from the
+# authorized Ricequant channel. See docs/rqalpha_plus_setup.md.
+

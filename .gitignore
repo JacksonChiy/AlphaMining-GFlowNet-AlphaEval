@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Models and generated artifacts
+checkpoints/*.pt
+checkpoints/*.pth
+checkpoints/*.ckpt
+results/
+experiments/*/
+!experiments/README.md
+
+# Local market data
+data/*.csv
+data/*.pkl
+data/*.parquet
+!data/README.md
+
+# Environment and IDE
+.env
+.venv/
+.idea/
+.vscode/
+.DS_Store
+
+# Temporary files
+tmp/
+
