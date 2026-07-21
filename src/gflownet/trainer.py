@@ -212,6 +212,7 @@ class GFlowNetTrainer:
             losses: list[torch.Tensor] = []
             rewards: list[float] = []
             rank_ics: list[float] = []
+            coverages: list[float] = []
             self.optimizer.zero_grad(set_to_none=True)
             with torch.autocast(
                 device_type=self.device.type,
@@ -243,6 +244,7 @@ class GFlowNetTrainer:
                     losses.append(self.trajectory_balance_loss(log_pf, breakdown.reward))
                     rewards.append(breakdown.reward)
                     rank_ics.append(breakdown.rank_ic)
+                    coverages.append(breakdown.coverage)
                 loss = torch.stack(losses).mean()
                 step_values = torch.stack(
                     [torch.stack(log_probabilities), torch.stack(losses)]
@@ -268,6 +270,9 @@ class GFlowNetTrainer:
                         "rank_ic": float(breakdown.rank_ic),
                         "long_ir": float(breakdown.long_ir),
                         "risk_penalty": float(breakdown.risk_penalty),
+                        "coverage": float(breakdown.coverage),
+                        "valid_date_coverage": float(breakdown.valid_date_coverage),
+                        "coverage_penalty": float(breakdown.coverage_penalty),
                         "log_pf": float(step_values[0, trajectory_index - 1]),
                         "tb_loss": float(step_values[1, trajectory_index - 1]),
                         "trajectory_seconds": float(average_step_seconds),
@@ -288,6 +293,9 @@ class GFlowNetTrainer:
                         f" rank_ic={breakdown.rank_ic:.6f}"
                         f" long_ir={breakdown.long_ir:.6f}"
                         f" risk_penalty={breakdown.risk_penalty:.6f}"
+                        f" coverage={breakdown.coverage:.2%}"
+                        f" valid_date_coverage={breakdown.valid_date_coverage:.2%}"
+                        f" coverage_penalty={breakdown.coverage_penalty:.6f}"
                         f" log_pf={trajectory_record['log_pf']:.6f}"
                         f" tb_loss={trajectory_record['tb_loss']:.6f}"
                         f" step_seconds={average_step_seconds:.2f}"
@@ -318,6 +326,7 @@ class GFlowNetTrainer:
                 "mean_reward": float(np.mean(rewards)),
                 "max_reward": float(np.max(rewards)),
                 "mean_rank_ic": float(np.mean(rank_ics)),
+                "mean_coverage": float(np.mean(coverages)),
                 "log_z": float(self.log_z.detach().cpu()),
                 "learning_rate": learning_rate,
                 "gradient_norm": float(gradient_norm.detach().cpu()),
@@ -347,6 +356,7 @@ class GFlowNetTrainer:
                 f" mean_reward={record['mean_reward']:.6f}"
                 f" max_reward={record['max_reward']:.6f}"
                 f" mean_rank_ic={record['mean_rank_ic']:.6f}"
+                f" mean_coverage={record['mean_coverage']:.2%}"
                 f" log_z={record['log_z']:.6f}"
                 f" grad_norm={record['gradient_norm']:.4f}"
                 f" lr={learning_rate:.2e}"
@@ -440,6 +450,19 @@ class GFlowNetTrainer:
                     )
                     continue
                 breakdown = breakdown_by_index[index]
+                if breakdown.coverage < self.reward_evaluator.min_coverage or (
+                    breakdown.valid_date_coverage < self.reward_evaluator.min_coverage
+                ):
+                    print(
+                        f"[GFlowNet] alpha_pool_step attempt={attempt:04d}/{attempts:04d} "
+                        f"status=low_coverage_rejected unique={len(unique)} "
+                        f"coverage={breakdown.coverage:.2%} "
+                        f"valid_date_coverage={breakdown.valid_date_coverage:.2%} "
+                        f"minimum={self.reward_evaluator.min_coverage:.2%} "
+                        f"expression={expression}",
+                        flush=False,
+                    )
+                    continue
                 unique[key] = {
                     "expression": expression,
                     "tokens": tokens,
@@ -451,7 +474,10 @@ class GFlowNetTrainer:
                     f"[GFlowNet] alpha_pool_step attempt={attempt:04d}/{attempts:04d} "
                     f"status=accepted unique={len(unique)} "
                     f"target_candidates={target_candidates} reward={breakdown.reward:.6f} "
-                    f"rank_ic={breakdown.rank_ic:.6f} expression={expression}",
+                    f"rank_ic={breakdown.rank_ic:.6f} "
+                    f"coverage={breakdown.coverage:.2%} "
+                    f"valid_date_coverage={breakdown.valid_date_coverage:.2%} "
+                    f"expression={expression}",
                     flush=False,
                 )
                 if len(unique) >= target_candidates:
@@ -467,10 +493,21 @@ def save_alpha_pool(
     data: pd.DataFrame,
     metadata_path: str | Path = "results/alpha_pool.csv",
     matrix_path: str | Path = "results/alpha_factor_matrix.pkl",
+    min_coverage: float = 0.80,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    eligible_pool = [
+        item
+        for item in pool
+        if float(item.get("coverage", 0.0)) >= min_coverage
+        and float(item.get("valid_date_coverage", 0.0)) >= min_coverage
+    ]
+    if not eligible_pool:
+        raise ValueError(
+            f"No alpha expression meets the minimum coverage requirement: {min_coverage:.2%}"
+        )
     metadata_rows: list[dict[str, Any]] = []
     matrix = data[["date", "code"]].copy()
-    for index, item in enumerate(pool, start=1):
+    for index, item in enumerate(eligible_pool, start=1):
         name = f"factor_{index:03d}"
         expression: Expression = item["expression"]
         matrix[name] = expression.execute(data).to_numpy()

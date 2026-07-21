@@ -27,6 +27,8 @@ reward:
   horizon: 5
   risk_aversion: 1.0
   min_cross_section: 20
+  min_coverage: 0.80
+  coverage_penalty_power: 2.0
 
 alpha_eval:
   rolling_window: 60

@@ -13,6 +13,8 @@ from src.gflownet import (
     Vocabulary,
 )
 from src.gflownet.grammar import ACTION_TOKENS
+from src.gflownet.trainer import save_alpha_pool
+from src.expression import expression_from_tokens
 
 
 def test_grammar_produces_parseable_terminal_expression() -> None:
@@ -113,6 +115,9 @@ def test_training_prints_epoch_metrics(
         "rank_ic",
         "long_ir",
         "risk_penalty",
+        "coverage",
+        "valid_date_coverage",
+        "coverage_penalty",
         "log_pf",
         "tb_loss",
         "trajectory_seconds",
@@ -128,4 +133,32 @@ def test_training_prints_epoch_metrics(
         "gpu_allocated_gb",
         "gpu_reserved_gb",
         "gpu_peak_gb",
+        "mean_coverage",
     }.issubset(metrics.columns)
+
+
+def test_save_alpha_pool_excludes_low_coverage_expression(
+    daily_prices: pd.DataFrame, tmp_path
+) -> None:
+    expression = expression_from_tokens(["close"])
+    common = {
+        "expression": expression,
+        "tokens": ["close"],
+        "reward": 0.1,
+        "valid_date_coverage": 1.0,
+    }
+    pool = [
+        {**common, "coverage": 0.50},
+        {**common, "coverage": 0.95, "reward": 0.05},
+    ]
+
+    metadata, matrix = save_alpha_pool(
+        pool,
+        daily_prices,
+        metadata_path=tmp_path / "alpha_pool.csv",
+        matrix_path=tmp_path / "alpha_matrix.pkl",
+        min_coverage=0.80,
+    )
+
+    assert metadata["coverage"].tolist() == [0.95]
+    assert [column for column in matrix if column.startswith("factor_")] == ["factor_001"]

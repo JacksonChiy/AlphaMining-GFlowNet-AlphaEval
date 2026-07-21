@@ -115,3 +115,43 @@ def test_vectorized_reward_matches_original_rank_ic_and_long_ir(
 
     assert np.isclose(actual.rank_ic, rank_ic.mean(), atol=1e-12)
     assert np.isclose(actual.long_ir, expected_long_ir, atol=1e-12)
+
+
+def test_low_coverage_factor_receives_penalty(daily_prices: pd.DataFrame) -> None:
+    evaluator = RewardEvaluator(
+        daily_prices,
+        horizon=5,
+        min_cross_section=20,
+        min_coverage=0.80,
+        coverage_penalty_power=2.0,
+    )
+    factor = daily_prices["close"].astype(float).copy()
+    code_order = daily_prices["code"].drop_duplicates().tolist()
+    factor[daily_prices["code"].isin(code_order[20:])] = np.nan
+
+    result = evaluator.evaluate_factor(factor)
+
+    assert np.isclose(result.coverage, 20 / len(code_order))
+    assert result.valid_date_coverage == 1.0
+    assert np.isclose(result.coverage_penalty, (result.coverage / 0.80) ** 2)
+    assert result.coverage < evaluator.min_coverage
+
+
+def test_missing_whole_dates_is_reflected_in_date_coverage(
+    daily_prices: pd.DataFrame,
+) -> None:
+    evaluator = RewardEvaluator(
+        daily_prices, horizon=5, min_cross_section=20, min_coverage=0.80
+    )
+    factor = daily_prices["close"].astype(float).copy()
+    eligible_dates = evaluator.data.loc[
+        evaluator.data["_target"].notna(), "date"
+    ].drop_duplicates()
+    removed_dates = set(eligible_dates.iloc[::2])
+    factor[evaluator.data["date"].isin(removed_dates)] = np.nan
+
+    result = evaluator.evaluate_factor(factor)
+
+    expected = 1.0 - len(removed_dates) / len(eligible_dates)
+    assert np.isclose(result.valid_date_coverage, expected)
+    assert result.coverage_penalty < 1.0

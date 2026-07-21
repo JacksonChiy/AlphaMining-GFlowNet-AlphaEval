@@ -28,6 +28,9 @@ class RewardBreakdown:
     long_ir: float
     annualized_long_excess: float
     risk_penalty: float
+    coverage: float
+    valid_date_coverage: float
+    coverage_penalty: float
     industry_exposure: float
     size_exposure: float
     observations: int
@@ -46,13 +49,21 @@ class RewardEvaluator:
         top_quantile: float = 0.10,
         risk_aversion: float = 1.0,
         min_cross_section: int = 20,
+        min_coverage: float = 0.80,
+        coverage_penalty_power: float = 2.0,
         reward_floor: float = 1e-8,
     ) -> None:
+        if not 0.0 < min_coverage <= 1.0:
+            raise ValueError("min_coverage must be in (0, 1]")
+        if coverage_penalty_power <= 0.0:
+            raise ValueError("coverage_penalty_power must be positive")
         self.data = data.sort_values(["code", "date"], kind="stable").copy()
         self.horizon = horizon
         self.top_quantile = top_quantile
         self.risk_aversion = risk_aversion
         self.min_cross_section = min_cross_section
+        self.min_coverage = min_coverage
+        self.coverage_penalty_power = coverage_penalty_power
         self.reward_floor = reward_floor
         self.data["_target"] = make_forward_return(self.data, horizon)
         self.cache: dict[str, RewardBreakdown] = {}
@@ -65,24 +76,38 @@ class RewardEvaluator:
             factor = expression.execute(self.data)
             result = self.evaluate_factor(factor)
         except (FloatingPointError, ValueError, KeyError, OverflowError):
-            result = RewardBreakdown(
-                self.reward_floor, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0,
-                "industry" in self.data, "market_cap" in self.data,
-            )
+            result = self._empty_breakdown()
         self.cache[key] = result
         return result
 
     def evaluate_factor(self, factor: pd.Series) -> RewardBreakdown:
         work = self.data[["date", "code", "_target"]].copy()
         work["factor"] = pd.to_numeric(factor.reindex(work.index), errors="coerce")
-        work = work.replace([np.inf, -np.inf], np.nan).dropna(subset=["factor", "_target"])
-        counts = work.groupby("date", observed=True).size()
-        valid_dates = counts[counts >= self.min_cross_section].index
-        work = work[work["date"].isin(valid_dates)]
+        work = work.replace([np.inf, -np.inf], np.nan)
+
+        eligible = work.dropna(subset=["_target"])
+        eligible_counts = eligible.groupby("date", observed=True).size()
+        eligible_dates = eligible_counts[eligible_counts >= self.min_cross_section].index
+        eligible = eligible[eligible["date"].isin(eligible_dates)]
+        if eligible.empty:
+            return self._empty_breakdown()
+
+        valid = eligible.dropna(subset=["factor"])
+        coverage = float(len(valid) / len(eligible))
+        valid_counts = valid.groupby("date", observed=True).size()
+        valid_dates = valid_counts[valid_counts >= self.min_cross_section].index
+        valid_date_coverage = float(len(valid_dates) / len(eligible_dates))
+        effective_coverage = min(coverage, valid_date_coverage)
+        coverage_penalty = float(
+            min(1.0, (effective_coverage / self.min_coverage) ** self.coverage_penalty_power)
+        )
+
+        work = valid[valid["date"].isin(valid_dates)]
         if work.empty:
-            return RewardBreakdown(
-                self.reward_floor, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0,
-                "industry" in self.data, "market_cap" in self.data,
+            return self._empty_breakdown(
+                coverage=coverage,
+                valid_date_coverage=valid_date_coverage,
+                coverage_penalty=coverage_penalty,
             )
 
         factor_rank = work.groupby("date", observed=True)["factor"].rank(method="average")
@@ -106,7 +131,12 @@ class RewardEvaluator:
         industry_exposure = self._industry_exposure(aligned)
         size_exposure = self._size_exposure(aligned)
         risk_penalty = math.exp(-self.risk_aversion * (industry_exposure + size_exposure))
-        reward = abs(rank_ic) * max(0.05, 1.0 + np.clip(long_ir, -0.95, 5.0)) * risk_penalty
+        reward = (
+            abs(rank_ic)
+            * max(0.05, 1.0 + np.clip(long_ir, -0.95, 5.0))
+            * risk_penalty
+            * coverage_penalty
+        )
         reward = float(max(self.reward_floor, reward))
         return RewardBreakdown(
             reward=reward,
@@ -114,11 +144,36 @@ class RewardEvaluator:
             long_ir=long_ir,
             annualized_long_excess=annualized,
             risk_penalty=risk_penalty,
+            coverage=coverage,
+            valid_date_coverage=valid_date_coverage,
+            coverage_penalty=coverage_penalty,
             industry_exposure=industry_exposure,
             size_exposure=size_exposure,
             observations=len(work),
             industry_penalty_applied="industry" in aligned,
             size_penalty_applied="market_cap" in aligned,
+        )
+
+    def _empty_breakdown(
+        self,
+        coverage: float = 0.0,
+        valid_date_coverage: float = 0.0,
+        coverage_penalty: float = 0.0,
+    ) -> RewardBreakdown:
+        return RewardBreakdown(
+            reward=self.reward_floor,
+            rank_ic=0.0,
+            long_ir=0.0,
+            annualized_long_excess=0.0,
+            risk_penalty=1.0,
+            coverage=coverage,
+            valid_date_coverage=valid_date_coverage,
+            coverage_penalty=coverage_penalty,
+            industry_exposure=0.0,
+            size_exposure=0.0,
+            observations=0,
+            industry_penalty_applied="industry" in self.data,
+            size_penalty_applied="market_cap" in self.data,
         )
 
     @staticmethod

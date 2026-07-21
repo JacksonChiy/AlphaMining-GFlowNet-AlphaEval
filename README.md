@@ -16,7 +16,8 @@
 
 - 文法采用日频 OHLCV/VWAP 特征，时间窗口为 5、10、20、40、60 个交易日；
 - 前缀表达式树的构建过程具有唯一父状态，因此 TB 中的反向策略项为 `log PB = 0`；
-- 奖励为 `abs(RankIC) × (1 + 截断后的 LongIR) × RiskPenalty`；
+- 奖励为 `abs(RankIC) × (1 + 截断后的 LongIR) × RiskPenalty × CoveragePenalty`；
+- 覆盖率同时检查有效观测占比和满足最小股票数的交易日占比；低覆盖表达式会被降权，低于默认 80% 门槛时禁止进入因子池；
 - 仅当数据中真实存在行业和市值字段时，才启用对应风险暴露惩罚；
 - 金融逻辑评价使用确定性的表达式复杂度与深度评分，不调用外部大模型；
 - DPP 阶段在质量加权的半正定相似度核上进行贪心 MAP 筛选；
@@ -110,7 +111,7 @@ python -m scripts.run_daily_pipeline --pool-size 100
 
 训练阶段保存 `checkpoints/gflownet_best.pt`，随后重新加载检查点，并生成 `factor_001`、`factor_002` 等因子元数据和因子值矩阵。
 
-训练过程中每条轨迹都实时打印 epoch/step、全局 step、总体完成百分比、表达式、动作数、reward、RankIC、LongIR、风险惩罚、`logPF`、单轨迹 TB loss 和耗时；每个 epoch 更新参数后，再打印平均与最高奖励、平均 RankIC、`logZ`、梯度范数、学习率、耗时、最佳检查点状态及 A100 显存。逐轨迹明细写入 `results/gflownet_trajectory_metrics.csv`，逐 epoch 汇总写入 `results/gflownet_training_metrics.csv`。因子池生成阶段也会为每次尝试打印接受或重复状态。
+训练过程中每条轨迹都实时打印 epoch/step、全局 step、总体完成百分比、表达式、动作数、reward、RankIC、LongIR、风险惩罚、观测覆盖率、有效交易日覆盖率、覆盖率惩罚、`logPF`、单轨迹 TB loss 和耗时；每个 epoch 更新参数后，再打印平均与最高奖励、平均 RankIC、平均覆盖率、`logZ`、梯度范数、学习率、耗时、最佳检查点状态及 A100 显存。逐轨迹明细写入 `results/gflownet_trajectory_metrics.csv`，逐 epoch 汇总写入 `results/gflownet_training_metrics.csv`。因子池生成阶段也会为每次尝试打印接受、重复或低覆盖拒绝状态。
 
 为提高 A100 利用率，同一 epoch 的轨迹按批次进行 Transformer 推理，而不是逐轨迹执行 batch size 1；Reward 对批内唯一表达式使用多线程并行，RankIC、Top 10% LongIR、行业与市值暴露均使用向量化计算。默认 `reward_workers: 4`，可根据 Colab CPU 核数调整。逐步日志保留，但每个 epoch 只进行一次批量 GPU→CPU 指标同步。
 
@@ -123,6 +124,16 @@ python -m scripts.run_daily_pipeline --pool-size 100
 ```
 
 采样使用 on-policy 轨迹，奖励按规范化表达式字符串缓存。检查点包含模型状态、优化器状态、`logZ`、训练配置、词表与训练历史。
+
+覆盖率惩罚定义为：
+
+```text
+effective_coverage = min(有效因子观测数 / 可评价观测数,
+                         有效交易日数 / 可评价交易日数)
+CoveragePenalty = min(1, (effective_coverage / min_coverage) ^ power)
+```
+
+默认 `min_coverage: 0.80`、`coverage_penalty_power: 2.0`。Reward 会连续惩罚低覆盖表达式；生成和保存因子池时还会执行 80% 硬门槛，避免稀疏表达式继续进入 AlphaEval、LightGBM 和本地回测。
 
 ## AlphaEval 与 LightGBM
 
