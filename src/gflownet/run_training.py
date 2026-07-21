@@ -34,7 +34,7 @@ def gpu_report(require_a100: bool = False) -> dict[str, str | bool | float]:
     return result
 
 
-def run(config_path: str, require_a100: bool = False, pool_size: int = 100) -> Path:
+def run(config_path: str, require_a100: bool = True, pool_size: int = 100) -> Path:
     config = load_config(config_path)
     print(gpu_report(require_a100))
     seed_everything(int(config["training"]["seed"]))
@@ -63,10 +63,14 @@ def run(config_path: str, require_a100: bool = False, pool_size: int = 100) -> P
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/training_config.yaml")
-    parser.add_argument("--require-a100", action="store_true")
+    parser.add_argument(
+        "--allow-non-a100",
+        action="store_true",
+        help="Only for small CPU/GPU smoke tests; formal training requires A100.",
+    )
     parser.add_argument("--pool-size", type=int, default=100)
     args = parser.parse_args()
-    run(args.config, args.require_a100, args.pool_size)
+    run(args.config, not args.allow_non_a100, args.pool_size)
 
 
 if __name__ == "__main__":

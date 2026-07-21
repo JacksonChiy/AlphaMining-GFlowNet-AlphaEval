@@ -99,9 +99,12 @@ Run notebooks in order:
 The same stages can be orchestrated from the project root:
 
 ```bash
-python -m scripts.run_daily_pipeline --require-a100 --pool-size 100
+python -m scripts.run_daily_pipeline --pool-size 100
 # Add --rqalpha-bundle /path/to/bundle to run the licensed backtest stage.
 ```
+
+Formal training enforces an A100 by default. `--allow-non-a100` exists only for
+small code-path smoke tests and must not be used for reported experiments.
 
 The training notebook saves `checkpoints/gflownet_best.pt`, reloads it, and
 generates `factor_001`, `factor_002`, ... plus a factor-value matrix.

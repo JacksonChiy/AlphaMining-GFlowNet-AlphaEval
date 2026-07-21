@@ -19,7 +19,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the daily research pipeline")
     parser.add_argument("--config", default="configs/training_config.yaml")
     parser.add_argument("--pool-size", type=int, default=100)
-    parser.add_argument("--require-a100", action="store_true")
+    parser.add_argument(
+        "--allow-non-a100",
+        action="store_true",
+        help="Only for smoke tests; formal training enforces an NVIDIA A100.",
+    )
     parser.add_argument("--rqalpha-bundle", default=None)
     args = parser.parse_args()
     config = load_config(args.config)
@@ -29,7 +33,7 @@ def main() -> None:
         config["dataset"]["output"],
         "results/data_quality_report.json",
     )
-    experiment_dir = run_gflownet(args.config, args.require_a100, args.pool_size)
+    experiment_dir = run_gflownet(args.config, not args.allow_non_a100, args.pool_size)
     factor_matrix = pd.read_pickle("results/alpha_factor_matrix.pkl")
     metadata = pd.read_csv("results/alpha_pool.csv")
     eval_values = dict(config["alpha_eval"])
@@ -62,4 +66,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

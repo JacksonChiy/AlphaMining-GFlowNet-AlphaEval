@@ -122,6 +122,9 @@ class LightGBMFusion:
             pct=True, method="average"
         )
         prediction = prediction.rename(columns={"date": "signal_date"})
+        # Future returns remain internal evaluation labels and are never exported
+        # to the strategy-facing score file.
+        prediction = prediction.drop(columns=["target"])
         prediction.to_csv(output_dir / "prediction_score.csv", index=False)
         pd.DataFrame(self.metrics).to_csv(output_dir / "model_metrics.csv", index=False)
         importance = pd.DataFrame({
