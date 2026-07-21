@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -91,7 +92,18 @@ class GFlowNetTrainer:
         checkpoint_path = Path(checkpoint_path)
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         best_loss = float("inf")
+        training_started = time.perf_counter()
+        print(
+            "[GFlowNet] training_start "
+            f"device={self.device} epochs={self.config.epochs} "
+            f"trajectories_per_epoch={self.config.trajectories_per_epoch} "
+            f"amp={self.amp_enabled} checkpoint={checkpoint_path}",
+            flush=True,
+        )
         for epoch in range(1, self.config.epochs + 1):
+            epoch_started = time.perf_counter()
+            if self.device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(self.device)
             self.model.train()
             losses: list[torch.Tensor] = []
             rewards: list[float] = []
@@ -111,9 +123,21 @@ class GFlowNetTrainer:
                 loss = torch.stack(losses).mean()
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
+            gradient_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.config.gradient_clip
+            )
             self.scaler.step(self.optimizer)
             self.scaler.update()
+            epoch_seconds = time.perf_counter() - epoch_started
+            elapsed_seconds = time.perf_counter() - training_started
+            learning_rate = float(self.optimizer.param_groups[0]["lr"])
+            gpu_allocated_gb = 0.0
+            gpu_reserved_gb = 0.0
+            gpu_peak_gb = 0.0
+            if self.device.type == "cuda":
+                gpu_allocated_gb = torch.cuda.memory_allocated(self.device) / 1024**3
+                gpu_reserved_gb = torch.cuda.memory_reserved(self.device) / 1024**3
+                gpu_peak_gb = torch.cuda.max_memory_allocated(self.device) / 1024**3
             record = {
                 "epoch": float(epoch),
                 "loss": float(loss.detach().cpu()),
@@ -121,11 +145,47 @@ class GFlowNetTrainer:
                 "max_reward": float(np.max(rewards)),
                 "mean_rank_ic": float(np.mean(rank_ics)),
                 "log_z": float(self.log_z.detach().cpu()),
+                "learning_rate": learning_rate,
+                "gradient_norm": float(gradient_norm.detach().cpu()),
+                "epoch_seconds": float(epoch_seconds),
+                "elapsed_seconds": float(elapsed_seconds),
+                "gpu_allocated_gb": float(gpu_allocated_gb),
+                "gpu_reserved_gb": float(gpu_reserved_gb),
+                "gpu_peak_gb": float(gpu_peak_gb),
             }
             self.history.append(record)
-            if record["loss"] < best_loss:
+            is_best = record["loss"] < best_loss
+            if is_best:
                 best_loss = record["loss"]
                 self.save_checkpoint(checkpoint_path, best_loss)
+            gpu_log = ""
+            if self.device.type == "cuda":
+                gpu_log = (
+                    f" gpu_allocated={gpu_allocated_gb:.2f}GB"
+                    f" gpu_reserved={gpu_reserved_gb:.2f}GB"
+                    f" gpu_peak={gpu_peak_gb:.2f}GB"
+                )
+            print(
+                f"[GFlowNet] epoch={epoch:03d}/{self.config.epochs:03d}"
+                f" loss={record['loss']:.6f}"
+                f" mean_reward={record['mean_reward']:.6f}"
+                f" max_reward={record['max_reward']:.6f}"
+                f" mean_rank_ic={record['mean_rank_ic']:.6f}"
+                f" log_z={record['log_z']:.6f}"
+                f" grad_norm={record['gradient_norm']:.4f}"
+                f" lr={learning_rate:.2e}"
+                f" epoch_seconds={epoch_seconds:.2f}"
+                f" elapsed_seconds={elapsed_seconds:.2f}"
+                f" checkpoint={'saved' if is_best else '-'}"
+                f"{gpu_log}",
+                flush=True,
+            )
+        print(
+            f"[GFlowNet] training_complete best_loss={best_loss:.6f} "
+            f"elapsed_seconds={time.perf_counter() - training_started:.2f} "
+            f"checkpoint={checkpoint_path}",
+            flush=True,
+        )
         return pd.DataFrame(self.history)
 
     def save_checkpoint(self, path: str | Path, best_loss: float | None = None) -> None:
@@ -164,10 +224,16 @@ class GFlowNetTrainer:
     def generate_pool(self, size: int = 100, attempts: int = 2000) -> list[dict[str, Any]]:
         self.model.eval()
         unique: dict[str, dict[str, Any]] = {}
-        for _ in range(attempts):
+        for attempt in range(1, attempts + 1):
             expression, _, tokens = self.sample_trajectory()
             key = str(expression)
             if key in unique:
+                if attempt % 100 == 0:
+                    print(
+                        f"[GFlowNet] alpha_pool_progress attempt={attempt}/{attempts} "
+                        f"unique={len(unique)} target_candidates={size * 5}",
+                        flush=True,
+                    )
                 continue
             breakdown = self.reward_evaluator.evaluate(expression)
             unique[key] = {
@@ -177,6 +243,13 @@ class GFlowNetTrainer:
                 "complexity": expression.complexity(),
                 "depth": expression.depth(),
             }
+            if attempt % 100 == 0:
+                print(
+                    f"[GFlowNet] alpha_pool_progress attempt={attempt}/{attempts} "
+                    f"unique={len(unique)} target_candidates={size * 5} "
+                    f"latest_reward={breakdown.reward:.6f}",
+                    flush=True,
+                )
             if len(unique) >= size * 5:
                 break
         return sorted(unique.values(), key=lambda item: item["reward"], reverse=True)[:size]
