@@ -2,6 +2,8 @@
 
 RQAlphaPlus 是米筐的授权软件，本项目不会用自研模拟器替代它。请通过已获授权的米筐渠道安装 `rqalpha_plus`，并提前准备本地数据包。为保证实验可复现，运行时不启用自动下载行情数据。
 
+本阶段只在本地运行，不在 Google Colab 运行。Colab 使用 `notebooks/00_colab_full_pipeline_A100.ipynb` 生成 `alphamining_colab_outputs.zip`；把压缩包放到本地仓库根目录后，运行 `notebooks/06_rqalpha_backtest.ipynb` 即可解压并校验训练产物。
+
 ## 运行前检查
 
 请确认以下条件均已满足：
