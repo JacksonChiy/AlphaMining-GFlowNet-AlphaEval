@@ -8,6 +8,6 @@
 
 预处理阶段在本地生成 `data/daily_price.pkl` 和数据质量报告。原始 CSV、处理后的 PKL 以及其他大型数据文件均不应提交到 GitHub。
 
-Colab 推荐使用 `notebooks/00_colab_full_pipeline_A100.ipynb` 上传本文件并完成全部训练阶段。
+Colab 推荐先将文件保存为 Google Drive 的 `MyDrive/price.csv`，再运行 `notebooks/00_colab_full_pipeline_A100.ipynb`。Notebook 会挂载 Drive，并在文件不存在或大小变化时复制到 Colab 本地的 `data/price.csv`。
 
 字段明细、数据检查和执行方法见[完整运行手册](../docs/运行手册.md)。

@@ -77,7 +77,7 @@ Colab 一次只需打开：
 notebooks/00_colab_full_pipeline_A100.ipynb
 ```
 
-该 Notebook 包含 GitHub clone、依赖安装、A100 检查、配置读取、`price.csv` 上传、前五阶段训练和产物打包。最终下载：
+该 Notebook 包含 GitHub clone、依赖安装、A100 检查、配置读取、从 Google Drive 复制 `price.csv`、前五阶段训练和产物打包。请先将行情文件保存为 Google Drive 的 `MyDrive/price.csv`。最终下载：
 
 ```text
 alphamining_colab_outputs.zip
@@ -109,6 +109,8 @@ python -m scripts.run_daily_pipeline --pool-size 100
 正式训练默认强制要求 A100。`--allow-non-a100` 仅用于小规模代码路径冒烟测试，不得用于正式实验结果。
 
 训练阶段保存 `checkpoints/gflownet_best.pt`，随后重新加载检查点，并生成 `factor_001`、`factor_002` 等因子元数据和因子值矩阵。
+
+训练过程中每个 epoch 实时打印 TB loss、平均与最高奖励、平均 RankIC、`logZ`、梯度范数、学习率、单轮与累计耗时、最佳检查点保存状态，以及 A100 已分配、保留和峰值显存。相同指标同时写入 `results/gflownet_training_metrics.csv`。
 
 ## GFlowNet 模型
 
