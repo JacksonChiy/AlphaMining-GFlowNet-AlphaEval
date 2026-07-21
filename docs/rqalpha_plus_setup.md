@@ -27,6 +27,8 @@ python -m rqalpha_strategy.run_backtest \
 
 如数据包不在默认位置，请将 `--bundle` 后的路径替换为实际授权数据包目录。
 
+本项目是纯 A 股策略，运行配置会显式关闭 `option`、`fund`、`convertible` 和 `spot` 模块，防止框架因缺少期权 instruments bundle 而尝试调用未初始化的 RQData。配置同时显式设置 `capital_gain_tax_rate: 0.0`，并使用新版 `stock_min_commission` 参数。股票行情 bundle 仍必须覆盖预测分数的全部回测日期。
+
 ## 策略与输出
 
 策略仅使用严格早于交易日的最近一期信号，每 5 个交易日调仓，选择预测分数最高的 Top N 股票并等权持有。分析器会在 `results/backtest_report/` 下写入绩效汇总、净值曲线、持仓和交易历史。

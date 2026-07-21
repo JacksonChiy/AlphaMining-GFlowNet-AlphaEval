@@ -32,6 +32,9 @@ def build_config(
             "accounts": {"STOCK": initial_cash},
             "rqdatac_uri": "disabled",
             "auto_update_bundle": False,
+            # This strategy only trades A-shares. Keep the currently compatible
+            # zero rate explicit instead of relying on a changing framework default.
+            "capital_gain_tax_rate": 0.0,
         },
         "extra": {"log_level": "info"},
         "mod": {
@@ -46,11 +49,17 @@ def build_config(
                 "volume_percent": 0.25,
             },
             "sys_transaction_cost": {
-                "cn_stock_min_commission": 5,
+                "stock_min_commission": 5,
                 "stock_commission_multiplier": 1,
                 "tax_multiplier": 1,
                 "pit_tax": True,
             },
+            # Disable non-stock modules so a stock-only backtest never attempts
+            # an RQData update for missing option/fund instrument bundles.
+            "option": {"enabled": False},
+            "fund": {"enabled": False},
+            "convertible": {"enabled": False},
+            "spot": {"enabled": False},
             "sys_analyser": {
                 "enabled": True,
                 "benchmark": benchmark,
@@ -119,4 +128,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
