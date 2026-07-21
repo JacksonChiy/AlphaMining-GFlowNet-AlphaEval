@@ -60,6 +60,7 @@ class GFlowNetTrainer:
         self.vocabulary = Vocabulary()
         self.rng = np.random.default_rng(config.seed)
         self.history: list[dict[str, float]] = []
+        self.trajectory_history: list[dict[str, float | str]] = []
 
     def _state_tensors(self, state: GrammarState) -> tuple[torch.Tensor, torch.Tensor]:
         ids = [self.vocabulary.bos_id, *self.vocabulary.encode(state.tokens)]
@@ -93,6 +94,7 @@ class GFlowNetTrainer:
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         best_loss = float("inf")
         training_started = time.perf_counter()
+        total_trajectory_steps = self.config.epochs * self.config.trajectories_per_epoch
         print(
             "[GFlowNet] training_start "
             f"device={self.device} epochs={self.config.epochs} "
@@ -102,6 +104,12 @@ class GFlowNetTrainer:
         )
         for epoch in range(1, self.config.epochs + 1):
             epoch_started = time.perf_counter()
+            print(
+                f"[GFlowNet] epoch_start epoch={epoch:03d}/{self.config.epochs:03d} "
+                f"trajectories={self.config.trajectories_per_epoch} "
+                f"lr={self.optimizer.param_groups[0]['lr']:.2e}",
+                flush=True,
+            )
             if self.device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(self.device)
             self.model.train()
@@ -114,12 +122,54 @@ class GFlowNetTrainer:
                 dtype=torch.float16,
                 enabled=self.amp_enabled,
             ):
-                for _ in range(self.config.trajectories_per_epoch):
-                    expression, log_pf, _ = self.sample_trajectory()
+                for trajectory_index in range(1, self.config.trajectories_per_epoch + 1):
+                    trajectory_started = time.perf_counter()
+                    global_step = (
+                        (epoch - 1) * self.config.trajectories_per_epoch + trajectory_index
+                    )
+                    progress_pct = 100.0 * global_step / total_trajectory_steps
+                    expression, log_pf, tokens = self.sample_trajectory()
                     breakdown = self.reward_evaluator.evaluate(expression)
-                    losses.append(self.trajectory_balance_loss(log_pf, breakdown.reward))
+                    trajectory_loss = self.trajectory_balance_loss(log_pf, breakdown.reward)
+                    losses.append(trajectory_loss)
                     rewards.append(breakdown.reward)
                     rank_ics.append(breakdown.rank_ic)
+                    trajectory_seconds = time.perf_counter() - trajectory_started
+                    trajectory_record: dict[str, float | str] = {
+                        "epoch": float(epoch),
+                        "step": float(trajectory_index),
+                        "global_step": float(global_step),
+                        "progress_pct": float(progress_pct),
+                        "expression": str(expression),
+                        "action_count": float(len(tokens)),
+                        "reward": float(breakdown.reward),
+                        "rank_ic": float(breakdown.rank_ic),
+                        "long_ir": float(breakdown.long_ir),
+                        "risk_penalty": float(breakdown.risk_penalty),
+                        "log_pf": float(log_pf.detach().cpu()),
+                        "tb_loss": float(trajectory_loss.detach().cpu()),
+                        "trajectory_seconds": float(trajectory_seconds),
+                        "elapsed_seconds": float(time.perf_counter() - training_started),
+                    }
+                    self.trajectory_history.append(trajectory_record)
+                    print(
+                        f"[GFlowNet] trajectory"
+                        f" epoch={epoch:03d}/{self.config.epochs:03d}"
+                        f" step={trajectory_index:03d}/{self.config.trajectories_per_epoch:03d}"
+                        f" global_step={global_step:05d}/{total_trajectory_steps:05d}"
+                        f" progress={progress_pct:6.2f}%"
+                        f" actions={len(tokens)}"
+                        f" expression={expression}"
+                        f" reward={breakdown.reward:.6f}"
+                        f" rank_ic={breakdown.rank_ic:.6f}"
+                        f" long_ir={breakdown.long_ir:.6f}"
+                        f" risk_penalty={breakdown.risk_penalty:.6f}"
+                        f" log_pf={trajectory_record['log_pf']:.6f}"
+                        f" tb_loss={trajectory_record['tb_loss']:.6f}"
+                        f" step_seconds={trajectory_seconds:.2f}"
+                        f" elapsed_seconds={trajectory_record['elapsed_seconds']:.2f}",
+                        flush=True,
+                    )
                 loss = torch.stack(losses).mean()
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
@@ -198,6 +248,7 @@ class GFlowNetTrainer:
             "action_tokens": ACTION_TOKENS,
             "best_loss": best_loss,
             "history": self.history,
+            "trajectory_history": self.trajectory_history,
         }
         torch.save(payload, Path(path))
 
@@ -218,6 +269,7 @@ class GFlowNetTrainer:
         trainer.optimizer.load_state_dict(payload["optimizer_state"])
         trainer.log_z.data.copy_(payload["log_z"].to(target_device))
         trainer.history = list(payload.get("history", []))
+        trainer.trajectory_history = list(payload.get("trajectory_history", []))
         return trainer
 
     @torch.no_grad()
@@ -228,12 +280,12 @@ class GFlowNetTrainer:
             expression, _, tokens = self.sample_trajectory()
             key = str(expression)
             if key in unique:
-                if attempt % 100 == 0:
-                    print(
-                        f"[GFlowNet] alpha_pool_progress attempt={attempt}/{attempts} "
-                        f"unique={len(unique)} target_candidates={size * 5}",
-                        flush=True,
-                    )
+                print(
+                    f"[GFlowNet] alpha_pool_step attempt={attempt:04d}/{attempts:04d} "
+                    f"status=duplicate unique={len(unique)} target_candidates={size * 5} "
+                    f"expression={expression}",
+                    flush=True,
+                )
                 continue
             breakdown = self.reward_evaluator.evaluate(expression)
             unique[key] = {
@@ -243,13 +295,13 @@ class GFlowNetTrainer:
                 "complexity": expression.complexity(),
                 "depth": expression.depth(),
             }
-            if attempt % 100 == 0:
-                print(
-                    f"[GFlowNet] alpha_pool_progress attempt={attempt}/{attempts} "
-                    f"unique={len(unique)} target_candidates={size * 5} "
-                    f"latest_reward={breakdown.reward:.6f}",
-                    flush=True,
-                )
+            print(
+                f"[GFlowNet] alpha_pool_step attempt={attempt:04d}/{attempts:04d} "
+                f"status=accepted unique={len(unique)} target_candidates={size * 5} "
+                f"reward={breakdown.reward:.6f} rank_ic={breakdown.rank_ic:.6f} "
+                f"expression={expression}",
+                flush=True,
+            )
             if len(unique) >= size * 5:
                 break
         return sorted(unique.values(), key=lambda item: item["reward"], reverse=True)[:size]
