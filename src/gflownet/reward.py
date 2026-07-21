@@ -85,17 +85,17 @@ class RewardEvaluator:
                 "industry" in self.data, "market_cap" in self.data,
             )
 
-        rank_ic_series = work.groupby("date", observed=True)[["factor", "_target"]].apply(
-            lambda x: x["factor"].corr(x["_target"], method="spearman")
-        ).dropna()
+        factor_rank = work.groupby("date", observed=True)["factor"].rank(method="average")
+        target_rank = work.groupby("date", observed=True)["_target"].rank(method="average")
+        rank_ic_series = self._grouped_correlation(factor_rank, target_rank, work["date"])
         rank_ic = float(rank_ic_series.mean()) if len(rank_ic_series) else 0.0
 
-        def long_excess(group: pd.DataFrame) -> float:
-            cutoff = group["factor"].quantile(1.0 - self.top_quantile)
-            selected = group.loc[group["factor"] >= cutoff, "_target"]
-            return float(selected.mean() - group["_target"].mean()) if len(selected) else np.nan
-
-        excess = work.groupby("date", observed=True)[["factor", "_target"]].apply(long_excess).dropna()
+        grouped = work.groupby("date", observed=True)
+        cutoffs = grouped["factor"].quantile(1.0 - self.top_quantile)
+        selected_mask = work["factor"] >= work["date"].map(cutoffs)
+        selected_mean = work.loc[selected_mask].groupby("date", observed=True)["_target"].mean()
+        market_mean = grouped["_target"].mean()
+        excess = selected_mean.sub(market_mean).dropna()
         periods = 252.0 / (self.horizon - 1)
         excess_std = float(excess.std(ddof=1)) if len(excess) > 1 else 0.0
         long_ir = float(excess.mean() / excess_std * math.sqrt(periods)) if excess_std > 0 else 0.0
@@ -122,29 +122,55 @@ class RewardEvaluator:
         )
 
     @staticmethod
+    def _grouped_correlation(left: pd.Series, right: pd.Series, dates: pd.Series) -> pd.Series:
+        frame = pd.DataFrame({"date": dates, "left": left, "right": right}).dropna()
+        grouped = frame.groupby("date", observed=True)
+        left_centered = frame["left"] - grouped["left"].transform("mean")
+        right_centered = frame["right"] - grouped["right"].transform("mean")
+        numerator = (left_centered * right_centered).groupby(frame["date"], observed=True).sum()
+        left_ss = left_centered.pow(2).groupby(frame["date"], observed=True).sum()
+        right_ss = right_centered.pow(2).groupby(frame["date"], observed=True).sum()
+        denominator = np.sqrt(left_ss * right_ss).replace(0.0, np.nan)
+        return numerator.div(denominator).replace([np.inf, -np.inf], np.nan).dropna()
+
+    @staticmethod
     def _size_exposure(work: pd.DataFrame) -> float:
         if "market_cap" not in work:
             return 0.0
-        values: list[float] = []
-        for _, group in work.dropna(subset=["market_cap"]).groupby("date", observed=True):
-            if len(group) >= 5:
-                corr = group["factor"].corr(np.log1p(group["market_cap"].clip(lower=0)), method="spearman")
-                if pd.notna(corr):
-                    values.append(abs(float(corr)))
-        return float(np.mean(values)) if values else 0.0
+        valid = work.dropna(subset=["factor", "market_cap"]).copy()
+        counts = valid.groupby("date", observed=True).size()
+        valid = valid[valid["date"].isin(counts[counts >= 5].index)]
+        if valid.empty:
+            return 0.0
+        factor_rank = valid.groupby("date", observed=True)["factor"].rank(method="average")
+        log_size = np.log1p(valid["market_cap"].clip(lower=0.0))
+        size_rank = log_size.groupby(valid["date"], observed=True).rank(method="average")
+        correlations = RewardEvaluator._grouped_correlation(
+            factor_rank, size_rank, valid["date"]
+        )
+        return float(correlations.abs().mean()) if len(correlations) else 0.0
 
     @staticmethod
     def _industry_exposure(work: pd.DataFrame) -> float:
         if "industry" not in work:
             return 0.0
-        values: list[float] = []
-        for _, group in work.dropna(subset=["industry"]).groupby("date", observed=True):
-            if group["industry"].nunique() < 2 or len(group) < 8:
-                continue
-            y = group["factor"].to_numpy(float)
-            dummies = pd.get_dummies(group["industry"], drop_first=False, dtype=float).to_numpy()
-            fitted = dummies @ np.linalg.lstsq(dummies, y, rcond=None)[0]
-            total = np.square(y - y.mean()).sum()
-            r2 = 1.0 - np.square(y - fitted).sum() / total if total > 0 else 0.0
-            values.append(float(np.clip(r2, 0.0, 1.0)))
-        return float(np.mean(values)) if values else 0.0
+        valid = work.dropna(subset=["factor", "industry"]).copy()
+        grouped = valid.groupby("date", observed=True)
+        counts = grouped.size()
+        industry_counts = grouped["industry"].nunique()
+        valid_dates = counts[(counts >= 8) & (industry_counts >= 2)].index
+        valid = valid[valid["date"].isin(valid_dates)]
+        if valid.empty:
+            return 0.0
+        daily_mean = valid.groupby("date", observed=True)["factor"].transform("mean")
+        industry_mean = valid.groupby(
+            ["date", "industry"], observed=True
+        )["factor"].transform("mean")
+        total_ss = (valid["factor"] - daily_mean).pow(2).groupby(
+            valid["date"], observed=True
+        ).sum()
+        residual_ss = (valid["factor"] - industry_mean).pow(2).groupby(
+            valid["date"], observed=True
+        ).sum()
+        r_squared = (1.0 - residual_ss.div(total_ss.replace(0.0, np.nan))).clip(0.0, 1.0)
+        return float(r_squared.dropna().mean()) if r_squared.notna().any() else 0.0

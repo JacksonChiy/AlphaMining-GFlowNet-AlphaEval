@@ -38,6 +38,10 @@ def run(config_path: str, require_a100: bool = True, pool_size: int = 100) -> Pa
     config = load_config(config_path)
     hardware = gpu_report(require_a100)
     print(f"[GFlowNet] hardware={hardware}", flush=True)
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     seed_everything(int(config["training"]["seed"]))
     experiment_dir = create_experiment(config_path)
     print(f"[GFlowNet] experiment_id={experiment_dir.name}", flush=True)
