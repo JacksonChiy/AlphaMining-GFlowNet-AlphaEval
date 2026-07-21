@@ -81,9 +81,8 @@ class RewardEvaluator:
                 "industry" in self.data, "market_cap" in self.data,
             )
 
-        rank_ic_series = work.groupby("date", observed=True).apply(
-            lambda x: x["factor"].corr(x["_target"], method="spearman"),
-            include_groups=False,
+        rank_ic_series = work.groupby("date", observed=True)[["factor", "_target"]].apply(
+            lambda x: x["factor"].corr(x["_target"], method="spearman")
         ).dropna()
         rank_ic = float(rank_ic_series.mean()) if len(rank_ic_series) else 0.0
 
@@ -92,7 +91,7 @@ class RewardEvaluator:
             selected = group.loc[group["factor"] >= cutoff, "_target"]
             return float(selected.mean() - group["_target"].mean()) if len(selected) else np.nan
 
-        excess = work.groupby("date", observed=True).apply(long_excess, include_groups=False).dropna()
+        excess = work.groupby("date", observed=True)[["factor", "_target"]].apply(long_excess).dropna()
         periods = 252.0 / self.horizon
         excess_std = float(excess.std(ddof=1)) if len(excess) > 1 else 0.0
         long_ir = float(excess.mean() / excess_std * math.sqrt(periods)) if excess_std > 0 else 0.0
@@ -145,4 +144,3 @@ class RewardEvaluator:
             r2 = 1.0 - np.square(y - fitted).sum() / total if total > 0 else 0.0
             values.append(float(np.clip(r2, 0.0, 1.0)))
         return float(np.mean(values)) if values else 0.0
-

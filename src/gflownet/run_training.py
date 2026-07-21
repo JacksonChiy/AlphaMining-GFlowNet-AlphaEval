@@ -10,7 +10,7 @@ import torch
 from src.gflownet.model import GFlowNetPolicy, PolicyConfig
 from src.gflownet.reward import RewardEvaluator
 from src.gflownet.trainer import GFlowNetTrainer, TrainerConfig, save_alpha_pool
-from src.utils import load_config, seed_everything
+from src.utils import create_experiment, load_config, seed_everything
 
 
 def gpu_report(require_a100: bool = False) -> dict[str, str | bool | float]:
@@ -34,10 +34,12 @@ def gpu_report(require_a100: bool = False) -> dict[str, str | bool | float]:
     return result
 
 
-def run(config_path: str, require_a100: bool = False, pool_size: int = 100) -> None:
+def run(config_path: str, require_a100: bool = True, pool_size: int = 100) -> Path:
     config = load_config(config_path)
     print(gpu_report(require_a100))
     seed_everything(int(config["training"]["seed"]))
+    experiment_dir = create_experiment(config_path)
+    print("experiment_id:", experiment_dir.name)
     data = pd.read_pickle(config["dataset"]["output"])
     evaluator = RewardEvaluator(data, **config["reward"])
     policy_values = dict(config["model"])
@@ -50,18 +52,25 @@ def run(config_path: str, require_a100: bool = False, pool_size: int = 100) -> N
     metrics = trainer.train("checkpoints/gflownet_best.pt")
     Path("results").mkdir(exist_ok=True)
     metrics.to_csv("results/gflownet_training_metrics.csv", index=False)
+    metrics.to_csv(experiment_dir / "model_metrics.csv", index=False)
     loaded = GFlowNetTrainer.load_checkpoint("checkpoints/gflownet_best.pt", evaluator)
     pool = loaded.generate_pool(size=pool_size)
-    save_alpha_pool(pool, data)
+    metadata, _ = save_alpha_pool(pool, data)
+    metadata.to_csv(experiment_dir / "factor_results.csv", index=False)
+    return experiment_dir
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/training_config.yaml")
-    parser.add_argument("--require-a100", action="store_true")
+    parser.add_argument(
+        "--allow-non-a100",
+        action="store_true",
+        help="Only for small CPU/GPU smoke tests; formal training requires A100.",
+    )
     parser.add_argument("--pool-size", type=int, default=100)
     args = parser.parse_args()
-    run(args.config, args.require_a100, args.pool_size)
+    run(args.config, not args.allow_non_a100, args.pool_size)
 
 
 if __name__ == "__main__":
