@@ -1,29 +1,22 @@
-# Daily replication methodology
+# 日频复现方法说明
 
-## Point-in-time boundary
+## 时点边界
 
-At date `t`, an expression may use only same-day or earlier OHLCV/VWAP. The
-future-return label is `close(t+5) / close(t+1) - 1` and is created only inside
-reward, AlphaEval and LightGBM modules. RQAlphaPlus trades a score only when
-`signal_date < trade_date`.
+在交易日 `t`，表达式只能使用当日或更早的 OHLCV/VWAP 数据。未来收益标签为 `close(t+5) / close(t+1) - 1`，且仅在奖励计算、AlphaEval 和 LightGBM 模块内部生成。RQAlphaPlus 只有在 `signal_date < trade_date` 时才允许使用该预测分数交易。
 
-Rolling functions are grouped by security after stable sorting. Cross-sectional
-rank/z-score/demean operations are grouped by date. Missing prices are only
-forward-filled; no future observation is used to repair history.
+滚动运算先稳定排序，再按股票分组；截面排名、标准化和去均值运算按日期分组。缺失价格只允许前向填充，绝不使用未来观测修补历史数据。
 
-## Safe operator semantics
+## 安全算子语义
 
-- `log(x) = log(abs(x) + 1e-12)`
-- `sqrt(x) = sqrt(abs(x))`
-- `div(x, y)` returns missing when `abs(y) <= 1e-12`
-- windows require a complete lookback except delay/delta, which naturally return
-  missing until the lag exists
-- non-finite results remain missing and are excluded from evaluation
+- `log(x) = log(abs(x) + 1e-12)`；
+- `sqrt(x) = sqrt(abs(x))`；
+- 当 `abs(y) <= 1e-12` 时，`div(x, y)` 返回缺失值；
+- 除 `delay` 和 `delta` 外，窗口算子要求完整回看期；`delay` 和 `delta` 在滞后数据不足时自然返回缺失值；
+- 非有限结果保持为缺失值，并在评价时排除。
 
-## Reward
+## 奖励函数
 
-Daily Spearman IC is calculated only on dates meeting the minimum cross-section.
-Top-decile return is measured relative to the equal-weight cross-sectional mean.
+仅在截面股票数达到最低要求的日期计算日度 Spearman IC。Top 10% 组合收益相对于当日全截面等权平均收益计算。
 
 ```text
 reward = abs(mean RankIC)
@@ -31,22 +24,17 @@ reward = abs(mean RankIC)
        * exp(-risk_aversion * (industry_exposure + size_exposure))
 ```
 
-Industry exposure is the daily one-hot regression R-squared. Size exposure is
-absolute daily Spearman correlation with log market cap. Each term is exactly
-zero, and its applied flag false, if the real input field is absent.
+行业暴露使用日度行业独热变量回归的决定系数 R² 衡量；市值暴露使用因子与对数市值的日度 Spearman 相关系数绝对值衡量。若数据中没有对应真实字段，则该惩罚项严格为 0，元数据中的启用标志为 `false`。
 
-## AlphaEval mini version
+## AlphaEval 精简版本
 
-- PPS: absolute RankIC and ICIR.
-- Temporal stability: rolling RankIC dispersion and sign consistency.
-- Perturbation robustness: IC retention after seeded cross-sectional noise.
-- Financial logic: deterministic penalty for excessive length/depth.
-- RRE: adjacent-date rank correlation and average absolute rank change.
-- Diversity: quality-weighted DPP greedy MAP selection and correlation penalty.
+- 预测能力：RankIC 绝对值与 ICIR；
+- 时间稳定性：滚动 RankIC 的离散程度和符号一致率；
+- 扰动鲁棒性：加入固定随机种子的截面噪声后，IC 的保留比例；
+- 金融逻辑性：对过长表达式和过深嵌套施加确定性惩罚；
+- RRE：相邻交易日因子排名相关性与平均绝对排名变化；
+- 多样性：质量加权 DPP 贪心 MAP 筛选与相关性惩罚。
 
-## Validation caveats
+## 验证注意事项
 
-Mining, AlphaEval, hyperparameter selection and performance reporting should use
-separate time periods in a production study. The code purges overlapping labels
-from each LightGBM fold, but the user must reserve a final untouched evaluation
-period. The report's proprietary data universe and Barra data are not inferred.
+正式研究应为因子挖掘、AlphaEval、超参数选择和最终业绩报告划分相互独立的时间区间。代码会从每个 LightGBM 滚动折中剔除标签重叠样本，但使用者仍必须保留一个从未参与开发的最终评价期。本项目不会猜测或补造研报使用的专有股票池及 Barra 数据。
