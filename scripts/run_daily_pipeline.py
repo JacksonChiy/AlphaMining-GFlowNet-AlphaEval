@@ -18,7 +18,7 @@ from src.utils import load_config
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the daily research pipeline")
     parser.add_argument("--config", default="configs/training_config.yaml")
-    parser.add_argument("--pool-size", type=int, default=100)
+    parser.add_argument("--pool-size", type=int, default=None)
     parser.add_argument(
         "--allow-non-a100",
         action="store_true",
@@ -28,12 +28,23 @@ def main() -> None:
     args = parser.parse_args()
     config = load_config(args.config)
 
+    dataset_filter_keys = (
+        "start_date", "end_date", "max_stocks", "universe_start_date",
+        "universe_end_date", "chunksize",
+    )
+    dataset_filters = {
+        key: config["dataset"][key]
+        for key in dataset_filter_keys
+        if config["dataset"].get(key) is not None
+    }
     price = prepare_price_csv(
         config["dataset"]["file"],
         config["dataset"]["output"],
         "results/data_quality_report.json",
+        **dataset_filters,
     )
-    experiment_dir = run_gflownet(args.config, not args.allow_non_a100, args.pool_size)
+    pool_size = args.pool_size or int(config.get("pipeline", {}).get("pool_size", 100))
+    experiment_dir = run_gflownet(args.config, not args.allow_non_a100, pool_size)
     factor_matrix = pd.read_pickle("results/alpha_factor_matrix.pkl")
     metadata = pd.read_csv("results/alpha_pool.csv")
     eval_values = dict(config["alpha_eval"])

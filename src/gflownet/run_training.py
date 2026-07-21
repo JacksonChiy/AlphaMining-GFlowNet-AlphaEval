@@ -72,7 +72,7 @@ def run(config_path: str, require_a100: bool = True, pool_size: int = 100) -> Pa
     loaded = GFlowNetTrainer.load_checkpoint("checkpoints/gflownet_best.pt", evaluator)
     print(f"[GFlowNet] alpha_pool_generation_start target_size={pool_size}", flush=True)
     pool = loaded.generate_pool(size=pool_size)
-    metadata, _ = save_alpha_pool(pool, data)
+    metadata, _ = save_alpha_pool(pool, data, min_coverage=evaluator.min_coverage)
     metadata.to_csv(experiment_dir / "factor_results.csv", index=False)
     print(
         f"[GFlowNet] alpha_pool_generation_complete factors={len(metadata)} "
