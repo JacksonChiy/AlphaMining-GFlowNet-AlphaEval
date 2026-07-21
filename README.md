@@ -37,6 +37,8 @@
 
 Notebook 默认 `FAST_MODE=True`，使用 `configs/quick_training_config.yaml` 快速生成首个模型：分块读取 2021 年以来的数据，并使用 2020 年下半年成交额选择 800 只股票；GFlowNet Reward 和 AlphaEval 只使用 2021–2022 年，避免样本外泄漏。选出的表达式会在 2021–2026 完整序列上重新计算，以保留时间序列算子的历史预热；LightGBM 使用 2023 年以前的数据建立初始模型，只输出 2023 年以后的预测分数供回测。GFlowNet 使用 8 个 epoch、每轮 16 条轨迹，最终生成 20 个因子。流程验证完成后把 `FAST_MODE=False`，即可切换到 `configs/training_config.yaml` 的正式全量训练。
 
+如果已经完成 GFlowNet 训练并保留 `results/alpha_pool.csv`，Notebook 的 `REUSE_EXISTING_ALPHA_POOL=True` 会跳过重新训练，从保存的 token 恢复表达式并直接重算 2021–2026 因子。命令行也可运行 `python -m src.gflownet.recompute_factors --config configs/quick_training_config.yaml`。
+
 本地数据准备与单元测试：
 
 ```bash
