@@ -23,7 +23,7 @@ class LightGBMConfig:
 
 
 class LightGBMFusion:
-    """Purged rolling-window LightGBM for future five-day cross-sectional returns."""
+    """Purged rolling LightGBM for close(t+5) / close(t+1) - 1 labels."""
 
     def __init__(self, config: LightGBMConfig | None = None) -> None:
         self.config = config or LightGBMConfig()
