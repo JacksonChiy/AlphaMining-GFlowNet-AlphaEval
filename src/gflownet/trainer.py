@@ -15,7 +15,7 @@ import torch
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 
-from src.expression import Expression
+from src.expression import Expression, SubexpressionCache
 
 from .grammar import ACTION_TOKENS, GrammarState, Vocabulary
 from .model import GFlowNetPolicy, PolicyConfig
@@ -152,9 +152,12 @@ class GFlowNetTrainer:
                 key = str(expression)
                 evaluated_by_expression[key] = self.reward_evaluator.evaluate(expression)
                 if log_progress:
+                    cache = self.reward_evaluator.cache_stats()
                     print(
                         f"[GFlowNet] reward_progress completed={completed:03d}/"
-                        f"{len(unique_expressions):03d} expression={expression}",
+                        f"{len(unique_expressions):03d} expression={expression} "
+                        f"cache_hits={cache['hits']} cache_misses={cache['misses']} "
+                        f"cache_hit_rate={cache['hit_rate']:.2%}",
                         flush=True,
                     )
         else:
@@ -166,9 +169,12 @@ class GFlowNetTrainer:
                 expression = future_to_expression[future]
                 evaluated_by_expression[str(expression)] = future.result()
                 if log_progress:
+                    cache = self.reward_evaluator.cache_stats()
                     print(
                         f"[GFlowNet] reward_progress completed={completed:03d}/"
-                        f"{len(unique_expressions):03d} expression={expression}",
+                        f"{len(unique_expressions):03d} expression={expression} "
+                        f"cache_hits={cache['hits']} cache_misses={cache['misses']} "
+                        f"cache_hit_rate={cache['hit_rate']:.2%}",
                         flush=True,
                     )
         return [evaluated_by_expression[str(expression)] for expression in expressions]
@@ -185,12 +191,18 @@ class GFlowNetTrainer:
         best_loss = float("inf")
         training_started = time.perf_counter()
         total_trajectory_steps = self.config.epochs * self.config.trajectories_per_epoch
+        initial_cache = self.reward_evaluator.cache_stats()
         print(
             "[GFlowNet] training_start "
             f"device={self.device} epochs={self.config.epochs} "
             f"trajectories_per_epoch={self.config.trajectories_per_epoch} "
             f"reward_workers={self.config.reward_workers} "
-            f"amp={self.amp_enabled} checkpoint={checkpoint_path}",
+            f"amp={self.amp_enabled} subexpression_cache={initial_cache['enabled']} "
+            f"cache_max_entries="
+            f"{getattr(self.reward_evaluator.subexpression_cache, 'max_entries', 0)} "
+            f"cache_max_mb="
+            f"{getattr(self.reward_evaluator.subexpression_cache, 'max_bytes', 0) / 1024**2:.1f} "
+            f"checkpoint={checkpoint_path}",
             flush=True,
         )
         reward_executor = (
@@ -200,6 +212,7 @@ class GFlowNetTrainer:
         )
         for epoch in range(1, self.config.epochs + 1):
             epoch_started = time.perf_counter()
+            cache_before = self.reward_evaluator.cache_stats()
             print(
                 f"[GFlowNet] epoch_start epoch={epoch:03d}/{self.config.epochs:03d} "
                 f"trajectories={self.config.trajectories_per_epoch} "
@@ -320,6 +333,7 @@ class GFlowNetTrainer:
                 gpu_allocated_gb = torch.cuda.memory_allocated(self.device) / 1024**3
                 gpu_reserved_gb = torch.cuda.memory_reserved(self.device) / 1024**3
                 gpu_peak_gb = torch.cuda.max_memory_allocated(self.device) / 1024**3
+            cache_after = self.reward_evaluator.cache_stats()
             record = {
                 "epoch": float(epoch),
                 "loss": float(loss.detach().cpu()),
@@ -337,6 +351,15 @@ class GFlowNetTrainer:
                 "gpu_allocated_gb": float(gpu_allocated_gb),
                 "gpu_reserved_gb": float(gpu_reserved_gb),
                 "gpu_peak_gb": float(gpu_peak_gb),
+                "cache_hits": float(cache_after["hits"] - cache_before["hits"]),
+                "cache_misses": float(cache_after["misses"] - cache_before["misses"]),
+                "cache_waits": float(cache_after["waits"] - cache_before["waits"]),
+                "cache_evictions": float(
+                    cache_after["evictions"] - cache_before["evictions"]
+                ),
+                "cache_hit_rate": float(cache_after["hit_rate"]),
+                "cache_entries": float(cache_after["entries"]),
+                "cache_memory_mb": float(cache_after["memory_mb"]),
             }
             self.history.append(record)
             is_best = record["loss"] < best_loss
@@ -364,6 +387,12 @@ class GFlowNetTrainer:
                 f" reward_seconds={reward_seconds:.2f}"
                 f" epoch_seconds={epoch_seconds:.2f}"
                 f" elapsed_seconds={elapsed_seconds:.2f}"
+                f" cache_hits={int(record['cache_hits'])}"
+                f" cache_misses={int(record['cache_misses'])}"
+                f" cache_waits={int(record['cache_waits'])}"
+                f" cache_hit_rate={record['cache_hit_rate']:.2%}"
+                f" cache_entries={int(record['cache_entries'])}"
+                f" cache_memory_mb={record['cache_memory_mb']:.1f}"
                 f" checkpoint={'saved' if is_best else '-'}"
                 f"{gpu_log}",
                 flush=True,
@@ -507,10 +536,12 @@ def save_alpha_pool(
         )
     metadata_rows: list[dict[str, Any]] = []
     matrix = data[["date", "code"]].copy()
+    ordered = data.sort_values(["code", "date"], kind="stable")
+    expression_cache = SubexpressionCache(ordered)
     for index, item in enumerate(eligible_pool, start=1):
         name = f"factor_{index:03d}"
         expression: Expression = item["expression"]
-        matrix[name] = expression.execute(data).to_numpy()
+        matrix[name] = expression.execute(ordered, cache=expression_cache).reindex(data.index).to_numpy()
         metadata_rows.append({
             "factor": name,
             "expression": str(expression),
@@ -523,4 +554,11 @@ def save_alpha_pool(
     matrix_path.parent.mkdir(parents=True, exist_ok=True)
     metadata.to_csv(metadata_path, index=False)
     matrix.to_pickle(matrix_path)
+    cache = expression_cache.stats()
+    print(
+        f"[FactorPool] cache_summary hits={cache['hits']} misses={cache['misses']} "
+        f"hit_rate={cache['hit_rate']:.2%} evictions={cache['evictions']} "
+        f"memory_mb={cache['memory_mb']:.1f}",
+        flush=True,
+    )
     return metadata, matrix
