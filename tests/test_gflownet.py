@@ -142,6 +142,9 @@ def test_training_prints_epoch_metrics(
         "cache_hit_rate",
         "cache_entries",
         "cache_memory_mb",
+        "ts_torch_calls",
+        "ts_pandas_calls",
+        "ts_torch_seconds",
     }.issubset(metrics.columns)
 
 

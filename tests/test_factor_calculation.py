@@ -2,9 +2,17 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
+import torch
 
 from src.gflownet.reward import RewardEvaluator, make_forward_return
-from src.operators import apply_binary, apply_cross_sectional, apply_time_series
+from src.operators import (
+    apply_binary,
+    apply_cross_sectional,
+    apply_time_series,
+    configure_time_series_backend,
+    get_time_series_backend_info,
+)
 
 
 def test_safe_division_and_cross_section() -> None:
@@ -23,6 +31,75 @@ def test_rolling_window_is_grouped_by_security() -> None:
     result = apply_time_series("ts_mean", values, codes, 2)
     assert np.isnan(result.iloc[0]) and result.iloc[1] == 1.5
     assert np.isnan(result.iloc[2]) and result.iloc[3] == 15.0
+
+
+@pytest.mark.parametrize(
+    "operator",
+    [
+        "ts_mean",
+        "ts_std",
+        "ts_rank",
+        "ts_delay",
+        "ts_delta",
+        "ts_sum",
+        "ts_max",
+        "ts_min",
+        "ts_zscore",
+    ],
+)
+def test_torch_time_series_matches_pandas(operator: str) -> None:
+    values = pd.Series(
+        [1.0, 2.0, 2.0, 4.0, np.nan, 6.0, 10.0, 10.0, 12.0, 15.0, 18.0],
+        index=np.arange(20, 31),
+    )
+    codes = pd.Series(["A"] * 6 + ["B"] * 5, index=values.index)
+    try:
+        configure_time_series_backend("pandas")
+        expected = apply_time_series(operator, values, codes, 3)
+        configure_time_series_backend(
+            "torch", device="cpu", chunk_size=1, dtype="float64"
+        )
+        actual = apply_time_series(operator, values, codes, 3)
+    finally:
+        configure_time_series_backend("auto")
+
+    pd.testing.assert_series_equal(
+        actual,
+        expected,
+        check_dtype=False,
+        check_names=True,
+        rtol=1e-10,
+        atol=1e-10,
+    )
+
+
+def test_torch_backend_rejects_non_contiguous_code_groups() -> None:
+    values = pd.Series([1.0, 2.0, 3.0])
+    codes = pd.Series(["A", "B", "A"])
+    try:
+        configure_time_series_backend("torch", device="cpu")
+        with pytest.raises(ValueError, match="grouped by code"):
+            apply_time_series("ts_mean", values, codes, 2)
+    finally:
+        configure_time_series_backend("auto")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_torch_cuda_time_series_matches_cpu_pandas() -> None:
+    values = pd.Series(np.linspace(1.0, 20.0, 20))
+    codes = pd.Series(["A"] * 10 + ["B"] * 10)
+    try:
+        configure_time_series_backend("pandas")
+        expected = apply_time_series("ts_zscore", values, codes, 5)
+        configure_time_series_backend("torch", device="cuda", chunk_size=2)
+        actual = apply_time_series("ts_zscore", values, codes, 5)
+        info = get_time_series_backend_info()
+    finally:
+        configure_time_series_backend("auto")
+
+    assert info["resolved_backend"] == "torch"
+    assert str(info["resolved_device"]).startswith("cuda")
+    assert np.allclose(actual, expected, equal_nan=True, rtol=1e-5, atol=1e-5)
 
 
 def test_forward_return_uses_tplus5_over_tplus1() -> None:

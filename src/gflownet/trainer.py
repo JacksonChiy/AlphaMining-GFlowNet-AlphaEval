@@ -16,6 +16,7 @@ from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 
 from src.expression import Expression, SubexpressionCache
+from src.operators import get_time_series_backend_info, get_time_series_runtime_stats
 
 from .grammar import ACTION_TOKENS, GrammarState, Vocabulary
 from .model import GFlowNetPolicy, PolicyConfig
@@ -192,6 +193,7 @@ class GFlowNetTrainer:
         training_started = time.perf_counter()
         total_trajectory_steps = self.config.epochs * self.config.trajectories_per_epoch
         initial_cache = self.reward_evaluator.cache_stats()
+        time_series_backend = get_time_series_backend_info()
         print(
             "[GFlowNet] training_start "
             f"device={self.device} epochs={self.config.epochs} "
@@ -202,6 +204,10 @@ class GFlowNetTrainer:
             f"{getattr(self.reward_evaluator.subexpression_cache, 'max_entries', 0)} "
             f"cache_max_mb="
             f"{getattr(self.reward_evaluator.subexpression_cache, 'max_bytes', 0) / 1024**2:.1f} "
+            f"ts_backend={time_series_backend['resolved_backend']} "
+            f"ts_device={time_series_backend['resolved_device']} "
+            f"ts_chunk_size={time_series_backend['chunk_size']} "
+            f"ts_dtype={time_series_backend['dtype']} "
             f"checkpoint={checkpoint_path}",
             flush=True,
         )
@@ -213,6 +219,7 @@ class GFlowNetTrainer:
         for epoch in range(1, self.config.epochs + 1):
             epoch_started = time.perf_counter()
             cache_before = self.reward_evaluator.cache_stats()
+            time_series_before = get_time_series_runtime_stats()
             print(
                 f"[GFlowNet] epoch_start epoch={epoch:03d}/{self.config.epochs:03d} "
                 f"trajectories={self.config.trajectories_per_epoch} "
@@ -334,6 +341,7 @@ class GFlowNetTrainer:
                 gpu_reserved_gb = torch.cuda.memory_reserved(self.device) / 1024**3
                 gpu_peak_gb = torch.cuda.max_memory_allocated(self.device) / 1024**3
             cache_after = self.reward_evaluator.cache_stats()
+            time_series_after = get_time_series_runtime_stats()
             record = {
                 "epoch": float(epoch),
                 "loss": float(loss.detach().cpu()),
@@ -360,6 +368,16 @@ class GFlowNetTrainer:
                 "cache_hit_rate": float(cache_after["hit_rate"]),
                 "cache_entries": float(cache_after["entries"]),
                 "cache_memory_mb": float(cache_after["memory_mb"]),
+                "ts_torch_calls": float(
+                    time_series_after["torch_calls"] - time_series_before["torch_calls"]
+                ),
+                "ts_pandas_calls": float(
+                    time_series_after["pandas_calls"] - time_series_before["pandas_calls"]
+                ),
+                "ts_torch_seconds": float(
+                    time_series_after["torch_seconds"]
+                    - time_series_before["torch_seconds"]
+                ),
             }
             self.history.append(record)
             is_best = record["loss"] < best_loss
@@ -393,6 +411,9 @@ class GFlowNetTrainer:
                 f" cache_hit_rate={record['cache_hit_rate']:.2%}"
                 f" cache_entries={int(record['cache_entries'])}"
                 f" cache_memory_mb={record['cache_memory_mb']:.1f}"
+                f" ts_torch_calls={int(record['ts_torch_calls'])}"
+                f" ts_pandas_calls={int(record['ts_pandas_calls'])}"
+                f" ts_torch_seconds={record['ts_torch_seconds']:.2f}"
                 f" checkpoint={'saved' if is_best else '-'}"
                 f"{gpu_log}",
                 flush=True,
