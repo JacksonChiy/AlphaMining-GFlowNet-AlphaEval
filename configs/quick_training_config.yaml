@@ -53,6 +53,8 @@ alpha_eval:
   rolling_window: 40
   perturbation_std: 0.05
   dpp_k: 20
+  dpp_max_rows: 300000
+  verbose: true
   seed: 42
 
 lightgbm:

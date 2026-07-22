@@ -143,6 +143,8 @@ CoveragePenalty = min(1, (effective_coverage / min_coverage) ^ power)
 
 `results/alpha_eval_result.csv` 至少包含 `factor`、`IC`、`RankIC`、`ICIR`、`Sharpe`、`complexity` 和 `score`，并附带滚动 IC、扰动鲁棒性、RRE 与 DPP 诊断结果。
 
+AlphaEval 的日度相关性和排名稳定性使用向量化计算，并逐因子打印四阶段耗时、总进度和预计剩余时间。DPP 按交易日均匀抽样，快速/正式配置最多使用 300,000/500,000 行构建多样性矩阵；因子预测能力指标仍使用完整样本。
+
 LightGBM 使用滚动训练窗和 5 个交易日的 purge 间隔，预测标签为：
 
 ```text
