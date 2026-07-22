@@ -12,7 +12,7 @@ from src.alpha_eval import AlphaEval, AlphaEvalConfig
 from src.data_loader import prepare_price_csv
 from src.gflownet.run_training import run as run_gflownet
 from src.model import LightGBMConfig, LightGBMFusion
-from src.utils import load_config, slice_date_range
+from src.utils import load_config, slice_date_range, validate_research_date_split
 
 
 def main() -> None:
@@ -27,6 +27,7 @@ def main() -> None:
     parser.add_argument("--rqalpha-bundle", default=None)
     args = parser.parse_args()
     config = load_config(args.config)
+    print(f"[Pipeline] date_split={validate_research_date_split(config)}", flush=True)
 
     dataset_filter_keys = (
         "start_date", "end_date", "max_stocks", "universe_start_date",
