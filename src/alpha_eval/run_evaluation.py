@@ -5,7 +5,12 @@ import argparse
 import pandas as pd
 
 from src.alpha_eval import AlphaEval, AlphaEvalConfig
-from src.utils import load_config, slice_date_range
+from src.utils import (
+    load_config,
+    slice_date_range,
+    validate_frame_covers_period,
+    validate_research_date_split,
+)
 
 
 def main() -> None:
@@ -17,6 +22,7 @@ def main() -> None:
     parser.add_argument("--output", default="results/alpha_eval_result.csv")
     args = parser.parse_args()
     config = load_config(args.config)
+    print(f"[AlphaEval] date_split={validate_research_date_split(config)}", flush=True)
     values = dict(config["alpha_eval"])
     values["horizon"] = int(config["dataset"]["horizon"])
     price = pd.read_pickle(args.price)
@@ -31,6 +37,18 @@ def main() -> None:
         factors,
         config["dataset"].get("mining_start_date"),
         config["dataset"].get("mining_end_date"),
+        label="AlphaEval factor data",
+    )
+    validate_frame_covers_period(
+        price,
+        config["dataset"]["mining_start_date"],
+        config["dataset"]["mining_end_date"],
+        label="AlphaEval price data",
+    )
+    validate_frame_covers_period(
+        factors,
+        config["dataset"]["mining_start_date"],
+        config["dataset"]["mining_end_date"],
         label="AlphaEval factor data",
     )
     metadata = pd.read_csv(args.metadata)

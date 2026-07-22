@@ -9,7 +9,12 @@ import json
 
 from src.model import LightGBMConfig, LightGBMFusion
 from src.gflownet import execute_saved_alpha_pool
-from src.utils import slice_date_range
+from src.utils import (
+    load_config,
+    slice_date_range,
+    validate_frame_covers_period,
+    validate_research_date_split,
+)
 
 
 def test_slice_date_range_is_inclusive() -> None:
@@ -27,6 +32,38 @@ def test_slice_date_range_rejects_empty_period() -> None:
     frame = pd.DataFrame({"date": [pd.Timestamp("2022-01-01")]})
     with pytest.raises(ValueError, match="has no rows"):
         slice_date_range(frame, "2023-01-01", label="test data")
+
+
+def test_training_configs_use_2020_2023_and_2024_2026_split() -> None:
+    for path in (
+        "configs/quick_training_config.yaml",
+        "configs/training_config.yaml",
+    ):
+        config = load_config(path)
+        assert validate_research_date_split(config) == {
+            "training": "2020-01-01..2023-12-31",
+            "out_of_sample": "2024-01-01..2026-12-31",
+        }
+        assert config["lightgbm"]["train_window_days"] == 1008
+        assert config["lightgbm"]["min_train_days"] == 756
+
+
+def test_date_split_rejects_training_oos_overlap() -> None:
+    config = load_config("configs/quick_training_config.yaml")
+    config["dataset"]["mining_end_date"] = "2024-01-02"
+    with pytest.raises(ValueError, match="must not overlap"):
+        validate_research_date_split(config)
+
+
+def test_training_coverage_rejects_stale_daily_price() -> None:
+    stale = pd.DataFrame({"date": pd.bdate_range("2021-01-01", "2023-12-29")})
+    with pytest.raises(ValueError, match="rebuild daily_price.pkl"):
+        validate_frame_covers_period(
+            stale,
+            "2020-01-01",
+            "2023-12-31",
+            label="training data",
+        )
 
 
 def test_lightgbm_prediction_period_preserves_training_history() -> None:
