@@ -3,6 +3,13 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from .torch_timeseries import (
+    apply_time_series_torch,
+    get_time_series_backend_config,
+    record_pandas_time_series_call,
+    resolve_time_series_device,
+)
+
 EPS = 1e-12
 
 
@@ -37,7 +44,9 @@ def apply_binary(name: str, left: pd.Series, right: pd.Series) -> pd.Series:
     return _finite(value)
 
 
-def apply_time_series(name: str, value: pd.Series, code: pd.Series, window: int) -> pd.Series:
+def _apply_time_series_pandas(
+    name: str, value: pd.Series, code: pd.Series, window: int
+) -> pd.Series:
     grouped = value.groupby(code, observed=True, sort=False)
     min_periods = window
     if name == "ts_delay":
@@ -67,6 +76,14 @@ def apply_time_series(name: str, value: pd.Series, code: pd.Series, window: int)
     return _finite(result.reset_index(level=0, drop=True))
 
 
+def apply_time_series(name: str, value: pd.Series, code: pd.Series, window: int) -> pd.Series:
+    config = get_time_series_backend_config()
+    if resolve_time_series_device(config) is not None:
+        return apply_time_series_torch(name, value, code, window, config)
+    record_pandas_time_series_call()
+    return _apply_time_series_pandas(name, value, code, window)
+
+
 def apply_cross_sectional(name: str, value: pd.Series, date: pd.Series) -> pd.Series:
     grouped = value.groupby(date, observed=True, sort=False)
     if name == "cs_rank":
@@ -80,4 +97,3 @@ def apply_cross_sectional(name: str, value: pd.Series, date: pd.Series) -> pd.Se
     else:
         raise KeyError(f"Unknown cross-sectional operator: {name}")
     return _finite(result)
-

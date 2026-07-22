@@ -14,6 +14,12 @@ dataset:
   out_of_sample_end_date: null
   chunksize: 500000
 
+operators:
+  time_series_backend: auto
+  time_series_device: auto
+  time_series_chunk_size: 64
+  time_series_dtype: float32
+
 model:
   name: GFlowNet
   hidden_dim: 128
