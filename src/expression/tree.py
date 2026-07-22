@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Iterator, Sequence
+from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Sequence
 
 import pandas as pd
 
 from src.operators import apply_binary, apply_cross_sectional, apply_time_series, apply_unary
+
+if TYPE_CHECKING:
+    from .cache import SubexpressionCache
 
 
 FEATURES = ("open", "high", "low", "close", "volume", "vwap")
@@ -85,32 +88,47 @@ class Expression:
     def generate(cls, max_depth: int = 4, seed: int | None = None) -> "Expression":
         return ExpressionGenerator(max_depth=max_depth, seed=seed).generate()
 
-    def execute(self, data: pd.DataFrame) -> pd.Series:
+    def execute(
+        self,
+        data: pd.DataFrame,
+        cache: SubexpressionCache | None = None,
+    ) -> pd.Series:
         required = {"date", "code", *FEATURES}
         missing = sorted(required.difference(data.columns))
         if missing:
             raise ValueError(f"Expression data is missing columns: {missing}")
+        if cache is not None:
+            cache.validate_data(data)
+            return self._execute_node(self.root, data, cache)
         if not data[["code", "date"]].equals(
             data.sort_values(["code", "date"], kind="stable")[["code", "date"]]
         ):
             ordered = data.sort_values(["code", "date"], kind="stable")
-            values = self._execute_node(self.root, ordered)
+            values = self._execute_node(self.root, ordered, None)
             return values.reindex(data.index)
-        return self._execute_node(self.root, data)
+        return self._execute_node(self.root, data, None)
 
-    def _execute_node(self, node: Node, data: pd.DataFrame) -> pd.Series:
-        if node.kind == "feature":
-            return data[node.name].astype(float)
-        values = [self._execute_node(child, data) for child in node.children]
-        if node.kind == "unary":
-            return apply_unary(node.name, values[0])
-        if node.kind == "binary":
-            return apply_binary(node.name, values[0], values[1])
-        if node.kind == "ts":
-            return apply_time_series(node.name, values[0], data["code"], int(node.window))
-        if node.kind == "cs":
-            return apply_cross_sectional(node.name, values[0], data["date"])
-        raise AssertionError(node.kind)
+    def _execute_node(
+        self,
+        node: Node,
+        data: pd.DataFrame,
+        cache: SubexpressionCache | None,
+    ) -> pd.Series:
+        def compute() -> pd.Series:
+            if node.kind == "feature":
+                return data[node.name].astype(float)
+            values = [self._execute_node(child, data, cache) for child in node.children]
+            if node.kind == "unary":
+                return apply_unary(node.name, values[0])
+            if node.kind == "binary":
+                return apply_binary(node.name, values[0], values[1])
+            if node.kind == "ts":
+                return apply_time_series(node.name, values[0], data["code"], int(node.window))
+            if node.kind == "cs":
+                return apply_cross_sectional(node.name, values[0], data["date"])
+            raise AssertionError(node.kind)
+
+        return cache.get_or_compute(node, compute) if cache is not None else compute()
 
     def complexity(self) -> int:
         return self.root.complexity()
@@ -180,4 +198,3 @@ def expression_from_tokens(tokens: Sequence[str]) -> Expression:
     if index != len(tokens):
         raise ValueError(f"Unused tokens after expression: {tokens[index:]}")
     return Expression(root)
-

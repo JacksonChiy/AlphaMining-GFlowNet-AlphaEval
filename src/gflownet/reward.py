@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 import numpy as np
 import pandas as pd
 
-from src.expression import Expression
+from src.expression import Expression, SubexpressionCache
 
 
 def make_forward_return(data: pd.DataFrame, horizon: int = 5) -> pd.Series:
@@ -52,6 +52,9 @@ class RewardEvaluator:
         min_coverage: float = 0.80,
         coverage_penalty_power: float = 2.0,
         reward_floor: float = 1e-8,
+        subexpression_cache_enabled: bool = True,
+        subexpression_cache_max_entries: int = 128,
+        subexpression_cache_max_mb: float = 512.0,
     ) -> None:
         if not 0.0 < min_coverage <= 1.0:
             raise ValueError("min_coverage must be in (0, 1]")
@@ -67,18 +70,43 @@ class RewardEvaluator:
         self.reward_floor = reward_floor
         self.data["_target"] = make_forward_return(self.data, horizon)
         self.cache: dict[str, RewardBreakdown] = {}
+        self.subexpression_cache = (
+            SubexpressionCache(
+                self.data,
+                max_entries=subexpression_cache_max_entries,
+                max_bytes=int(subexpression_cache_max_mb * 1024**2),
+            )
+            if subexpression_cache_enabled
+            else None
+        )
 
     def evaluate(self, expression: Expression) -> RewardBreakdown:
         key = str(expression)
         if key in self.cache:
             return self.cache[key]
         try:
-            factor = expression.execute(self.data)
+            factor = expression.execute(self.data, cache=self.subexpression_cache)
             result = self.evaluate_factor(factor)
         except (FloatingPointError, ValueError, KeyError, OverflowError):
             result = self._empty_breakdown()
         self.cache[key] = result
         return result
+
+    def cache_stats(self) -> dict[str, int | float | bool]:
+        if self.subexpression_cache is None:
+            return {
+                "enabled": False,
+                "hits": 0,
+                "misses": 0,
+                "waits": 0,
+                "evictions": 0,
+                "oversized": 0,
+                "entries": 0,
+                "bytes": 0,
+                "memory_mb": 0.0,
+                "hit_rate": 0.0,
+            }
+        return {"enabled": True, **self.subexpression_cache.stats()}
 
     def evaluate_factor(self, factor: pd.Series) -> RewardBreakdown:
         work = self.data[["date", "code", "_target"]].copy()
