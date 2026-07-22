@@ -93,6 +93,7 @@ def test_training_prints_epoch_metrics(
     assert "[GFlowNet] batch_sampling_start epoch=001" in output
     assert "[GFlowNet] batch_sampling_complete epoch=001" in output
     assert "[GFlowNet] reward_progress completed=001/001" in output
+    assert "cache_hit_rate=" in output
     assert "[GFlowNet] trajectory epoch=001/001 step=001/001" in output
     assert "global_step=00001/00001" in output
     assert "progress=100.00%" in output
@@ -134,6 +135,13 @@ def test_training_prints_epoch_metrics(
         "gpu_reserved_gb",
         "gpu_peak_gb",
         "mean_coverage",
+        "cache_hits",
+        "cache_misses",
+        "cache_waits",
+        "cache_evictions",
+        "cache_hit_rate",
+        "cache_entries",
+        "cache_memory_mb",
     }.issubset(metrics.columns)
 
 

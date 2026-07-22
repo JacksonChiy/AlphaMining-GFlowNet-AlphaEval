@@ -115,9 +115,9 @@ python -m scripts.run_daily_pipeline --pool-size 100
 
 训练阶段保存 `checkpoints/gflownet_best.pt`，随后重新加载检查点，并生成 `factor_001`、`factor_002` 等因子元数据和因子值矩阵。
 
-训练过程中每条轨迹都实时打印 epoch/step、全局 step、总体完成百分比、表达式、动作数、reward、RankIC、LongIR、风险惩罚、观测覆盖率、有效交易日覆盖率、覆盖率惩罚、`logPF`、单轨迹 TB loss 和耗时；每个 epoch 更新参数后，再打印平均与最高奖励、平均 RankIC、平均覆盖率、`logZ`、梯度范数、学习率、耗时、最佳检查点状态及 A100 显存。逐轨迹明细写入 `results/gflownet_trajectory_metrics.csv`，逐 epoch 汇总写入 `results/gflownet_training_metrics.csv`。因子池生成阶段也会为每次尝试打印接受、重复或低覆盖拒绝状态。
+训练过程中每条轨迹都实时打印 epoch/step、全局 step、总体完成百分比、表达式、动作数、reward、RankIC、LongIR、风险惩罚、观测覆盖率、有效交易日覆盖率、覆盖率惩罚、`logPF`、单轨迹 TB loss 和耗时；Reward 进度同时输出子表达式缓存命中数、未命中数与命中率。每个 epoch 更新参数后，再打印平均与最高奖励、平均 RankIC、平均覆盖率、`logZ`、梯度范数、学习率、缓存命中/等待/内存、耗时、最佳检查点状态及 A100 显存。逐轨迹明细写入 `results/gflownet_trajectory_metrics.csv`，逐 epoch 汇总写入 `results/gflownet_training_metrics.csv`。因子池生成阶段也会为每次尝试打印接受、重复或低覆盖拒绝状态。
 
-为提高 A100 利用率，同一 epoch 的轨迹按批次进行 Transformer 推理，而不是逐轨迹执行 batch size 1；Reward 对批内唯一表达式使用多线程并行，RankIC、Top 10% LongIR、行业与市值暴露均使用向量化计算。默认 `reward_workers: 4`，可根据 Colab CPU 核数调整。逐步日志保留，但每个 epoch 只进行一次批量 GPU→CPU 指标同步。
+为提高 A100 利用率，同一 epoch 的轨迹按批次进行 Transformer 推理，而不是逐轨迹执行 batch size 1；Reward 对批内唯一表达式使用多线程并行，RankIC、Top 10% LongIR、行业与市值暴露均使用向量化计算。表达式执行器还会跨表达式复用结构相同的子树，例如多个因子共同包含的 `ts_mean(close,20)` 只计算一次。缓存支持并发 single-flight、有界 LRU 和内存上限，不会因表达式池增长而无限占用 RAM。默认 `reward_workers: 4`，可根据 Colab CPU 核数调整。逐步日志保留，但每个 epoch 只进行一次批量 GPU→CPU 指标同步。
 
 ## GFlowNet 模型
 

@@ -39,6 +39,9 @@ reward:
   min_cross_section: 20
   min_coverage: 0.80
   coverage_penalty_power: 2.0
+  subexpression_cache_enabled: true
+  subexpression_cache_max_entries: 128
+  subexpression_cache_max_mb: 512
 
 alpha_eval:
   rolling_window: 40

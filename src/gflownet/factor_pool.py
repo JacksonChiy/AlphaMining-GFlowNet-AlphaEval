@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src.expression import expression_from_tokens
+from src.expression import SubexpressionCache, expression_from_tokens
 from src.utils import slice_date_range
 
 
@@ -31,6 +31,8 @@ def execute_saved_alpha_pool(
         raise ValueError("Alpha pool metadata is empty")
 
     matrix = data[["date", "code"]].copy()
+    ordered = data.sort_values(["code", "date"], kind="stable")
+    expression_cache = SubexpressionCache(ordered)
     print(
         f"[FactorPool] execution_start factors={len(metadata)} rows={len(data):,} "
         f"start={data['date'].min()} end={data['date'].max()}",
@@ -42,7 +44,10 @@ def execute_saved_alpha_pool(
         if not isinstance(tokens, list) or not tokens:
             raise ValueError(f"Invalid token sequence for factor {row['factor']}")
         expression = expression_from_tokens(tokens)
-        values = pd.to_numeric(expression.execute(data), errors="coerce").replace(
+        values = pd.to_numeric(
+            expression.execute(ordered, cache=expression_cache).reindex(data.index),
+            errors="coerce",
+        ).replace(
             [np.inf, -np.inf], np.nan
         )
         matrix[str(row["factor"])] = values.to_numpy()
@@ -67,9 +72,13 @@ def execute_saved_alpha_pool(
         oos_matrix_path = Path(oos_matrix_path)
         oos_matrix_path.parent.mkdir(parents=True, exist_ok=True)
         oos_matrix.to_pickle(oos_matrix_path)
+    cache = expression_cache.stats()
     print(
         f"[FactorPool] execution_complete full_rows={len(matrix):,} "
-        f"oos_rows={len(oos_matrix) if oos_matrix is not None else 0:,}",
+        f"oos_rows={len(oos_matrix) if oos_matrix is not None else 0:,} "
+        f"cache_hits={cache['hits']} cache_misses={cache['misses']} "
+        f"cache_hit_rate={cache['hit_rate']:.2%} "
+        f"cache_memory_mb={cache['memory_mb']:.1f}",
         flush=True,
     )
     return matrix, oos_matrix
