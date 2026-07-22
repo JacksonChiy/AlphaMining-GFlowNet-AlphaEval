@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from src.expression import SubexpressionCache, expression_from_tokens
+from src.operators import get_time_series_backend_info
 from src.utils import slice_date_range
 
 
@@ -35,7 +36,8 @@ def execute_saved_alpha_pool(
     expression_cache = SubexpressionCache(ordered)
     print(
         f"[FactorPool] execution_start factors={len(metadata)} rows={len(data):,} "
-        f"start={data['date'].min()} end={data['date'].max()}",
+        f"start={data['date'].min()} end={data['date'].max()} "
+        f"time_series_backend={get_time_series_backend_info()}",
         flush=True,
     )
     for index, row in metadata.reset_index(drop=True).iterrows():

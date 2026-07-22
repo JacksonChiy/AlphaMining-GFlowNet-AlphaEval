@@ -10,6 +10,7 @@ import torch
 from src.gflownet.model import GFlowNetPolicy, PolicyConfig
 from src.gflownet.reward import RewardEvaluator
 from src.gflownet.trainer import GFlowNetTrainer, TrainerConfig, save_alpha_pool
+from src.operators import configure_time_series_from_mapping, get_time_series_backend_info
 from src.utils import create_experiment, load_config, seed_everything, slice_date_range
 
 
@@ -42,6 +43,11 @@ def run(config_path: str, require_a100: bool = True, pool_size: int = 100) -> Pa
         torch.set_float32_matmul_precision("high")
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+    configure_time_series_from_mapping(config.get("operators"))
+    print(
+        f"[GFlowNet] time_series_backend={get_time_series_backend_info()}",
+        flush=True,
+    )
     seed_everything(int(config["training"]["seed"]))
     experiment_dir = create_experiment(config_path)
     print(f"[GFlowNet] experiment_id={experiment_dir.name}", flush=True)
