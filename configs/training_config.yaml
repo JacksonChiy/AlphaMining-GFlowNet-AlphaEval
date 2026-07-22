@@ -3,6 +3,13 @@ dataset:
   output: data/daily_price.pkl
   horizon: 5
   required_columns: [date, code, open, high, low, close, volume]
+  start_date: '2020-01-01'
+  end_date: '2026-12-31'
+  mining_start_date: '2020-01-01'
+  mining_end_date: '2023-12-31'
+  out_of_sample_start_date: '2024-01-01'
+  out_of_sample_end_date: '2026-12-31'
+  chunksize: 500000
 
 model:
   name: GFlowNet
@@ -38,13 +45,15 @@ alpha_eval:
 
 lightgbm:
   horizon: 5
-  train_window_days: 756
-  min_train_days: 504
+  train_window_days: 1008
+  min_train_days: 756
   refit_interval_days: 20
   num_leaves: 31
   learning_rate: 0.03
   n_estimators: 500
   seed: 42
+  prediction_start_date: '2024-01-01'
+  prediction_end_date: '2026-12-31'
 
 backtest:
   initial_cash: 1000000

@@ -11,7 +11,14 @@ from src.gflownet.model import GFlowNetPolicy, PolicyConfig
 from src.gflownet.reward import RewardEvaluator
 from src.gflownet.trainer import GFlowNetTrainer, TrainerConfig, save_alpha_pool
 from src.operators import configure_time_series_from_mapping, get_time_series_backend_info
-from src.utils import create_experiment, load_config, seed_everything, slice_date_range
+from src.utils import (
+    create_experiment,
+    load_config,
+    seed_everything,
+    slice_date_range,
+    validate_frame_covers_period,
+    validate_research_date_split,
+)
 
 
 def gpu_report(require_a100: bool = False) -> dict[str, str | bool | float]:
@@ -37,6 +44,7 @@ def gpu_report(require_a100: bool = False) -> dict[str, str | bool | float]:
 
 def run(config_path: str, require_a100: bool = True, pool_size: int = 100) -> Path:
     config = load_config(config_path)
+    print(f"[GFlowNet] date_split={validate_research_date_split(config)}", flush=True)
     hardware = gpu_report(require_a100)
     print(f"[GFlowNet] hardware={hardware}", flush=True)
     if torch.cuda.is_available():
@@ -63,10 +71,17 @@ def run(config_path: str, require_a100: bool = True, pool_size: int = 100) -> Pa
         config["dataset"].get("mining_end_date"),
         label="GFlowNet mining data",
     )
+    mining_coverage = validate_frame_covers_period(
+        mining_data,
+        config["dataset"]["mining_start_date"],
+        config["dataset"]["mining_end_date"],
+        label="GFlowNet mining data",
+    )
     print(
         f"[GFlowNet] mining_data rows={len(mining_data)} "
         f"dates={mining_data['date'].nunique()} "
-        f"start={mining_data['date'].min()} end={mining_data['date'].max()}",
+        f"start={mining_data['date'].min()} end={mining_data['date'].max()} "
+        f"coverage={mining_coverage}",
         flush=True,
     )
     evaluator = RewardEvaluator(mining_data, **config["reward"])
