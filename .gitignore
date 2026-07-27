@@ -19,8 +19,10 @@ alphamining_colab_outputs.zip
 
 # Local market data
 data/*.csv
+data/*.csv.gz
 data/*.pkl
 data/*.parquet
+data/*.metadata.json
 !data/README.md
 
 # Environment and IDE

@@ -22,6 +22,8 @@ class LightGBMConfig:
     seed: int = 42
     prediction_start_date: str | None = None
     prediction_end_date: str | None = None
+    label_path: str | None = None
+    target_type: str = "raw_return"
 
 
 class LightGBMFusion:
@@ -54,8 +56,7 @@ class LightGBMFusion:
         missing = sorted(set(self.feature_names).difference(all_factors))
         if missing:
             raise ValueError(f"Selected factors missing from matrix: {missing}")
-        base = price[keys + ["close"]].copy()
-        base["target"] = make_forward_return(price, self.config.horizon).to_numpy()
+        base = self._build_training_base(price)
         data = base.merge(
             factors[keys + self.feature_names], on=keys, how="inner", validate="one_to_one"
         ).sort_values(keys, kind="stable")
@@ -186,6 +187,48 @@ class LightGBMFusion:
             output_dir / "lgbm_model.joblib",
         )
         return prediction
+
+    def _build_training_base(self, price: pd.DataFrame) -> pd.DataFrame:
+        """Select the legacy full-market label or a local PIT index label file."""
+        keys = ["date", "code"]
+        if not self.config.label_path:
+            base = price[keys + ["close"]].copy()
+            base["target"] = make_forward_return(price, self.config.horizon).to_numpy()
+            return base[keys + ["target"]]
+
+        label_path = Path(self.config.label_path)
+        if not label_path.exists():
+            raise FileNotFoundError(f"Index label file not found: {label_path.resolve()}")
+        labels = (
+            pd.read_pickle(label_path)
+            if label_path.suffix.lower() in {".pkl", ".pickle"}
+            else pd.read_csv(label_path)
+        )
+        target_columns = {
+            "raw_return": "target_raw_return",
+            "excess_return": "target_excess_return",
+            "cross_sectional_rank": "target_cross_sectional_rank",
+            "rank": "target_cross_sectional_rank",
+        }
+        if self.config.target_type not in target_columns:
+            raise ValueError(
+                "target_type must be raw_return, excess_return, or cross_sectional_rank"
+            )
+        target_column = target_columns[self.config.target_type]
+        missing = {*keys, target_column}.difference(labels.columns)
+        if missing:
+            raise ValueError(f"Index label file missing columns: {sorted(missing)}")
+        base = labels[[*keys, target_column]].rename(columns={target_column: "target"})
+        base["date"] = pd.to_datetime(base["date"]).dt.normalize()
+        if base.duplicated(keys).any():
+            raise ValueError("Index label file contains duplicate date/code rows")
+        print(
+            f"[LightGBM] label_source={label_path.resolve()} "
+            f"target_type={self.config.target_type} rows={len(base):,} "
+            f"valid_targets={base['target'].notna().sum():,}",
+            flush=True,
+        )
+        return base
 
     @staticmethod
     def _cross_sectional_zscore(values: pd.Series) -> pd.Series:

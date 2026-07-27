@@ -19,12 +19,23 @@ def main() -> None:
     parser.add_argument("--factors", default="results/alpha_factor_matrix.pkl")
     parser.add_argument("--evaluation", default="results/alpha_eval_result.csv")
     parser.add_argument("--output-dir", default="results/lightgbm")
+    parser.add_argument("--label-path", default=None)
+    parser.add_argument(
+        "--target-type",
+        choices=["raw_return", "excess_return", "cross_sectional_rank"],
+        default=None,
+    )
     args = parser.parse_args()
     config = load_config(args.config)
     print(f"[LightGBM] date_split={validate_research_date_split(config)}", flush=True)
     evaluation = pd.read_csv(args.evaluation)
     selected = evaluation.loc[evaluation["dpp_selected"].astype(bool), "factor"].tolist()
-    fusion = LightGBMFusion(LightGBMConfig(**config["lightgbm"]))
+    model_config = dict(config["lightgbm"])
+    if args.label_path:
+        model_config["label_path"] = args.label_path
+    if args.target_type:
+        model_config["target_type"] = args.target_type
+    fusion = LightGBMFusion(LightGBMConfig(**model_config))
     price = pd.read_pickle(args.price)
     factors = pd.read_pickle(args.factors)
     validate_frame_covers_period(

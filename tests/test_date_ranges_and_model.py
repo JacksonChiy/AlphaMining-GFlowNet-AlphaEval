@@ -82,6 +82,26 @@ def test_lightgbm_prediction_period_preserves_training_history() -> None:
     assert start > 252
 
 
+def test_lightgbm_uses_local_index_excess_labels(tmp_path) -> None:
+    label_path = tmp_path / "labels.pkl"
+    labels = pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-02", "2024-01-02"]),
+        "code": ["000001.XSHE", "000002.XSHE"],
+        "target_raw_return": [0.02, 0.01],
+        "target_excess_return": [0.015, 0.005],
+        "target_cross_sectional_rank": [1.0, 0.5],
+    })
+    labels.to_pickle(label_path)
+    fusion = LightGBMFusion(LightGBMConfig(
+        label_path=str(label_path), target_type="excess_return"
+    ))
+
+    base = fusion._build_training_base(pd.DataFrame())
+
+    assert base["target"].tolist() == [0.015, 0.005]
+    assert base.columns.tolist() == ["date", "code", "target"]
+
+
 class _DummyRegressor:
     def __init__(self, **kwargs) -> None:
         self.feature_importances_ = np.array([1.0])

@@ -75,6 +75,11 @@ backtest:
   top_n: 30
   rebalance_days: 5
   slippage: 0.001
+  cash_buffer: 0.98
+  rank_smoothing_weights: [0.5, 0.3, 0.2]
+  hold_buffer_rank: 60
+  max_replacement_ratio: 0.25
+  min_holding_days: 10
 
 pipeline:
   pool_size: 20

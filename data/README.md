@@ -11,3 +11,5 @@
 Colab 推荐先将文件保存为 Google Drive 的 `MyDrive/price.csv`，再运行 `notebooks/00_colab_full_pipeline_A100.ipynb`。Notebook 会挂载 Drive，并在文件不存在或大小变化时复制到 Colab 本地的 `data/price.csv`。
 
 字段明细、数据检查和执行方法见[完整运行手册](../docs/运行手册.md)。
+
+指数增强模块会在本地授权RQData环境中一次性生成 `data/index_components.csv.gz`，包含沪深300、中证500和中证1000的历史时点成分股。该文件及元数据均由Git忽略；生成后，指数内预测和回测只读取本地文件，不会重复调用接口。详见[指数增强运行手册](../docs/指数增强运行手册.md)。
