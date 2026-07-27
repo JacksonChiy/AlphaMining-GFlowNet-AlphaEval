@@ -35,7 +35,7 @@
 - PyTorch 版本；
 - A100 强制校验结果。
 
-Notebook 默认 `FAST_MODE=True`，使用 `configs/quick_training_config.yaml` 快速生成首个模型：分块读取 2020–2026 年数据，并使用 2020 年下半年成交额选择 800 只股票；GFlowNet Reward、AlphaEval 和 LightGBM 初始训练使用 2020–2023 年，2024–2026 年作为样本外回测区间。选出的表达式会在 2020–2026 完整序列上重新计算，以保留 2024 年初时间序列算子的历史预热；LightGBM 采用带 5 日 purge 的 walk-forward 更新，只输出 2024 年以后的预测分数。GFlowNet 使用 8 个 epoch、每轮 16 条轨迹，最终生成 20 个因子。流程验证完成后把 `FAST_MODE=False`，即可切换到 `configs/training_config.yaml` 的正式全量训练。
+Notebook 默认 `FAST_MODE=False`，因为三指数正式训练必须覆盖全部历史成分股。GFlowNet Reward 和 AlphaEval 使用 2020–2023 年，选出的表达式在 2020–2026 完整序列上重算；随后在沪深300、中证500和中证1000各自的历史 Universe 内，以指数加权超额收益为目标分别进行带 5 日 purge 的 LightGBM walk-forward 训练，只输出 2024 年以后的预测。`FAST_MODE=True` 仍可用于800只股票的流水线冒烟测试，但不能生成完整三指数增强模型。
 
 Notebook 默认 `REUSE_EXISTING_ALPHA_POOL=False`，确保日期切换后真正使用 2020–2023 年重新训练。只有已经用相同训练区间完成 GFlowNet 并保留 `results/alpha_pool.csv` 时，才可手工改为 `True`，从保存的 token 恢复表达式并重算 2020–2026 因子。命令行也可运行 `python -m src.gflownet.recompute_factors --config configs/quick_training_config.yaml`。
 
@@ -82,13 +82,13 @@ Colab 一次只需打开：
 notebooks/00_colab_full_pipeline_A100.ipynb
 ```
 
-该 Notebook 包含 GitHub clone、依赖安装、A100 检查、配置读取、从 Google Drive 复制 `price.csv`、前五阶段训练和产物打包。请先将行情文件保存为 Google Drive 的 `MyDrive/price.csv`。最终下载：
+该 Notebook 包含 GitHub clone、依赖安装、A100 检查、配置读取、从 Google Drive 复制本地数据、GFlowNet、AlphaEval、三指数标签、三套 LightGBM 和产物打包。请将行情保存为 `MyDrive/price.csv`，并将 `index_components.csv.gz`、`index_weights.csv.gz` 保存到 `MyDrive/AlphaMiningData/`。最终下载：
 
 ```text
 alphamining_colab_outputs.zip
 ```
 
-压缩包包含 GFlowNet 检查点、因子池、因子矩阵、AlphaEval 结果、LightGBM 模型与 `prediction_score.csv`。RQAlphaPlus 不在 Colab 运行。
+压缩包包含 GFlowNet 检查点、因子池、因子矩阵、AlphaEval 结果，以及三套指数 LightGBM 模型与 `prediction_score.csv`。RQAlphaPlus 不在 Colab 运行。
 
 ### 分阶段 Notebook
 
@@ -157,17 +157,54 @@ close(t+5) / close(t+1) - 1
 
 RQAlphaPlus **不在 Colab 运行**。将 Colab 下载的 `alphamining_colab_outputs.zip` 放到本地仓库根目录，然后运行 `notebooks/06_rqalpha_backtest.ipynb`。本地 Notebook 会解压并校验产物；策略实际读取 Alpha 因子经过 LightGBM 融合后的 `results/lightgbm/prediction_score.csv`。
 
-仓库**不包含自研回测器**。策略通过 RQAlphaPlus 的 `run_file` 和 `order_target_portfolio` 运行，只使用满足 `signal_date < trade_date` 的最近一期预测分数，选择 Top N 股票等权持有，每 5 个交易日调仓。
+仓库**不包含自研回测器**。策略通过 RQAlphaPlus 的 `run_file` 和 `order_target_portfolio` 运行，只使用满足 `signal_date < trade_date` 的最近一期预测分数。Notebook 和命令行入口默认从 `configs/training_config.yaml` 的 `backtest` 段读取全部参数；命令行显式参数可有意覆盖配置。
 
-默认配置：
+为降低原始 Top-N 策略的高换手，策略先对最近三个信号截面的股票排名按 `0.5/0.3/0.2` 加权平滑，再应用持仓排名缓冲、最短持有期和单次替换比例上限。正式配置下，Top 20 旧持仓只要仍在前 40 名即可保留，每次最多替换 25% 的目标股票，并至少持有 10 个交易日。替换比例限制的是名单变动，不是成交金额的严格上限；真实换手仍以 RQAlphaPlus 报告为准。
 
-- 初始资金：人民币 1,000,000 元；
-- 基准：`000300.XSHG`（沪深 300）；
+当前参数以配置文件为准，例如：
+
+- `initial_cash`：初始资金；
+- `benchmark`：业绩基准；
+- `top_n`：持股数量；
+- `rebalance_days`：调仓周期；
+- `rank_smoothing_weights`：当前及历史信号排名的平滑权重；
+- `hold_buffer_rank`：允许旧持仓继续保留的最差平滑排名；
+- `max_replacement_ratio`：单次调仓最多替换的目标股票比例；
+- `min_holding_days`：最短持有交易日数；
 - 交易费用：A 股默认佣金与时点印花税；
-- 滑点：价格比例滑点 0.001；
+- `slippage`：价格比例滑点；
 - 报告目录：`results/backtest_report/`。
 
+回测开始前会打印最终生效参数，并保存为 `results/backtest_report/backtest_effective_config.json`，Notebook 会逐项校验它与所选 YAML 配置一致。
+
 RQAlphaPlus 输出年度收益、总收益、Sharpe、最大回撤、波动率、换手率、净值曲线、持仓和交易明细。
+
+## 三类指数增强
+
+项目支持在沪深300、中证500和中证1000的历史成分股内分别训练和回测。历史成分与指数权重各下载一次并保存到本地；`t+5/t+1` 原始收益、指数加权收益、超额收益、截面 Rank 和涨跌停可交易标签均由本地原始行情生成，后续训练、诊断和回测不重复调用RQData。
+
+```bash
+# 仅首次或主动更新时运行：每个指数调用一次RQData
+/opt/miniconda3/envs/rqsdk/bin/python -m src.index_enhancement.universe
+
+# 仅首次或主动更新时运行：每个指数一次完整区间权重查询
+/opt/miniconda3/envs/rqsdk/bin/python -m src.index_enhancement.weights
+
+# 纯本地生成三套指数内超额收益标签
+/opt/miniconda3/envs/rqsdk/bin/python -m src.index_enhancement.labels
+
+# 冻结当前基线并诊断 IC、分组收益、换手成本和现金拖累
+/opt/miniconda3/envs/rqsdk/bin/python -m src.index_enhancement.diagnostics \
+  --output-dir results/index_enhancement_diagnostics
+
+# 纯本地生成三套指数内预测文件
+python -m src.index_enhancement.builder
+
+# 本地RQAlphaPlus分别回测三个指数
+/opt/miniconda3/envs/rqsdk/bin/python -m rqalpha_strategy.run_index_enhancement
+```
+
+详细参数、输出结构和防未来成分泄漏检查见[指数增强运行手册](docs/指数增强运行手册.md)。
 
 ## 实验结果
 
@@ -182,11 +219,10 @@ results/alpha_pool.csv
 results/alpha_factor_matrix.pkl
 results/alpha_factor_matrix_oos.pkl
 results/alpha_eval_result.csv
-results/lightgbm/lgbm_model.joblib
-results/lightgbm/model_metrics.csv
-results/lightgbm/feature_importance.csv
-results/lightgbm/prediction_score.csv
-results/backtest_report/
+results/index_enhancement/csi300/
+results/index_enhancement/csi500/
+results/index_enhancement/csi1000/
+results/index_enhancement_backtest/
 ```
 
 ## 实验版本管理

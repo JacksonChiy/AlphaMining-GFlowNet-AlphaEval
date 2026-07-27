@@ -20,6 +20,7 @@ RQAlphaPlus 是米筐的授权软件，本项目不会用自研模拟器替代�
 
 ```bash
 python -m rqalpha_strategy.run_backtest \
+  --config configs/training_config.yaml \
   --bundle ~/.rqalpha-plus/bundle \
   --predictions results/lightgbm/prediction_score.csv \
   --output-dir results/backtest_report
@@ -27,11 +28,13 @@ python -m rqalpha_strategy.run_backtest \
 
 如数据包不在默认位置，请将 `--bundle` 后的路径替换为实际授权数据包目录。
 
+回测参数默认从所选 YAML 文件的 `backtest` 段读取。程序会将最终生效的资金、基准、持仓、排名平滑和换手控制参数打印到终端，并保存为 `results/backtest_report/backtest_effective_config.json`，避免 Notebook 只显示配置却没有传给回测程序。
+
 本项目是纯 A 股策略，运行配置会显式关闭 `option`、`fund`、`convertible` 和 `spot` 模块，防止框架因缺少期权 instruments bundle 而尝试调用未初始化的 RQData。配置同时显式设置 `capital_gain_tax_rate: 0.0`，并使用新版 `stock_min_commission` 参数。股票行情 bundle 仍必须覆盖预测分数的全部回测日期。
 
 ## 策略与输出
 
-策略仅使用严格早于交易日的最近一期信号，每 5 个交易日调仓，选择预测分数最高的 Top N 股票并等权持有。分析器会在 `results/backtest_report/` 下写入绩效汇总、净值曲线、持仓和交易历史。
+策略仅使用严格早于交易日的信号。股票截面排名先按配置权重做历史平滑，再按 `rebalance_days` 调仓；旧持仓可在排名缓冲区内继续保留，同时受最短持有期和单次最大替换比例约束。目标组合最终等权持有，分析器会在 `results/backtest_report/` 下写入绩效汇总、净值曲线、持仓和交易历史。
 
 完整步骤与故障排查见[运行手册](运行手册.md)。
 

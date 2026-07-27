@@ -1,0 +1,53 @@
+component_data:
+  # 仅此步骤调用 rqdatac；生成后其余模块只读取本地压缩 CSV。
+  file: data/index_components.csv.gz
+  start_date: '2020-01-01'
+  end_date: '2026-07-27'
+
+weight_data:
+  # 仅下载步骤调用 rqdatac.index_weights；训练、诊断和回测只读取本地文件。
+  file: data/index_weights.csv.gz
+  start_date: '2020-01-01'
+  end_date: '2026-07-27'
+
+labels:
+  # 标签必须使用未做截面 winsorize/zscore 的原始行情。
+  price_file: data/price.csv
+  output_root: results/index_enhancement_labels
+  horizon: 5
+  min_weight_coverage: 0.95
+  tradability_policy: drop
+
+diagnostics:
+  baseline_id: baseline_index_enhancement_20260727
+  backtest_root: results/index_enhancement_backtest
+  prediction_root: results/index_enhancement
+  label_root: results/index_enhancement_labels
+  output_root: results/index_enhancement_diagnostics
+  top_quantiles: 5
+
+build:
+  predictions: results/lightgbm/prediction_score.csv
+  output_root: results/index_enhancement
+
+indexes:
+  csi300:
+    order_book_id: 000300.XSHG
+    name: 沪深300
+    top_n: 60
+    hold_buffer_rank: 120
+  csi500:
+    order_book_id: 000905.XSHG
+    name: 中证500
+    top_n: 100
+    hold_buffer_rank: 200
+  csi1000:
+    order_book_id: 000852.XSHG
+    name: 中证1000
+    top_n: 200
+    hold_buffer_rank: 400
+
+backtest:
+  base_config: configs/training_config.yaml
+  bundle: ~/.rqalpha-plus/bundle
+  output_root: results/index_enhancement_backtest
