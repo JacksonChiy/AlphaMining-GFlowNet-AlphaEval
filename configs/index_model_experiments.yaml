@@ -1,0 +1,32 @@
+# P2 指数模型实验矩阵。所有实验使用相同日期、因子、Universe和费用口径。
+experiments:
+  excess_l2:
+    target_type: excess_return
+    objective: regression_l2
+    top_weight_multiplier: 1.0
+  cross_sectional_rank:
+    target_type: cross_sectional_rank
+    objective: regression_l2
+    top_weight_multiplier: 1.0
+  excess_huber:
+    target_type: excess_return
+    objective: huber
+    top_weight_multiplier: 1.0
+  excess_top_weighted:
+    target_type: excess_return
+    objective: regression_l2
+    top_weight_quantile: 0.20
+    top_weight_multiplier: 3.0
+  lambdarank:
+    target_type: excess_return
+    objective: lambdarank
+    rank_bins: 20
+    top_weight_quantile: 0.20
+    top_weight_multiplier: 2.0
+
+promotion_gate:
+  min_information_ratio: 0.50
+  max_tracking_error: 0.05
+  max_annualized_gross_turnover: 10.0
+  max_excess_drawdown: 0.12
+  min_positive_q5_q1_years: 2
