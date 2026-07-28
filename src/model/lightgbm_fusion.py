@@ -24,6 +24,11 @@ class LightGBMConfig:
     prediction_end_date: str | None = None
     label_path: str | None = None
     target_type: str = "raw_return"
+    objective: str = "regression_l2"
+    rank_bins: int = 20
+    top_weight_quantile: float = 0.20
+    top_weight_multiplier: float = 1.0
+    save_all_models: bool = True
 
 
 class LightGBMFusion:
@@ -116,8 +121,9 @@ class LightGBMFusion:
                 f"{pd.Timestamp(test_dates[-1]).date()} rows={len(test):,}",
                 flush=True,
             )
-            model = lgb.LGBMRegressor(
-                objective="regression_l2",
+            model_class = lgb.LGBMRanker if self.config.objective == "lambdarank" else lgb.LGBMRegressor
+            model = model_class(
+                objective=self.config.objective,
                 n_estimators=self.config.n_estimators,
                 learning_rate=self.config.learning_rate,
                 num_leaves=self.config.num_leaves,
@@ -129,23 +135,64 @@ class LightGBMFusion:
                 n_jobs=-1,
                 verbosity=-1,
             )
-            model.fit(train[self.feature_names], train["target"])
+            sample_weight = self._sample_weight(train)
+            fit_kwargs: dict[str, object] = {}
+            if self.config.top_weight_multiplier > 1.0:
+                fit_kwargs["sample_weight"] = sample_weight
+            train_target = train["target"]
+            if self.config.objective == "lambdarank":
+                train = train.sort_values(keys, kind="stable")
+                sample_weight = self._sample_weight(train)
+                fit_kwargs = {"group": train.groupby("date", observed=True, sort=True).size().tolist()}
+                if self.config.top_weight_multiplier > 1.0:
+                    fit_kwargs["sample_weight"] = sample_weight
+                train_target = self._ranking_relevance(train)
+            model.fit(train[self.feature_names], train_target, **fit_kwargs)
             test["prediction_score"] = model.predict(test[self.feature_names])
             predictions.append(test[keys + ["target", "prediction_score"]])
-            valid = test.dropna(subset=["target", "prediction_score"])
+            valid = test.dropna(subset=["target", "prediction_score"]).copy()
             daily_ic = valid.groupby("date", observed=True)[["prediction_score", "target"]].apply(
                 lambda x: x["prediction_score"].corr(x["target"], method="spearman")
             ).dropna()
+            valid["score_quantile"] = valid.groupby("date", observed=True)[
+                "prediction_score"
+            ].transform(
+                lambda values: pd.qcut(values.rank(method="first"), 5, labels=False) + 1
+            )
+            quantile_return = valid.groupby(["date", "score_quantile"], observed=True)[
+                "target"
+            ].mean().unstack()
+            q_high_low = (
+                quantile_return.iloc[:, -1] - quantile_return.iloc[:, 0]
+                if quantile_return.shape[1] >= 2 else pd.Series(dtype=float)
+            )
+            top_cutoff = valid.groupby("date", observed=True)["prediction_score"].transform(
+                "quantile", q=1.0 - self.config.top_weight_quantile
+            )
+            top_target = valid.loc[valid["prediction_score"] >= top_cutoff].groupby(
+                "date", observed=True
+            )["target"].mean()
             self.metrics.append({
                 "train_start": str(pd.Timestamp(train_dates[0]).date()),
                 "train_end": str(pd.Timestamp(train_dates[-1]).date()),
                 "test_start": str(pd.Timestamp(test_dates[0]).date()),
                 "test_end": str(pd.Timestamp(test_dates[-1]).date()),
                 "rank_ic": float(daily_ic.mean()) if len(daily_ic) else np.nan,
+                "positive_rank_ic_ratio": float(daily_ic.gt(0).mean()) if len(daily_ic) else np.nan,
+                "q5_q1": float(q_high_low.mean()) if len(q_high_low) else np.nan,
+                "positive_q5_q1_ratio": float(q_high_low.gt(0).mean()) if len(q_high_low) else np.nan,
+                "top_quantile_mean_target": float(top_target.mean()) if len(top_target) else np.nan,
+                "mature_label_dates": float(valid["date"].nunique()),
+                "last_mature_label_date": str(valid["date"].max().date()) if len(valid) else "",
                 "train_rows": float(len(train)),
                 "test_rows": float(len(test)),
             })
             self.models.append(model)
+            if self.config.save_all_models:
+                joblib.dump(
+                    {"model": model, "config": asdict(self.config), "features": self.feature_names},
+                    output_dir / f"lgbm_window_{window_index:03d}.joblib",
+                )
             print(
                 f"[LightGBM] window_complete index={window_index:03d} "
                 f"rank_ic={self.metrics[-1]['rank_ic']:.6f}",
@@ -187,6 +234,29 @@ class LightGBMFusion:
             output_dir / "lgbm_model.joblib",
         )
         return prediction
+
+    def _sample_weight(self, train: pd.DataFrame) -> np.ndarray:
+        """Emphasize the profitable tail without changing chronological sampling."""
+        weights = np.ones(len(train), dtype=np.float64)
+        multiplier = float(self.config.top_weight_multiplier)
+        if multiplier <= 1.0:
+            return weights
+        quantile = float(self.config.top_weight_quantile)
+        if not 0.0 < quantile < 1.0:
+            raise ValueError("top_weight_quantile must be in (0, 1)")
+        cutoffs = train.groupby("date", observed=True)["target"].transform(
+            "quantile", q=1.0 - quantile
+        )
+        weights[train["target"].ge(cutoffs).to_numpy()] = multiplier
+        return weights
+
+    def _ranking_relevance(self, train: pd.DataFrame) -> pd.Series:
+        """Convert continuous returns to integer relevance levels per date."""
+        bins = max(2, int(self.config.rank_bins))
+        percentile = train.groupby("date", observed=True)["target"].rank(
+            method="average", pct=True
+        )
+        return np.minimum((percentile * bins).astype(int), bins - 1)
 
     def _build_training_base(self, price: pd.DataFrame) -> pd.DataFrame:
         """Select the legacy full-market label or a local PIT index label file."""

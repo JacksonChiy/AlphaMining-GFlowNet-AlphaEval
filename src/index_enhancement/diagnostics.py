@@ -427,10 +427,19 @@ def main() -> None:
         "output_root", "results/index_enhancement_diagnostics"
     )
     index_keys = list(config["indexes"])
+    prediction_paths = {}
+    for key in index_keys:
+        candidates = [
+            prediction_root / key / "prediction_score.csv",
+            prediction_root / key / "prediction_score.csv.gz",
+        ]
+        prediction_paths[key] = next(
+            (path for path in candidates if path.exists()), candidates[0]
+        )
     outputs = run_diagnostics(
         price_path,
         config.get("component_data", {}).get("file", "data/index_components.csv.gz"),
-        {key: prediction_root / key / "prediction_score.csv.gz" for key in index_keys},
+        prediction_paths,
         {key: backtest_root / key for key in index_keys},
         output_dir,
         extra_frozen_paths=[args.config],

@@ -122,13 +122,30 @@ def greedy_dpp_select(kernel: np.ndarray, k: int) -> list[int]:
 class AlphaEval:
     """Deterministic mini AlphaEval: PPS, RRE, robustness, logic, and DPP diversity."""
 
-    def __init__(self, price: pd.DataFrame, factors: pd.DataFrame, config: AlphaEvalConfig | None = None) -> None:
+    def __init__(
+        self,
+        price: pd.DataFrame,
+        factors: pd.DataFrame,
+        config: AlphaEvalConfig | None = None,
+        target_data: pd.DataFrame | None = None,
+        target_column: str = "target",
+    ) -> None:
         self.config = config or AlphaEvalConfig()
         keys = ["date", "code"]
         if not set(keys).issubset(factors):
             raise ValueError("Factor matrix must contain date and code")
-        base = price[keys + ["close"]].copy()
-        base["target"] = make_forward_return(price, self.config.horizon).to_numpy()
+        if target_data is None:
+            base = price[keys + ["close"]].copy()
+            base["target"] = make_forward_return(price, self.config.horizon).to_numpy()
+        else:
+            missing = {*keys, target_column}.difference(target_data.columns)
+            if missing:
+                raise ValueError(f"Target data missing columns: {sorted(missing)}")
+            base = target_data[[*keys, target_column]].rename(
+                columns={target_column: "target"}
+            ).copy()
+            if base.duplicated(keys).any():
+                raise ValueError("Target data contains duplicate date/code rows")
         self.data = base.merge(factors, on=keys, how="inner", validate="one_to_one")
         self.data = self.data.sort_values(keys).reset_index(drop=True)
         self.factor_names = [column for column in factors.columns if column not in keys]
