@@ -152,3 +152,28 @@ def test_index_backtest_command_passes_benchmark_and_universe_parameters(tmp_pat
     assert command[command.index("--benchmark") + 1] == "000905.XSHG"
     assert command[command.index("--top-n") + 1] == "100"
     assert command[command.index("--hold-buffer-rank") + 1] == "200"
+
+
+def test_index_backtest_command_passes_optimizer_parameters(tmp_path) -> None:
+    command = build_backtest_command(
+        "csi300",
+        {
+            "order_book_id": "000300.XSHG",
+            "top_n": 60,
+            "hold_buffer_rank": 120,
+            "optimizer_max_names": 150,
+        },
+        tmp_path / "predictions.csv",
+        tmp_path / "report",
+        "configs/training_config.yaml",
+        "~/.rqalpha-plus/bundle",
+        portfolio_mode="benchmark_optimized",
+        index_weights=tmp_path / "weights.csv.gz",
+        optimizer={"risk_aversion": 2.0, "max_rebalance_turnover": 0.15},
+    )
+
+    assert command[command.index("--portfolio-mode") + 1] == "benchmark_optimized"
+    assert command[command.index("--index-key") + 1] == "csi300"
+    assert command[command.index("--optimizer-max-names") + 1] == "150"
+    assert command[command.index("--risk-aversion") + 1] == "2.0"
+    assert command[command.index("--max-rebalance-turnover") + 1] == "0.15"

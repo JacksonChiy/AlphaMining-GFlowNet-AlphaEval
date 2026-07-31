@@ -36,18 +36,37 @@ indexes:
     name: 沪深300
     top_n: 60
     hold_buffer_rank: 120
+    optimizer_max_names: 120
+    prediction_dir: results_excess_top_weighted/index_enhancement/csi300
   csi500:
     order_book_id: 000905.XSHG
     name: 中证500
     top_n: 100
     hold_buffer_rank: 200
+    optimizer_max_names: 200
+    prediction_dir: results_lambdarank/index_enhancement/csi500
   csi1000:
     order_book_id: 000852.XSHG
     name: 中证1000
     top_n: 200
     hold_buffer_rank: 400
+    optimizer_max_names: 300
+    prediction_dir: results_lambdarank/index_enhancement/csi1000
 
 backtest:
   base_config: configs/training_config.yaml
   bundle: ~/.rqalpha-plus/bundle
-  output_root: results/index_enhancement_backtest
+  output_root: results/index_enhancement_optimizer_backtest
+  portfolio_mode: benchmark_optimized
+  index_weights: data/index_weights.csv.gz
+  optimizer:
+    # 收益项强度、对基准偏离惩罚和换手惩罚需要后续网格搜索。
+    alpha_strength: 0.05
+    risk_aversion: 1.0
+    turnover_penalty: 0.01
+    max_active_weight: 0.01
+    max_stock_weight: 0.10
+    max_rebalance_turnover: 0.20
+    # 万8佣金 + 0.001滑点；卖出额外加入万5印花税。
+    estimated_buy_cost: 0.0018
+    estimated_sell_cost: 0.0023

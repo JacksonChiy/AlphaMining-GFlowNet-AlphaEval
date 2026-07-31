@@ -17,8 +17,11 @@ def build_backtest_command(
     output_dir: Path,
     base_config: str | Path,
     bundle: str | Path,
+    portfolio_mode: str | None = None,
+    index_weights: str | Path | None = None,
+    optimizer: dict | None = None,
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         "-m",
         "rqalpha_strategy.run_backtest",
@@ -37,6 +40,28 @@ def build_backtest_command(
         "--hold-buffer-rank",
         str(int(spec["hold_buffer_rank"])),
     ]
+    if portfolio_mode:
+        command.extend(["--portfolio-mode", str(portfolio_mode)])
+    if index_weights:
+        command.extend(
+            ["--index-weights", str(index_weights), "--index-key", str(index_key)]
+        )
+    if spec.get("optimizer_max_names") is not None:
+        command.extend(["--optimizer-max-names", str(int(spec["optimizer_max_names"]))])
+    flags = {
+        "alpha_strength": "--alpha-strength",
+        "risk_aversion": "--risk-aversion",
+        "turnover_penalty": "--turnover-penalty",
+        "max_active_weight": "--max-active-weight",
+        "max_stock_weight": "--max-stock-weight",
+        "max_rebalance_turnover": "--max-rebalance-turnover",
+        "estimated_buy_cost": "--estimated-buy-cost",
+        "estimated_sell_cost": "--estimated-sell-cost",
+    }
+    for key, flag in flags.items():
+        if optimizer and optimizer.get(key) is not None:
+            command.extend([flag, str(optimizer[key])])
+    return command
 
 
 def run_all(
@@ -59,7 +84,7 @@ def run_all(
     )
     commands = []
     for index_key in selected:
-        prediction_dir = prediction_root / index_key
+        prediction_dir = Path(specs[index_key].get("prediction_dir", prediction_root / index_key))
         # A freshly trained index-specific model writes plain CSV.  Prefer it
         # over the legacy compressed file produced by the full-market filter.
         candidates = [
@@ -80,6 +105,9 @@ def run_all(
             output_dir=output_dir,
             base_config=backtest.get("base_config", "configs/training_config.yaml"),
             bundle=backtest.get("bundle", "~/.rqalpha-plus/bundle"),
+            portfolio_mode=backtest.get("portfolio_mode"),
+            index_weights=backtest.get("index_weights"),
+            optimizer=backtest.get("optimizer", {}),
         )
         commands.append(command)
         print(f"[IndexBacktest] index={index_key} command={' '.join(command)}", flush=True)

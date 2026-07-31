@@ -55,7 +55,7 @@ backtest:
 
     settings = load_backtest_settings(config_path, top_n=25)
 
-    assert settings == {
+    expected = {
         "initial_cash": 10_000_000.0,
         "benchmark": "000852.XSHG",
         "top_n": 25,
@@ -67,6 +67,10 @@ backtest:
         "max_replacement_ratio": 0.2,
         "min_holding_days": 8,
     }
+    assert {key: settings[key] for key in expected} == expected
+    assert settings["stock_commission_multiplier"] == 1.0
+    assert settings["pit_tax"] is True
+    assert settings["portfolio_mode"] == "equal_weight"
 
 
 def test_parse_smoothing_weights_normalizes_and_validates() -> None:

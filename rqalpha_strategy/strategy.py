@@ -9,6 +9,13 @@ from pathlib import Path
 
 import pandas as pd
 
+from src.index_enhancement.portfolio_optimizer import (
+    PortfolioOptimizerConfig,
+    latest_weight_date,
+    load_weight_history_for_strategy,
+    optimize_benchmark_portfolio,
+)
+
 
 DEFAULT_SMOOTHING_WEIGHTS = (0.5, 0.3, 0.2)
 
@@ -47,6 +54,14 @@ def parse_smoothing_weights(value: str | None) -> tuple[float, ...]:
         raise ValueError("Rank smoothing weights must contain non-negative values with a positive sum")
     total = sum(weights)
     return tuple(weight / total for weight in weights)
+
+
+def _env_float(name: str, default: float) -> float:
+    return float(os.environ.get(name, str(default)))
+
+
+def _env_int(name: str, default: int) -> int:
+    return int(os.environ.get(name, str(default)))
 
 
 def build_smoothed_scores(
@@ -179,6 +194,46 @@ def init(context):
         os.environ.get("ALPHAMINING_MAX_REPLACEMENT_RATIO", "0.25")
     )
     context.min_holding_days = int(os.environ.get("ALPHAMINING_MIN_HOLDING_DAYS", "10"))
+    context.portfolio_mode = os.environ.get(
+        "ALPHAMINING_PORTFOLIO_MODE", "equal_weight"
+    ).strip().lower()
+    if context.portfolio_mode not in {"equal_weight", "benchmark_optimized"}:
+        raise ValueError(
+            "ALPHAMINING_PORTFOLIO_MODE must be equal_weight or benchmark_optimized"
+        )
+    context.weights_by_date = {}
+    context.weight_dates = []
+    context.optimizer_config = None
+    if context.portfolio_mode == "benchmark_optimized":
+        weight_path = os.environ.get("ALPHAMINING_INDEX_WEIGHTS")
+        index_key = os.environ.get("ALPHAMINING_INDEX_KEY")
+        if not weight_path or not index_key:
+            raise ValueError(
+                "benchmark_optimized mode requires ALPHAMINING_INDEX_WEIGHTS "
+                "and ALPHAMINING_INDEX_KEY"
+            )
+        context.weights_by_date = load_weight_history_for_strategy(
+            weight_path,
+            index_key,
+            start_date=min(context.signal_dates),
+            end_date=max(context.signal_dates),
+        )
+        context.weight_dates = sorted(context.weights_by_date)
+        context.optimizer_config = PortfolioOptimizerConfig(
+            max_names=_env_int("ALPHAMINING_OPTIMIZER_MAX_NAMES", context.top_n * 2),
+            alpha_top_n=context.top_n,
+            cash_buffer=context.cash_buffer,
+            alpha_strength=_env_float("ALPHAMINING_ALPHA_STRENGTH", 0.05),
+            risk_aversion=_env_float("ALPHAMINING_RISK_AVERSION", 1.0),
+            turnover_penalty=_env_float("ALPHAMINING_TURNOVER_PENALTY", 0.01),
+            max_active_weight=_env_float("ALPHAMINING_MAX_ACTIVE_WEIGHT", 0.01),
+            max_stock_weight=_env_float("ALPHAMINING_MAX_STOCK_WEIGHT", 0.10),
+            max_rebalance_turnover=_env_float(
+                "ALPHAMINING_MAX_REBALANCE_TURNOVER", 0.20
+            ),
+            estimated_buy_cost=_env_float("ALPHAMINING_ESTIMATED_BUY_COST", 0.0018),
+            estimated_sell_cost=_env_float("ALPHAMINING_ESTIMATED_SELL_COST", 0.0023),
+        )
     context.trading_day_count = 0
     context.last_signal_date = None
     context.holding_days = {}
@@ -187,7 +242,8 @@ def init(context):
         f"smoothing_weights={context.rank_smoothing_weights} "
         f"hold_buffer_rank={context.hold_buffer_rank} "
         f"max_replacement_ratio={context.max_replacement_ratio:.2f} "
-        f"min_holding_days={context.min_holding_days}",
+        f"min_holding_days={context.min_holding_days} "
+        f"portfolio_mode={context.portfolio_mode}",
         flush=True,
     )
 
@@ -196,6 +252,28 @@ def _latest_lagged_signal(context, current_date):
     # Strict inequality is intentional: same-day close-derived scores cannot trade the same bar.
     candidates = [date for date in context.signal_dates if date < current_date]
     return candidates[-1] if candidates else None
+
+
+def _current_portfolio_weights(context, bar_dict) -> dict[str, float]:
+    total_value = float(getattr(context.portfolio, "total_value", 0.0) or 0.0)
+    if total_value <= 0:
+        return {}
+    output = {}
+    for code, position in getattr(context.portfolio, "positions", {}).items():
+        quantity = float(
+            getattr(position, "quantity", getattr(position, "total_quantity", 0)) or 0
+        )
+        if quantity <= 0:
+            continue
+        market_value = getattr(position, "market_value", None)
+        if market_value is None:
+            bar = bar_dict.get(code) if hasattr(bar_dict, "get") else None
+            last = float(getattr(bar, "last", 0.0) or 0.0) if bar is not None else 0.0
+            market_value = quantity * last
+        weight = float(market_value or 0.0) / total_value
+        if weight > 0:
+            output[str(code)] = weight
+    return output
 
 
 def handle_bar(context, bar_dict):
@@ -219,19 +297,36 @@ def handle_bar(context, bar_dict):
     ranked = context.scores_by_date[signal_date]
     if ranked.empty:
         return
-    targets = select_turnover_controlled_targets(
-        ranked_codes=ranked["code"].tolist(),
-        current_holdings=current_holdings,
-        holding_days=context.holding_days,
-        top_n=context.top_n,
-        hold_buffer_rank=context.hold_buffer_rank,
-        max_replacement_ratio=context.max_replacement_ratio,
-        min_holding_days=context.min_holding_days,
-    )
-    if not targets:
-        return
-    weight = context.cash_buffer / len(targets)
-    target_portfolio = dict.fromkeys(targets, weight)
+    optimizer_diagnostics = None
+    if context.portfolio_mode == "benchmark_optimized":
+        weight_date = latest_weight_date(context.weight_dates, signal_date)
+        if weight_date is None:
+            print(
+                f"[Strategy] no benchmark weights signal_date={signal_date}", flush=True
+            )
+            return
+        optimized, optimizer_diagnostics = optimize_benchmark_portfolio(
+            ranked,
+            context.weights_by_date[weight_date],
+            current_weights=_current_portfolio_weights(context, bar_dict),
+            config=context.optimizer_config,
+        )
+        target_portfolio = optimized.set_index("code")["target_weight"].to_dict()
+        targets = list(target_portfolio)
+    else:
+        targets = select_turnover_controlled_targets(
+            ranked_codes=ranked["code"].tolist(),
+            current_holdings=current_holdings,
+            holding_days=context.holding_days,
+            top_n=context.top_n,
+            hold_buffer_rank=context.hold_buffer_rank,
+            max_replacement_ratio=context.max_replacement_ratio,
+            min_holding_days=context.min_holding_days,
+        )
+        if not targets:
+            return
+        weight = context.cash_buffer / len(targets)
+        target_portfolio = dict.fromkeys(targets, weight)
     added = len(set(targets) - current_set)
     removed = len(current_set - set(targets))
     print(
@@ -240,6 +335,12 @@ def handle_bar(context, bar_dict):
         f"added={added} removed={removed}",
         flush=True,
     )
+    if optimizer_diagnostics is not None:
+        print(
+            "[Strategy] optimizer "
+            + " ".join(f"{key}={value}" for key, value in optimizer_diagnostics.items()),
+            flush=True,
+        )
     # RQAlphaPlus performs stock T+1 checks, lot rounding, price-limit checks,
     # commissions, stamp duty, slippage, and trade recording inside its engine.
     order_target_portfolio(target_portfolio)

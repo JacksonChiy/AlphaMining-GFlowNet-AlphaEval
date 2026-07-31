@@ -1,0 +1,19 @@
+baseline_id: fee_0008_baseline_20260729
+output_dir: experiments/fee_0008_baseline_20260729
+
+fee_assumptions:
+  stock_commission_rate: 0.0008
+  stock_min_commission: 5.0
+  stamp_duty_rate: 0.0005
+  slippage: 0.001
+  capital_gain_tax_rate: 0.0
+
+indexes: [csi300, csi500, csi1000]
+
+experiments:
+  excess_l2: results_rankic_topn
+  cross_sectional_rank: results_cross_sectional_rank
+  excess_huber: results_excess_huber
+  excess_top_weighted: results_excess_top_weighted
+  lambdarank: results_lambdarank
+

@@ -42,8 +42,16 @@ def gpu_report(require_a100: bool = False) -> dict[str, str | bool | float]:
     return result
 
 
-def run(config_path: str, require_a100: bool = True, pool_size: int = 100) -> Path:
+def run(
+    config_path: str,
+    require_a100: bool = True,
+    pool_size: int | None = None,
+) -> Path:
     config = load_config(config_path)
+    if pool_size is None:
+        pool_size = int(config.get("pipeline", {}).get("pool_size", 100))
+    if pool_size <= 0:
+        raise ValueError("pipeline.pool_size must be positive")
     print(f"[GFlowNet] date_split={validate_research_date_split(config)}", flush=True)
     hardware = gpu_report(require_a100)
     print(f"[GFlowNet] hardware={hardware}", flush=True)
@@ -141,7 +149,12 @@ def main() -> None:
         action="store_true",
         help="Only for small CPU/GPU smoke tests; formal training requires A100.",
     )
-    parser.add_argument("--pool-size", type=int, default=100)
+    parser.add_argument(
+        "--pool-size",
+        type=int,
+        default=None,
+        help="Override pipeline.pool_size from the YAML config.",
+    )
     args = parser.parse_args()
     run(args.config, not args.allow_non_a100, args.pool_size)
 

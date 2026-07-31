@@ -68,6 +68,15 @@ backtest:
   hold_buffer_rank: 100
   max_replacement_ratio: 0.25
   min_holding_days: 10
+  # 以下参数直接传入并从RQAlphaPlus解析后的完整config中落盘。
+  capital_gain_tax_rate: 0.0
+  stock_min_commission: 5.0
+  stock_commission_multiplier: 1.0  # RQAlpha股票基准佣金万8，倍率1即实际万8
+  tax_multiplier: 1.0
+  pit_tax: true                     # 2023-08-28起卖出印花税万5
+  volume_percent: 0.25
+  portfolio_mode: equal_weight
 
 pipeline:
-  pool_size: 100
+  # 扩大候选池提高DPP发现低相关因子的机会；最终入模数量仍由alpha_eval.dpp_k控制。
+  pool_size: 300

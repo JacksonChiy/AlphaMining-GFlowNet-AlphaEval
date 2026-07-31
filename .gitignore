@@ -13,9 +13,10 @@ checkpoints/*.pt
 checkpoints/*.pth
 checkpoints/*.ckpt
 results/
+results_*/
 experiments/*/
 !experiments/README.md
-alphamining_colab_outputs.zip
+*.zip
 
 # Local market data
 data/*.csv
@@ -23,6 +24,7 @@ data/*.csv.gz
 data/*.pkl
 data/*.parquet
 data/*.metadata.json
+data/rqdata/
 !data/README.md
 
 # Environment and IDE
