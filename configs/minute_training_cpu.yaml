@@ -1,0 +1,56 @@
+dataset:
+  # DolphinDB导出或服务器本地缓存后的规范分钟长表。
+  minute_file: data/minute_price.pkl
+  daily_file: data/daily_price.pkl
+  mining_start_date: '2020-01-01'
+  mining_end_date: '2023-12-31'
+  out_of_sample_start_date: '2024-01-01'
+  out_of_sample_end_date: '2026-12-31'
+
+cpu_runtime:
+  # 按机器物理核心数调整。并行Reward较多时不要把BLAS线程设得过大。
+  torch_threads: 8
+  interop_threads: 2
+  blas_threads: 1
+
+model:
+  name: MinuteGFlowNetCPU
+  hidden_dim: 128
+  num_layers: 2
+  num_heads: 4
+  dropout: 0.1
+  max_sequence_length: 40
+
+training:
+  epochs: 30
+  trajectories_per_epoch: 8
+  learning_rate: 0.0002
+  weight_decay: 0.0001
+  reward_temperature: 1.0
+  mixed_precision: false
+  max_depth: 5
+  max_nodes: 12
+  gradient_clip: 1.0
+  reward_workers: 4
+  seed: 42
+
+reward:
+  horizon: 5
+  top_quantile: 0.10
+  risk_aversion: 1.0
+  min_cross_section: 20
+  min_coverage: 0.80
+  coverage_penalty_power: 2.0
+  reward_floor: 1.0e-8
+  subexpression_cache_enabled: false
+
+pipeline:
+  pool_size: 50
+  pool_attempts: 600
+
+outputs:
+  checkpoint: checkpoints/gflownet_minute_cpu_best.pt
+  metrics: results/minute_cpu/gflownet_training_metrics.csv
+  trajectory_metrics: results/minute_cpu/gflownet_trajectory_metrics.csv
+  alpha_pool: results/minute_cpu/alpha_pool.csv
+  factor_matrix: results/minute_cpu/alpha_factor_matrix.pkl

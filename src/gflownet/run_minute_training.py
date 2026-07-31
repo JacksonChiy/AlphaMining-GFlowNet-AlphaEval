@@ -30,14 +30,23 @@ def _load_frame(path: str | Path) -> pd.DataFrame:
     raise ValueError(f"Unsupported minute input format: {suffix}; use pkl, parquet or csv")
 
 
-def run(config_path: str, require_a100: bool = True, pool_size: int | None = None) -> Path:
+def run(
+    config_path: str,
+    require_a100: bool = True,
+    pool_size: int | None = None,
+    device: str | torch.device | None = None,
+) -> Path:
     config = load_config(config_path)
     dataset = config["dataset"]
     pool_size = int(pool_size or config.get("pipeline", {}).get("pool_size", 100))
     if pool_size <= 0:
         raise ValueError("pipeline.pool_size must be positive")
     hardware = gpu_report(require_a100)
-    print(f"[MinuteGFlowNet] hardware={hardware}", flush=True)
+    target_device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    print(
+        f"[MinuteGFlowNet] hardware={hardware} training_device={target_device}",
+        flush=True,
+    )
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -86,6 +95,7 @@ def run(config_path: str, require_a100: bool = True, pool_size: int | None = Non
         model,
         evaluator,
         TrainerConfig(seed=int(config["training"]["seed"]), **training_values),
+        device=target_device,
     )
     checkpoint = Path(config.get("outputs", {}).get("checkpoint", "checkpoints/gflownet_minute_best.pt"))
     metrics = trainer.train(checkpoint)
@@ -93,13 +103,17 @@ def run(config_path: str, require_a100: bool = True, pool_size: int | None = Non
     metrics_path = Path(outputs.get("metrics", "results/minute_gflownet_training_metrics.csv"))
     trajectory_path = Path(outputs.get("trajectory_metrics", "results/minute_gflownet_trajectory_metrics.csv"))
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    trajectory_path.parent.mkdir(parents=True, exist_ok=True)
     metrics.to_csv(metrics_path, index=False)
     pd.DataFrame(trainer.trajectory_history).to_csv(trajectory_path, index=False)
     metrics.to_csv(experiment_dir / "model_metrics.csv", index=False)
 
-    loaded = MinuteGFlowNetTrainer.load_checkpoint(checkpoint, evaluator)
+    loaded = MinuteGFlowNetTrainer.load_checkpoint(
+        checkpoint, evaluator, device=target_device
+    )
     print(f"[MinuteGFlowNet] alpha_pool_generation_start target_size={pool_size}", flush=True)
-    pool = loaded.generate_pool(size=pool_size)
+    pool_attempts = int(config.get("pipeline", {}).get("pool_attempts", 2000))
+    pool = loaded.generate_pool(size=pool_size, attempts=pool_attempts)
     metadata, matrix = save_minute_alpha_pool(
         pool,
         minute_data,
@@ -121,9 +135,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train the report chart-27~30 minute grammar")
     parser.add_argument("--config", default="configs/minute_training_config.yaml")
     parser.add_argument("--allow-non-a100", action="store_true")
+    parser.add_argument("--cpu", action="store_true", help="Force CPU-only training")
     parser.add_argument("--pool-size", type=int, default=None)
     args = parser.parse_args()
-    run(args.config, require_a100=not args.allow_non_a100, pool_size=args.pool_size)
+    run(
+        args.config,
+        require_a100=not (args.allow_non_a100 or args.cpu),
+        pool_size=args.pool_size,
+        device="cpu" if args.cpu else None,
+    )
 
 
 if __name__ == "__main__":

@@ -46,6 +46,7 @@ def run(
     config_path: str,
     require_a100: bool = True,
     pool_size: int | None = None,
+    device: str | torch.device | None = None,
 ) -> Path:
     config = load_config(config_path)
     if pool_size is None:
@@ -54,7 +55,8 @@ def run(
         raise ValueError("pipeline.pool_size must be positive")
     print(f"[GFlowNet] date_split={validate_research_date_split(config)}", flush=True)
     hardware = gpu_report(require_a100)
-    print(f"[GFlowNet] hardware={hardware}", flush=True)
+    target_device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    print(f"[GFlowNet] hardware={hardware} training_device={target_device}", flush=True)
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -101,20 +103,38 @@ def run(
     training_values = dict(config["training"])
     training_values.pop("seed", None)
     trainer_config = TrainerConfig(seed=int(config["training"]["seed"]), **training_values)
-    trainer = GFlowNetTrainer(model, evaluator, trainer_config)
-    metrics = trainer.train("checkpoints/gflownet_best.pt")
+    trainer = GFlowNetTrainer(model, evaluator, trainer_config, device=target_device)
+    outputs = config.get("outputs", {})
+    checkpoint_path = Path(outputs.get("checkpoint", "checkpoints/gflownet_best.pt"))
+    metrics_path = Path(outputs.get("metrics", "results/gflownet_training_metrics.csv"))
+    trajectory_path = Path(
+        outputs.get("trajectory_metrics", "results/gflownet_trajectory_metrics.csv")
+    )
+    alpha_pool_path = Path(outputs.get("alpha_pool", "results/alpha_pool.csv"))
+    factor_matrix_path = Path(
+        outputs.get("factor_matrix", "results/alpha_factor_matrix.pkl")
+    )
+    oos_path = Path(outputs.get("oos_factor_matrix", "results/alpha_factor_matrix_oos.pkl"))
+    metrics = trainer.train(checkpoint_path)
     Path("results").mkdir(exist_ok=True)
-    metrics.to_csv("results/gflownet_training_metrics.csv", index=False)
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    trajectory_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics.to_csv(metrics_path, index=False)
     trajectory_metrics = pd.DataFrame(trainer.trajectory_history)
-    trajectory_metrics.to_csv("results/gflownet_trajectory_metrics.csv", index=False)
+    trajectory_metrics.to_csv(trajectory_path, index=False)
     metrics.to_csv(experiment_dir / "model_metrics.csv", index=False)
     trajectory_metrics.to_csv(experiment_dir / "trajectory_metrics.csv", index=False)
     print("[GFlowNet] reloading_best_checkpoint", flush=True)
-    loaded = GFlowNetTrainer.load_checkpoint("checkpoints/gflownet_best.pt", evaluator)
+    loaded = GFlowNetTrainer.load_checkpoint(checkpoint_path, evaluator, device=target_device)
     print(f"[GFlowNet] alpha_pool_generation_start target_size={pool_size}", flush=True)
-    pool = loaded.generate_pool(size=pool_size)
+    pool_attempts = int(config.get("pipeline", {}).get("pool_attempts", 2000))
+    pool = loaded.generate_pool(size=pool_size, attempts=pool_attempts)
     metadata, factor_matrix = save_alpha_pool(
-        pool, data, min_coverage=evaluator.min_coverage
+        pool,
+        data,
+        metadata_path=alpha_pool_path,
+        matrix_path=factor_matrix_path,
+        min_coverage=evaluator.min_coverage,
     )
     oos_start = config["dataset"].get("out_of_sample_start_date")
     oos_end = config["dataset"].get("out_of_sample_end_date")
@@ -125,7 +145,7 @@ def run(
             oos_end,
             label="out-of-sample factor matrix",
         )
-        oos_path = Path("results/alpha_factor_matrix_oos.pkl")
+        oos_path.parent.mkdir(parents=True, exist_ok=True)
         oos_matrix.to_pickle(oos_path)
         print(
             f"[GFlowNet] oos_factor_matrix rows={len(oos_matrix)} "
@@ -135,7 +155,7 @@ def run(
     metadata.to_csv(experiment_dir / "factor_results.csv", index=False)
     print(
         f"[GFlowNet] alpha_pool_generation_complete factors={len(metadata)} "
-        "metadata=results/alpha_pool.csv matrix=results/alpha_factor_matrix.pkl",
+        f"metadata={alpha_pool_path} matrix={factor_matrix_path}",
         flush=True,
     )
     return experiment_dir
@@ -155,8 +175,18 @@ def main() -> None:
         default=None,
         help="Override pipeline.pool_size from the YAML config.",
     )
+    parser.add_argument(
+        "--cpu",
+        action="store_true",
+        help="Force CPU training even if CUDA is available.",
+    )
     args = parser.parse_args()
-    run(args.config, not args.allow_non_a100, args.pool_size)
+    run(
+        args.config,
+        require_a100=not (args.allow_non_a100 or args.cpu),
+        pool_size=args.pool_size,
+        device="cpu" if args.cpu else None,
+    )
 
 
 if __name__ == "__main__":
