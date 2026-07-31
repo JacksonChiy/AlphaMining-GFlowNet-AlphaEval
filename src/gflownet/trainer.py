@@ -62,7 +62,8 @@ class GFlowNetTrainer:
             self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp_enabled)
         else:  # PyTorch 2.2 compatibility
             self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp_enabled)
-        self.vocabulary = Vocabulary()
+        self.vocabulary = self.model.vocabulary
+        self.action_tokens = tuple(self.vocabulary.action_tokens)
         self.rng = np.random.default_rng(config.seed)
         self.history: list[dict[str, float]] = []
         self.trajectory_history: list[dict[str, float | str]] = []
@@ -94,6 +95,9 @@ class GFlowNetTrainer:
         )
         return token_ids, features
 
+    def _make_state(self) -> GrammarState:
+        return GrammarState(max_depth=self.config.max_depth, max_nodes=self.config.max_nodes)
+
     def sample_trajectory(self, greedy: bool = False) -> tuple[Expression, torch.Tensor, list[str]]:
         return self.sample_trajectories(1, greedy=greedy)[0]
 
@@ -102,10 +106,7 @@ class GFlowNetTrainer:
     ) -> list[tuple[Expression, torch.Tensor, list[str]]]:
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
-        states = [
-            GrammarState(max_depth=self.config.max_depth, max_nodes=self.config.max_nodes)
-            for _ in range(batch_size)
-        ]
+        states = [self._make_state() for _ in range(batch_size)]
         log_forward: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
         active_indices = list(range(batch_size))
         while active_indices:
@@ -125,7 +126,7 @@ class GFlowNetTrainer:
             next_active: list[int] = []
             for local_index, state_index in enumerate(active_indices):
                 log_forward[state_index].append(step_log_prob[local_index])
-                states[state_index] = states[state_index].step(ACTION_TOKENS[actions[local_index]])
+                states[state_index] = states[state_index].step(self.action_tokens[actions[local_index]])
                 if not states[state_index].terminal:
                     next_active.append(state_index)
             active_indices = next_active
@@ -435,7 +436,7 @@ class GFlowNetTrainer:
             "log_z": self.log_z.detach().cpu(),
             "policy_config": self.model.config.to_dict(),
             "trainer_config": asdict(self.config),
-            "action_tokens": ACTION_TOKENS,
+            "action_tokens": self.action_tokens,
             "best_loss": best_loss,
             "history": self.history,
             "trajectory_history": self.trajectory_history,

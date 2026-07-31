@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass
 import torch
 from torch import nn
 
-from .grammar import ACTION_TOKENS, Vocabulary
+from .grammar import Vocabulary
 
 
 @dataclass
@@ -46,7 +46,7 @@ class GFlowNetPolicy(nn.Module):
             nn.LayerNorm(config.hidden_dim),
             nn.Linear(config.hidden_dim, config.hidden_dim),
             nn.GELU(),
-            nn.Linear(config.hidden_dim, len(ACTION_TOKENS)),
+            nn.Linear(config.hidden_dim, len(self.vocabulary.action_tokens)),
         )
 
     def forward(self, token_ids: torch.Tensor, state_features: torch.Tensor) -> torch.Tensor:
@@ -62,4 +62,3 @@ class GFlowNetPolicy(nn.Module):
         last_index = (~padding_mask).sum(dim=1).sub(1).clamp_min(0)
         pooled = encoded[torch.arange(batch, device=token_ids.device), last_index]
         return self.head(pooled + self.state_projection(state_features))
-

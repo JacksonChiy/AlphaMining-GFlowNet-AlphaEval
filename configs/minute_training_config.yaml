@@ -1,0 +1,50 @@
+dataset:
+  # DolphinDB导出或服务器本地缓存后的规范长表；支持pkl/parquet/csv。
+  minute_file: data/minute_price.pkl
+  daily_file: data/daily_price.pkl
+  mining_start_date: '2020-01-01'
+  mining_end_date: '2023-12-31'
+  out_of_sample_start_date: '2024-01-01'
+  out_of_sample_end_date: '2026-12-31'
+
+model:
+  name: MinuteGFlowNet
+  hidden_dim: 256
+  num_layers: 4
+  num_heads: 8
+  dropout: 0.1
+  max_sequence_length: 48
+
+training:
+  epochs: 100
+  trajectories_per_epoch: 32
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  reward_temperature: 1.0
+  mixed_precision: true
+  max_depth: 6
+  max_nodes: 18
+  gradient_clip: 1.0
+  reward_workers: 4
+  seed: 42
+
+reward:
+  horizon: 5
+  top_quantile: 0.10
+  risk_aversion: 1.0
+  min_cross_section: 20
+  min_coverage: 0.80
+  coverage_penalty_power: 2.0
+  reward_floor: 1.0e-8
+  # 分钟表达式已有按表达式缓存；日频子表达式缓存不参与分钟树执行。
+  subexpression_cache_enabled: false
+
+pipeline:
+  pool_size: 300
+
+outputs:
+  checkpoint: checkpoints/gflownet_minute_best.pt
+  metrics: results/minute_gflownet_training_metrics.csv
+  trajectory_metrics: results/minute_gflownet_trajectory_metrics.csv
+  alpha_pool: results/minute_alpha_pool.csv
+  factor_matrix: results/minute_alpha_factor_matrix.pkl

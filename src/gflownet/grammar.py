@@ -21,7 +21,8 @@ ACTION_TOKENS = FEATURES + UNARY_OPS + BINARY_OPS + TS_UNARY_OPS + CS_OPS + WIND
 class Vocabulary:
     def __init__(self) -> None:
         self.special = ("<PAD>", "<BOS>")
-        self.tokens = self.special + ACTION_TOKENS
+        self.action_tokens = ACTION_TOKENS
+        self.tokens = self.special + self.action_tokens
         self.token_to_id = {token: index for index, token in enumerate(self.tokens)}
         self.id_to_token = dict(enumerate(self.tokens))
 
@@ -37,7 +38,7 @@ class Vocabulary:
         return [self.token_to_id[token] for token in tokens]
 
     def action_id(self, token: str) -> int:
-        return ACTION_TOKENS.index(token)
+        return self.action_tokens.index(token)
 
 
 @dataclass(frozen=True)
@@ -118,4 +119,3 @@ class GrammarState:
             self.operator_count / max(1, self.max_nodes),
             self.node_count / max(1, self.max_nodes),
         )
-
