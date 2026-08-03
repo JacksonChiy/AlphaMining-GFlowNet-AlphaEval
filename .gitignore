@@ -25,6 +25,7 @@ data/*.pkl
 data/*.parquet
 data/*.metadata.json
 data/rqdata/
+data/minute_ddb_cache/
 !data/README.md
 
 # Environment and IDE

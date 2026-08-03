@@ -6,7 +6,8 @@ from pathlib import Path
 import pandas as pd
 import torch
 
-from src.gflownet.minute_factor_pool import save_minute_alpha_pool
+from src.data_loader.dolphindb_minute import load_minute_cache, prepare_dolphindb_minute_data
+from src.gflownet.minute_factor_pool import save_minute_alpha_pool, save_minute_alpha_pool_from_cache
 from src.gflownet.minute_grammar import MinuteVocabulary
 from src.gflownet.minute_reward import MinuteRewardEvaluator
 from src.gflownet.minute_trainer import MinuteGFlowNetTrainer
@@ -54,8 +55,18 @@ def run(
     experiment_dir = create_experiment(config_path)
     print(f"[MinuteGFlowNet] experiment_id={experiment_dir.name}", flush=True)
 
-    minute_data = _load_frame(dataset["minute_file"])
-    daily_data = _load_frame(dataset["daily_file"])
+    ddb_cache: Path | None = None
+    if str(dataset.get("source", "local")).lower() == "dolphindb":
+        ddb_cache, daily_path = prepare_dolphindb_minute_data(dataset)
+        minute_data = load_minute_cache(
+            ddb_cache,
+            dataset.get("mining_start_date"),
+            dataset.get("mining_end_date"),
+        )
+        daily_data = _load_frame(daily_path)
+    else:
+        minute_data = _load_frame(dataset["minute_file"])
+        daily_data = _load_frame(dataset["daily_file"])
     for frame, label in ((minute_data, "minute"), (daily_data, "daily")):
         if not {"date", "code"}.issubset(frame.columns):
             raise ValueError(f"{label} input must contain date and code")
@@ -114,14 +125,19 @@ def run(
     print(f"[MinuteGFlowNet] alpha_pool_generation_start target_size={pool_size}", flush=True)
     pool_attempts = int(config.get("pipeline", {}).get("pool_attempts", 2000))
     pool = loaded.generate_pool(size=pool_size, attempts=pool_attempts)
-    metadata, matrix = save_minute_alpha_pool(
-        pool,
-        minute_data,
-        daily_data,
-        metadata_path=outputs.get("alpha_pool", "results/minute_alpha_pool.csv"),
-        matrix_path=outputs.get("factor_matrix", "results/minute_alpha_factor_matrix.pkl"),
-        min_coverage=evaluator.min_coverage,
-    )
+    save_arguments = {
+        "metadata_path": outputs.get("alpha_pool", "results/minute_alpha_pool.csv"),
+        "matrix_path": outputs.get("factor_matrix", "results/minute_alpha_factor_matrix.pkl"),
+        "min_coverage": evaluator.min_coverage,
+    }
+    if ddb_cache is not None:
+        metadata, matrix = save_minute_alpha_pool_from_cache(
+            pool, ddb_cache, daily_data, **save_arguments
+        )
+    else:
+        metadata, matrix = save_minute_alpha_pool(
+            pool, minute_data, daily_data, **save_arguments
+        )
     metadata.to_csv(experiment_dir / "factor_results.csv", index=False)
     print(
         f"[MinuteGFlowNet] complete factors={len(metadata)} matrix_rows={len(matrix):,} "

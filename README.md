@@ -268,6 +268,8 @@ AlphaMining-GFlowNet-AlphaEval/
 
 没有 GPU 时，可使用独立的日频/分钟频 CPU 配置和强制 CPU 启动器。线程调优、运行命令、输出目录与排错方法见[CPU 训练运行手册](docs/CPU训练运行手册.md)。
 
+远程 DolphinDB 分钟表可通过字段审计、日期分块缓存和 CPU 训练入口接入。连接配置、复权确认和完整命令见[DolphinDB 分钟数据 CPU 训练手册](docs/DolphinDB分钟数据CPU训练手册.md)。
+
 - 使用 MemMap、分块缓存、Numba 和多进程扩展分钟频数据；
 - 增加更多研报算子，包括时序二元算子；
 - 接入严格时点一致的行业、市值和 Barra 风险暴露并进行中性化；

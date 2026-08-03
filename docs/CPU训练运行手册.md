@@ -246,6 +246,8 @@ results/minute_cpu/alpha_factor_matrix.pkl
 
 CPU 输出与 A100 输出完全分离，后续 AlphaEval 和 LightGBM 只需读取对应目录中的因子矩阵与 Alpha Pool。
 
+使用远程 DolphinDB 分钟表时，参见 [DolphinDB 分钟数据 CPU 训练手册](DolphinDB分钟数据CPU训练手册.md)。
+
 ## 11. 常见问题
 
 ### 训练开始后 CPU 使用率很高但 Reward 很慢
