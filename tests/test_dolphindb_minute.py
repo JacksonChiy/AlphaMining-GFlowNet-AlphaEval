@@ -14,7 +14,11 @@ from src.data_loader.dolphindb_minute import (
     normalize_dolphindb_minutes,
 )
 from src.expression.minute import minute_expression_from_tokens
-from src.gflownet.minute_factor_pool import save_minute_alpha_pool_from_cache
+from src.gflownet.minute_factor_pool import (
+    save_minute_alpha_pool_from_cache,
+    save_minute_alpha_pool_from_dolphindb_stream,
+)
+from src.gflownet.minute_reward import DolphinDBStreamingMinuteRewardEvaluator
 
 
 def _source_minutes() -> pd.DataFrame:
@@ -65,6 +69,18 @@ class FakeDolphinDBSession:
                 "maxDate": [selected["date"].max()],
                 "rows": [len(selected)],
             })
+        if "select first(open)" in script:
+            dates = re.findall(r"date [<>]= (\d{4}\.\d{2}\.\d{2})", script)
+            assert len(dates) == 2
+            start, end = (pd.Timestamp(value.replace(".", "-")) for value in dates)
+            selected = self.frame[self.frame["date"].between(start, end)].copy()
+            if selected.empty:
+                return pd.DataFrame()
+            return selected.groupby(["date", "sym"], observed=True, sort=True).agg(
+                open=("open", "first"), high=("high", "max"), low=("low", "min"),
+                close=("close", "last"), volume=("volume", "sum"),
+                amount=("amount", "sum"), trade_count=("tradeCount", "sum"),
+            ).reset_index()
         dates = re.findall(r"date [<>]= (\d{4}\.\d{2}\.\d{2})", script)
         assert len(dates) == 2
         start, end = (pd.Timestamp(value.replace(".", "-")) for value in dates)
@@ -83,6 +99,8 @@ def _config(tmp_path, adjusted: bool = True) -> MinuteDolphinDBConfig:
         cache_dir=tmp_path / "minute_cache",
         daily_file=tmp_path / "daily.pkl",
         chunk_days=1,
+        audit_chunk_days=1,
+        daily_aggregate_chunk_days=1,
         prices_are_adjusted=adjusted,
     )
 
@@ -116,6 +134,24 @@ def test_field_audit_rejects_incompatible_dolphindb_type(tmp_path) -> None:
         DolphinDBMinuteLoader(_config(tmp_path), session).audit()
 
 
+def test_field_audit_reports_actual_date_when_requested_end_is_unavailable(tmp_path) -> None:
+    config = MinuteDolphinDBConfig(
+        database="dfs://minuteBars",
+        table="minuteKline",
+        start_date="2024-01-02",
+        end_date="2024-02-29",
+        cache_dir=tmp_path / "minute_cache",
+        daily_file=tmp_path / "daily.pkl",
+        chunk_days=20,
+        prices_are_adjusted=True,
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"requested_end=2024-02-29, actual_last_trade_date=2024-01-03",
+    ):
+        DolphinDBMinuteLoader(config, FakeDolphinDBSession(_source_minutes())).audit()
+
+
 def test_unadjusted_source_is_auditable_but_cannot_extract(tmp_path) -> None:
     loader = DolphinDBMinuteLoader(
         _config(tmp_path, adjusted=False), FakeDolphinDBSession(_source_minutes())
@@ -124,6 +160,71 @@ def test_unadjusted_source_is_auditable_but_cannot_extract(tmp_path) -> None:
     with pytest.raises(ValueError, match="prices_are_adjusted=true"):
         loader.extract()
     assert (tmp_path / "minute_cache" / "field_audit.json").exists()
+
+
+def test_server_side_daily_aggregation_does_not_fetch_raw_minutes(tmp_path) -> None:
+    session = FakeDolphinDBSession(_source_minutes())
+    daily = DolphinDBMinuteLoader(_config(tmp_path), session).build_daily_in_memory()
+    assert len(daily) == 4
+    assert np.allclose(daily["volume"], 303)
+    daily_scripts = [script for script in session.scripts if "select first(open)" in script]
+    assert len(daily_scripts) == 2
+    assert all("group by date, sym" in script for script in daily_scripts)
+    assert all("order by date, sym, time;" in script for script in daily_scripts)
+
+
+def test_streaming_reward_batch_shares_ddb_scan_and_daily_block(tmp_path) -> None:
+    session = FakeDolphinDBSession(_source_minutes())
+    loader = DolphinDBMinuteLoader(_config(tmp_path), session)
+    daily = loader.build_daily_in_memory()
+    session.scripts.clear()
+    evaluator = DolphinDBStreamingMinuteRewardEvaluator(
+        loader,
+        daily,
+        start_date="2024-01-02",
+        end_date="2024-01-03",
+        block_cache_max_entries=8,
+        horizon=2,
+        min_cross_section=1,
+        min_coverage=0.5,
+        subexpression_cache_enabled=False,
+    )
+    first = minute_expression_from_tokens(["r_mean", "close"])
+    second = minute_expression_from_tokens(["neg", "r_mean", "close"])
+    results = evaluator.evaluate_many([first, second])
+    data_scripts = [script for script in session.scripts if "select sym, date, time" in script]
+    assert len(results) == 2
+    assert len(data_scripts) == 2
+    assert evaluator.cache_stats()["entries"] == 1
+    evaluator.evaluate_many([first, second])
+    assert len([script for script in session.scripts if "select sym, date, time" in script]) == 2
+
+
+def test_streaming_factor_pool_writes_daily_csv_without_minute_pickle(tmp_path) -> None:
+    session = FakeDolphinDBSession(_source_minutes())
+    loader = DolphinDBMinuteLoader(_config(tmp_path), session)
+    daily = loader.build_daily_in_memory()
+    expression = minute_expression_from_tokens(["r_mean", "close"])
+    pool = [{
+        "expression": expression,
+        "tokens": expression.to_tokens(),
+        "coverage": 1.0,
+        "valid_date_coverage": 1.0,
+        "reward": 0.1,
+    }]
+    metadata, matrix = save_minute_alpha_pool_from_dolphindb_stream(
+        pool,
+        loader,
+        daily,
+        start_date="2024-01-02",
+        end_date="2024-01-03",
+        metadata_path=tmp_path / "alpha_pool.csv",
+        matrix_path=tmp_path / "alpha_factor_matrix.csv.gz",
+    )
+    assert metadata["expression"].tolist() == ["r_mean(close)"]
+    assert matrix["minute_factor_001"].notna().all()
+    assert (tmp_path / "alpha_factor_matrix.csv.gz").exists()
+    assert not list(tmp_path.glob("minute_*.pkl"))
 
 
 def test_chunked_extract_daily_aggregation_and_partitioned_factor_pool(tmp_path) -> None:

@@ -70,14 +70,19 @@ class MinuteDolphinDBConfig:
     chunk_days: int = 20
     prices_are_adjusted: bool = False
     force_refresh: bool = False
+    load_mode: str = "cache"
+    audit_chunk_days: int = 120
+    daily_aggregate_chunk_days: int = 120
 
     def __post_init__(self) -> None:
         if not re.fullmatch(r"dfs://[A-Za-z0-9_./-]+", self.database):
             raise ValueError("DolphinDB database must be an explicit dfs:// path")
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", self.table):
             raise ValueError("DolphinDB table contains unsupported characters")
-        if self.chunk_days < 1:
-            raise ValueError("DolphinDB chunk_days must be positive")
+        if min(self.chunk_days, self.audit_chunk_days, self.daily_aggregate_chunk_days) < 1:
+            raise ValueError("DolphinDB chunk day settings must be positive")
+        if self.load_mode not in {"cache", "stream"}:
+            raise ValueError("DolphinDB load_mode must be 'cache' or 'stream'")
         start, end = pd.Timestamp(self.start_date), pd.Timestamp(self.end_date)
         if start > end:
             raise ValueError("DolphinDB start_date must not be later than end_date")
@@ -104,6 +109,9 @@ class MinuteDolphinDBConfig:
             chunk_days=int(values.get("chunk_days", 20)),
             prices_are_adjusted=bool(values.get("prices_are_adjusted", False)),
             force_refresh=bool(values.get("force_refresh", False)),
+            load_mode=str(values.get("load_mode", "cache")).lower(),
+            audit_chunk_days=int(values.get("audit_chunk_days", 120)),
+            daily_aggregate_chunk_days=int(values.get("daily_aggregate_chunk_days", 120)),
         )
 
 
@@ -314,6 +322,87 @@ class DolphinDBMinuteLoader:
         build_daily_from_minute_cache(cache_dir, self.config.daily_file)
         return cache_dir, self.config.daily_file
 
+    def iter_frames(
+        self,
+        start_date: str | pd.Timestamp | None = None,
+        end_date: str | pd.Timestamp | None = None,
+    ):
+        """Yield normalized DDB chunks directly from memory without local minute files."""
+        chunks = list(self._date_chunks(start_date, end_date, self.config.chunk_days))
+        for chunk_index, (start, end) in enumerate(chunks, start=1):
+            raw = self.session.run(self.build_data_sql(start, end))
+            frame = normalize_dolphindb_minutes(pd.DataFrame(raw))
+            print(
+                f"[DDBStream] chunk={chunk_index:03d}/{len(chunks):03d} "
+                f"start={start.date()} end={end.date()} minute_rows={len(frame):,}",
+                flush=True,
+            )
+            if not frame.empty:
+                yield start, end, frame
+
+    def build_daily_in_memory(
+        self,
+        start_date: str | pd.Timestamp | None = None,
+        end_date: str | pd.Timestamp | None = None,
+    ) -> pd.DataFrame:
+        """Let DolphinDB aggregate daily OHLCV so raw minutes never cross the network here."""
+        daily_parts: list[pd.DataFrame] = []
+        chunks = list(self._date_chunks(
+            start_date, end_date, self.config.daily_aggregate_chunk_days
+        ))
+        for chunk_index, (start, end) in enumerate(chunks, start=1):
+            raw = pd.DataFrame(self.session.run(self.build_daily_sql(start, end)))
+            if raw.empty:
+                continue
+            required = {
+                "date", "sym", "open", "high", "low", "close",
+                "volume", "amount", "trade_count",
+            }
+            missing = sorted(required.difference(raw.columns))
+            if missing:
+                raise ValueError(f"DolphinDB daily aggregate is missing columns: {missing}")
+            raw["date"] = pd.to_datetime(raw["date"], errors="coerce").dt.normalize()
+            raw["code"] = raw["sym"].astype("string").str.strip()
+            for column in (
+                "open", "high", "low", "close", "volume", "amount", "trade_count"
+            ):
+                raw[column] = pd.to_numeric(raw[column], errors="coerce")
+            daily_parts.append(raw[[
+                "date", "code", "open", "high", "low", "close",
+                "volume", "amount", "trade_count",
+            ]])
+            if chunk_index == 1 or chunk_index == len(chunks) or chunk_index % 25 == 0:
+                print(
+                    f"[DDBStream] daily_aggregate_progress "
+                    f"chunks={chunk_index}/{len(chunks)} rows={sum(map(len, daily_parts)):,}",
+                    flush=True,
+                )
+        if not daily_parts:
+            raise ValueError("DolphinDB streaming query returned no minute rows")
+        daily = pd.concat(daily_parts, ignore_index=True)
+        daily = daily.sort_values(["date", "code"], kind="stable").reset_index(drop=True)
+        daily["vwap"] = daily["amount"].div(daily["volume"].where(daily["volume"] > 0))
+        print(
+            f"[DDBStream] daily_ready rows={len(daily):,} "
+            f"dates={daily['date'].nunique():,} stocks={daily['code'].nunique():,}",
+            flush=True,
+        )
+        return daily
+
+    def build_daily_sql(self, start: pd.Timestamp, end: pd.Timestamp) -> str:
+        start_literal, end_literal = start.strftime("%Y.%m.%d"), end.strftime("%Y.%m.%d")
+        return (
+            "dailySource = select date, sym, time, open, high, low, close, volume, "
+            f"amount, tradeCount from {self.table_expression} "
+            f"where date >= {start_literal}, date <= {end_literal} "
+            "order by date, sym, time; "
+            "select first(open) as open, max(high) as high, min(low) as low, "
+            "last(close) as close, sum(volume) as volume, sum(amount) as amount, "
+            "sum(tradeCount) as trade_count "
+            "from dailySource "
+            "group by date, sym order by date, sym"
+        )
+
     def build_data_sql(self, start: pd.Timestamp, end: pd.Timestamp) -> str:
         start_literal, end_literal = start.strftime("%Y.%m.%d"), end.strftime("%Y.%m.%d")
         columns = ", ".join(SOURCE_COLUMNS)
@@ -337,7 +426,9 @@ class DolphinDBMinuteLoader:
         min_dates: list[pd.Timestamp] = []
         max_dates: list[pd.Timestamp] = []
         total_rows = 0
-        chunks = list(self._date_chunks())
+        chunks = list(self._date_chunks(
+            chunk_days=self.config.audit_chunk_days
+        ))
         for chunk_index, (start, end) in enumerate(chunks, start=1):
             result = pd.DataFrame(self.session.run(self.build_stats_sql(start, end)))
             if not result.empty:
@@ -362,11 +453,19 @@ class DolphinDBMinuteLoader:
             "rows": total_rows,
         }
 
-    def _date_chunks(self):
-        current = pd.Timestamp(self.config.start_date).normalize()
-        final = pd.Timestamp(self.config.end_date).normalize()
+    def _date_chunks(
+        self,
+        start_date: str | pd.Timestamp | None = None,
+        end_date: str | pd.Timestamp | None = None,
+        chunk_days: int | None = None,
+    ):
+        current = pd.Timestamp(start_date or self.config.start_date).normalize()
+        final = pd.Timestamp(end_date or self.config.end_date).normalize()
+        if current > final:
+            raise ValueError("DolphinDB stream start_date must not be later than end_date")
         while current <= final:
-            end = min(current + pd.Timedelta(days=self.config.chunk_days - 1), final)
+            days = int(chunk_days or self.config.chunk_days)
+            end = min(current + pd.Timedelta(days=days - 1), final)
             yield current, end
             current = end + pd.Timedelta(days=1)
 
@@ -407,11 +506,23 @@ class DolphinDBMinuteLoader:
         if pd.Timestamp(audit.source_min_date) > (
             pd.Timestamp(self.config.start_date) + boundary_tolerance
         ):
-            raise ValueError("DolphinDB source starts later than requested training start")
+            raise ValueError(
+                "DolphinDB source starts later than requested extraction start: "
+                f"requested_start={self.config.start_date}, "
+                f"actual_first_trade_date={audit.source_min_date}. "
+                "Update dataset.dolphindb.start_date and dataset.mining_start_date "
+                "to a covered date."
+            )
         if pd.Timestamp(audit.source_max_date) < (
             pd.Timestamp(self.config.end_date) - boundary_tolerance
         ):
-            raise ValueError("DolphinDB source ends earlier than requested extraction end")
+            raise ValueError(
+                "DolphinDB source ends earlier than requested extraction end: "
+                f"requested_end={self.config.end_date}, "
+                f"actual_last_trade_date={audit.source_max_date}. "
+                "Set dataset.dolphindb.end_date and "
+                "dataset.out_of_sample_end_date to actual_last_trade_date (or earlier)."
+            )
 
 
 def create_dolphindb_session(values: Mapping[str, Any]) -> SessionLike:

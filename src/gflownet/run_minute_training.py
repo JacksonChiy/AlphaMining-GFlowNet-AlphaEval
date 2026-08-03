@@ -6,10 +6,23 @@ from pathlib import Path
 import pandas as pd
 import torch
 
-from src.data_loader.dolphindb_minute import load_minute_cache, prepare_dolphindb_minute_data
-from src.gflownet.minute_factor_pool import save_minute_alpha_pool, save_minute_alpha_pool_from_cache
+from src.data_loader.dolphindb_minute import (
+    DolphinDBMinuteLoader,
+    MinuteDolphinDBConfig,
+    create_dolphindb_session,
+    load_minute_cache,
+    prepare_dolphindb_minute_data,
+)
+from src.gflownet.minute_factor_pool import (
+    save_minute_alpha_pool,
+    save_minute_alpha_pool_from_cache,
+    save_minute_alpha_pool_from_dolphindb_stream,
+)
 from src.gflownet.minute_grammar import MinuteVocabulary
-from src.gflownet.minute_reward import MinuteRewardEvaluator
+from src.gflownet.minute_reward import (
+    DolphinDBStreamingMinuteRewardEvaluator,
+    MinuteRewardEvaluator,
+)
 from src.gflownet.minute_trainer import MinuteGFlowNetTrainer
 from src.gflownet.model import GFlowNetPolicy, PolicyConfig
 from src.gflownet.run_training import gpu_report
@@ -56,42 +69,114 @@ def run(
     print(f"[MinuteGFlowNet] experiment_id={experiment_dir.name}", flush=True)
 
     ddb_cache: Path | None = None
-    if str(dataset.get("source", "local")).lower() == "dolphindb":
-        ddb_cache, daily_path = prepare_dolphindb_minute_data(dataset)
-        minute_data = load_minute_cache(
-            ddb_cache,
-            dataset.get("mining_start_date"),
-            dataset.get("mining_end_date"),
+    ddb_loader: DolphinDBMinuteLoader | None = None
+    ddb_session = None
+    minute_data: pd.DataFrame | None
+    try:
+        if str(dataset.get("source", "local")).lower() == "dolphindb":
+            values = dataset.get("dolphindb", {})
+            ddb_config = MinuteDolphinDBConfig.from_mapping(dataset, values)
+            if ddb_config.load_mode == "stream":
+                ddb_session = create_dolphindb_session(values)
+                ddb_loader = DolphinDBMinuteLoader(ddb_config, ddb_session)
+                audit = ddb_loader.audit()
+                if not audit.passed:
+                    raise ValueError(
+                        "DolphinDB stream field audit failed: confirm adjusted OHLC and set "
+                        "dataset.dolphindb.prices_are_adjusted=true"
+                    )
+                print(
+                    f"[MinuteGFlowNet] ddb_stream_enabled raw_minute_files=false "
+                    f"source_range={audit.source_min_date}..{audit.source_max_date} "
+                    f"rows={audit.source_rows:,}",
+                    flush=True,
+                )
+                daily_data = ddb_loader.build_daily_in_memory(
+                    ddb_config.start_date, ddb_config.end_date
+                )
+                minute_data = None
+            else:
+                ddb_cache, daily_path = prepare_dolphindb_minute_data(dataset)
+                minute_data = load_minute_cache(
+                    ddb_cache,
+                    dataset.get("mining_start_date"),
+                    dataset.get("mining_end_date"),
+                )
+                daily_data = _load_frame(daily_path)
+        else:
+            minute_data = _load_frame(dataset["minute_file"])
+            daily_data = _load_frame(dataset["daily_file"])
+        return _run_loaded_pipeline(
+            config=config,
+            dataset=dataset,
+            pool_size=pool_size,
+            target_device=target_device,
+            experiment_dir=experiment_dir,
+            minute_data=minute_data,
+            daily_data=daily_data,
+            ddb_cache=ddb_cache,
+            ddb_loader=ddb_loader,
         )
-        daily_data = _load_frame(daily_path)
-    else:
-        minute_data = _load_frame(dataset["minute_file"])
-        daily_data = _load_frame(dataset["daily_file"])
-    for frame, label in ((minute_data, "minute"), (daily_data, "daily")):
+    finally:
+        if ddb_session is not None:
+            ddb_session.close()
+
+
+def _run_loaded_pipeline(
+    config: dict,
+    dataset: dict,
+    pool_size: int,
+    target_device: torch.device,
+    experiment_dir: Path,
+    minute_data: pd.DataFrame | None,
+    daily_data: pd.DataFrame,
+    ddb_cache: Path | None,
+    ddb_loader: DolphinDBMinuteLoader | None,
+) -> Path:
+    frames = [(daily_data, "daily")]
+    if minute_data is not None:
+        frames.insert(0, (minute_data, "minute"))
+    for frame, label in frames:
         if not {"date", "code"}.issubset(frame.columns):
             raise ValueError(f"{label} input must contain date and code")
         frame["date"] = pd.to_datetime(frame["date"]).dt.normalize()
         frame["code"] = frame["code"].astype(str)
     mining_start = dataset.get("mining_start_date")
     mining_end = dataset.get("mining_end_date")
-    minute_mining = slice_date_range(
-        minute_data, mining_start, mining_end, label="minute mining data"
-    )
     daily_mining = slice_date_range(
         daily_data, mining_start, mining_end, label="daily reward data"
     )
-    print(
-        f"[MinuteGFlowNet] minute_data rows={len(minute_mining):,} "
-        f"dates={minute_mining['date'].nunique():,} stocks={minute_mining['code'].nunique():,} "
-        f"start={minute_mining['date'].min()} end={minute_mining['date'].max()}",
-        flush=True,
-    )
+    minute_mining = None
+    if minute_data is not None:
+        minute_mining = slice_date_range(
+            minute_data, mining_start, mining_end, label="minute mining data"
+        )
+        print(
+            f"[MinuteGFlowNet] minute_data rows={len(minute_mining):,} "
+            f"dates={minute_mining['date'].nunique():,} stocks={minute_mining['code'].nunique():,} "
+            f"start={minute_mining['date'].min()} end={minute_mining['date'].max()}",
+            flush=True,
+        )
     print(
         f"[MinuteGFlowNet] daily_reward_data rows={len(daily_mining):,} "
         f"dates={daily_mining['date'].nunique():,} stocks={daily_mining['code'].nunique():,}",
         flush=True,
     )
-    evaluator = MinuteRewardEvaluator(minute_mining, daily_mining, **config["reward"])
+    reward_options = dict(config["reward"])
+    block_cache_max_entries = int(reward_options.pop("block_cache_max_entries", 256))
+    if ddb_loader is not None:
+        evaluator = DolphinDBStreamingMinuteRewardEvaluator(
+            ddb_loader,
+            daily_mining,
+            start_date=str(mining_start),
+            end_date=str(mining_end),
+            block_cache_max_entries=block_cache_max_entries,
+            **reward_options,
+        )
+    else:
+        if minute_mining is None:
+            raise AssertionError("Local/cache minute mode requires minute data")
+        evaluator = MinuteRewardEvaluator(minute_mining, daily_mining, **reward_options)
     policy_values = dict(config["model"])
     policy_values.pop("name", None)
     model = GFlowNetPolicy(PolicyConfig(**policy_values), MinuteVocabulary())
@@ -130,11 +215,23 @@ def run(
         "matrix_path": outputs.get("factor_matrix", "results/minute_alpha_factor_matrix.pkl"),
         "min_coverage": evaluator.min_coverage,
     }
-    if ddb_cache is not None:
+    if ddb_loader is not None:
+        ddb_values = dataset["dolphindb"]
+        metadata, matrix = save_minute_alpha_pool_from_dolphindb_stream(
+            pool,
+            ddb_loader,
+            daily_data,
+            start_date=str(ddb_values.get("start_date", dataset.get("mining_start_date"))),
+            end_date=str(ddb_values.get("end_date", dataset.get("out_of_sample_end_date"))),
+            **save_arguments,
+        )
+    elif ddb_cache is not None:
         metadata, matrix = save_minute_alpha_pool_from_cache(
             pool, ddb_cache, daily_data, **save_arguments
         )
     else:
+        if minute_data is None:
+            raise AssertionError("Local minute mode requires minute data")
         metadata, matrix = save_minute_alpha_pool(
             pool, minute_data, daily_data, **save_arguments
         )

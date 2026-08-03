@@ -18,6 +18,7 @@ from src.expression.minute import (
     MinuteExpression,
     minute_expression_from_tokens,
 )
+from src.expression.tree import BINARY_OPS, CS_OPS, TS_UNARY_OPS, UNARY_OPS
 
 
 MINUTE_WINDOW_TOKENS = tuple(f"W{window}" for window in MINUTE_WINDOWS)
@@ -32,6 +33,10 @@ MINUTE_ACTION_TOKENS = (
     + MASK_BINARY_OPS
     + REDUCE_UNARY_OPS
     + REDUCE_BINARY_OPS
+    + UNARY_OPS
+    + BINARY_OPS
+    + TS_UNARY_OPS
+    + CS_OPS
     + MINUTE_WINDOW_TOKENS
 )
 
@@ -61,10 +66,10 @@ class MinuteVocabulary:
 
 @dataclass(frozen=True)
 class MinuteGrammarState:
-    """Prefix grammar for MinExpr -> optional MaskExpr -> ReduceOp -> daily value."""
+    """Report prefix grammar: intraday blocks followed by optional daily operators."""
 
     tokens: tuple[str, ...] = ()
-    pending: tuple[tuple[str, int], ...] = (("block", 1),)
+    pending: tuple[tuple[str, int], ...] = (("daily", 1),)
     max_depth: int = 6
     max_nodes: int = 18
     operator_count: int = 0
@@ -89,6 +94,15 @@ class MinuteGrammarState:
         symbol, depth = self.pending[-1]
         if symbol == "window":
             return MINUTE_WINDOW_TOKENS
+        if symbol == "daily":
+            remaining = sum(item[0] == "daily" for item in self.pending)
+            must_close = depth >= self.max_depth - 1 or self.node_count + remaining >= self.max_nodes
+            if must_close:
+                return REDUCE_UNARY_OPS + REDUCE_BINARY_OPS
+            return (
+                REDUCE_UNARY_OPS + REDUCE_BINARY_OPS
+                + UNARY_OPS + BINARY_OPS + TS_UNARY_OPS + CS_OPS
+            )
         if symbol == "block":
             return REDUCE_UNARY_OPS + REDUCE_BINARY_OPS
         remaining = sum(item[0] in {"minute", "source"} for item in self.pending)
@@ -119,6 +133,18 @@ class MinuteGrammarState:
         max_seen = max(self.max_depth_seen, depth)
         if symbol == "window":
             pass
+        elif action in UNARY_OPS:
+            operators += 1
+            pending.append(("daily", depth + 1))
+        elif action in BINARY_OPS:
+            operators += 1
+            pending.extend((("daily", depth + 1), ("daily", depth + 1)))
+        elif action in TS_UNARY_OPS:
+            operators += 1
+            pending.extend((("daily", depth + 1), ("window", depth)))
+        elif action in CS_OPS:
+            operators += 1
+            pending.append(("daily", depth + 1))
         elif action in MINUTE_FEATURES:
             features += 1
         elif action in REDUCE_UNARY_OPS:

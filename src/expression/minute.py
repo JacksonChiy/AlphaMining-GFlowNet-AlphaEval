@@ -18,6 +18,13 @@ from src.operators.minute import (
     apply_reduce_unary,
     build_minute_features,
 )
+from src.operators.daily import (
+    apply_binary as apply_daily_binary,
+    apply_cross_sectional as apply_daily_cross_sectional,
+    apply_time_series as apply_daily_time_series,
+    apply_unary as apply_daily_unary,
+)
+from src.expression.tree import BINARY_OPS, CS_OPS, TS_UNARY_OPS, UNARY_OPS
 
 
 MINUTE_FEATURES = (
@@ -51,8 +58,12 @@ _ARITY = {
     "mask_binary": 2,
     "reduce_unary": 1,
     "reduce_binary": 2,
+    "daily_unary": 1,
+    "daily_binary": 2,
+    "daily_ts": 1,
+    "daily_cs": 1,
 }
-_WINDOW_KINDS = {"minute_window", "mask_window", "mask_binary_window"}
+_WINDOW_KINDS = {"minute_window", "mask_window", "mask_binary_window", "daily_ts"}
 
 
 @dataclass(frozen=True)
@@ -113,14 +124,16 @@ class MinuteNode:
 
 @dataclass(frozen=True)
 class MinuteExpression:
-    """A minute expression whose root reduction produces one value per date and stock."""
+    """Report grammar: intraday blocks reduced to daily values, then daily operators."""
 
     root: MinuteNode
     FEATURES: ClassVar[tuple[str, ...]] = MINUTE_FEATURES
 
     def __post_init__(self) -> None:
-        if self.root.kind not in {"reduce_unary", "reduce_binary"}:
-            raise ValueError("A minute expression must terminate with a reduction operator")
+        if self.root.kind not in {
+            "reduce_unary", "reduce_binary", "daily_unary", "daily_binary", "daily_ts", "daily_cs"
+        }:
+            raise ValueError("A report minute expression must terminate in the daily expression layer")
 
     @classmethod
     def generate(cls, max_depth: int = 5, seed: int | None = None) -> "MinuteExpression":
@@ -129,9 +142,91 @@ class MinuteExpression:
     def execute(self, data: pd.DataFrame) -> pd.Series:
         prepared = build_minute_features(data)
         cache: dict[MinuteNode, pd.Series] = {}
-        result = self._execute_node(self.root, prepared, cache)
+        result = self._execute_daily_node(self.root, prepared, cache, {})
         result.name = str(self)
         return result.replace([np.inf, -np.inf], np.nan).astype(float)
+
+    def block_nodes(self) -> tuple[MinuteNode, ...]:
+        unique: dict[str, MinuteNode] = {}
+
+        def visit(node: MinuteNode) -> None:
+            if node.kind in {"reduce_unary", "reduce_binary"}:
+                unique.setdefault(node.render(), node)
+                return
+            for child in node.children:
+                visit(child)
+
+        visit(self.root)
+        return tuple(unique.values())
+
+    def execute_block(self, node: MinuteNode, data: pd.DataFrame) -> pd.Series:
+        if node.kind not in {"reduce_unary", "reduce_binary"}:
+            raise ValueError("execute_block requires a reduce node")
+        prepared = build_minute_features(data)
+        return self._execute_node(node, prepared, {})
+
+    def execute_blocks(
+        self, nodes: Sequence[MinuteNode], data: pd.DataFrame
+    ) -> dict[str, pd.Series]:
+        """Execute several blocks with one prepared frame and shared subexpression cache."""
+        prepared = build_minute_features(data)
+        cache: dict[MinuteNode, pd.Series] = {}
+        return {
+            node.render(): self._execute_node(node, prepared, cache)
+            for node in nodes
+        }
+
+    def execute_from_blocks(self, blocks: dict[str, pd.Series]) -> pd.Series:
+        result = self._execute_daily_node(self.root, None, {}, blocks)
+        result.name = str(self)
+        return result.replace([np.inf, -np.inf], np.nan).astype(float)
+
+    def _execute_daily_node(
+        self,
+        node: MinuteNode,
+        data: pd.DataFrame | None,
+        minute_cache: dict[MinuteNode, pd.Series],
+        blocks: dict[str, pd.Series],
+    ) -> pd.Series:
+        if node.kind in {"reduce_unary", "reduce_binary"}:
+            cached = blocks.get(node.render())
+            if cached is not None:
+                return cached
+            if data is None:
+                raise KeyError(f"Missing computed intraday block: {node.render()}")
+            return self._execute_node(node, data, minute_cache)
+        children = [
+            self._execute_daily_node(child, data, minute_cache, blocks)
+            for child in node.children
+        ]
+        if node.kind == "daily_unary":
+            return apply_daily_unary(node.name, children[0])
+        if node.kind == "daily_binary":
+            return apply_daily_binary(node.name, children[0], children[1])
+        if node.kind == "daily_ts":
+            return self._apply_daily_grouped(node, children[0], time_series=True)
+        if node.kind == "daily_cs":
+            return self._apply_daily_grouped(node, children[0], time_series=False)
+        raise AssertionError(node.kind)
+
+    @staticmethod
+    def _apply_daily_grouped(node: MinuteNode, values: pd.Series, time_series: bool) -> pd.Series:
+        if not isinstance(values.index, pd.MultiIndex) or values.index.nlevels != 2:
+            raise ValueError("Daily block output must use a (date, code) MultiIndex")
+        frame = values.rename("value").reset_index()
+        frame.columns = ["date", "code", "value"]
+        frame["date"] = pd.to_datetime(frame["date"]).dt.normalize()
+        frame["code"] = frame["code"].astype(str)
+        order = ["code", "date"] if time_series else ["date", "code"]
+        frame = frame.sort_values(order, kind="stable").reset_index(drop=True)
+        if time_series:
+            result = apply_daily_time_series(
+                node.name, frame["value"], frame["code"], int(node.window)
+            )
+        else:
+            result = apply_daily_cross_sectional(node.name, frame["value"], frame["date"])
+        index = pd.MultiIndex.from_frame(frame[["date", "code"]], names=["date", "code"])
+        return pd.Series(result.to_numpy(dtype=float), index=index).sort_index()
 
     def _execute_node(
         self,
@@ -193,16 +288,41 @@ class MinuteExpressionGenerator:
         self.rng = random.Random(seed)
 
     def generate(self) -> MinuteExpression:
+        return MinuteExpression(self._daily(1))
+
+    def _daily(self, depth: int) -> MinuteNode:
+        if depth >= self.max_depth or self.rng.random() < 0.42:
+            return self._block(depth)
+        kind = self.rng.choices(
+            ("daily_unary", "daily_binary", "daily_ts", "daily_cs"),
+            weights=(2, 2, 4, 2),
+            k=1,
+        )[0]
+        if kind == "daily_unary":
+            return MinuteNode(kind, self.rng.choice(UNARY_OPS), (self._daily(depth + 1),))
+        if kind == "daily_binary":
+            return MinuteNode(
+                kind, self.rng.choice(BINARY_OPS),
+                (self._daily(depth + 1), self._daily(depth + 1)),
+            )
+        if kind == "daily_ts":
+            return MinuteNode(
+                kind, self.rng.choice(TS_UNARY_OPS),
+                (self._daily(depth + 1),), self.rng.choice(MINUTE_WINDOWS),
+            )
+        return MinuteNode(kind, self.rng.choice(CS_OPS), (self._daily(depth + 1),))
+
+    def _block(self, depth: int) -> MinuteNode:
         if self.rng.random() < 0.8:
-            child = self._source(2)
+            child = self._source(depth + 1)
             root = MinuteNode("reduce_unary", self.rng.choice(REDUCE_UNARY_OPS), (child,))
         else:
             root = MinuteNode(
                 "reduce_binary",
                 self.rng.choice(REDUCE_BINARY_OPS),
-                (self._minute(2), self._minute(2)),
+                (self._minute(depth + 1), self._minute(depth + 1)),
             )
-        return MinuteExpression(root)
+        return root
 
     def _source(self, depth: int) -> MinuteNode:
         if depth < self.max_depth and self.rng.random() < 0.30:
@@ -237,6 +357,19 @@ def minute_expression_from_tokens(tokens: Sequence[str]) -> MinuteExpression:
             raise ValueError("Incomplete minute prefix expression")
         token = tokens[index]
         index += 1
+        if expected == "daily" and token in UNARY_OPS:
+            return MinuteNode("daily_unary", token, (parse("daily"),))
+        if expected == "daily" and token in BINARY_OPS:
+            return MinuteNode("daily_binary", token, (parse("daily"), parse("daily")))
+        if expected == "daily" and token in CS_OPS:
+            return MinuteNode("daily_cs", token, (parse("daily"),))
+        if expected == "daily" and token in TS_UNARY_OPS:
+            window = parse_window(token)
+            return MinuteNode("daily_ts", token, (parse("daily"),), window)
+        if expected == "daily" and token in REDUCE_UNARY_OPS:
+            return MinuteNode("reduce_unary", token, (parse("source"),))
+        if expected == "daily" and token in REDUCE_BINARY_OPS:
+            return MinuteNode("reduce_binary", token, (parse("minute"), parse("minute")))
         if expected in {"minute", "source"} and token in MINUTE_FEATURES:
             return MinuteNode("feature", token)
         if expected in {"minute", "source"} and token in MINUTE_UNARY_OPS:
@@ -272,7 +405,7 @@ def minute_expression_from_tokens(tokens: Sequence[str]) -> MinuteExpression:
             raise ValueError(f"Invalid minute window: {window}")
         return window
 
-    root = parse("block")
+    root = parse("daily")
     if index != len(tokens):
         raise ValueError(f"Unused tokens after minute expression: {tokens[index:]}")
     return MinuteExpression(root)

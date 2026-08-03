@@ -57,7 +57,7 @@ def test_chart_28_to_30_operator_inventory_is_complete() -> None:
     assert len(MINUTE_UNARY_OPS + MINUTE_WINDOW_OPS + MINUTE_BINARY_OPS) == 15
     assert len(MASK_WINDOW_OPS + MASK_UNARY_OPS + MASK_BINARY_WINDOW_OPS + MASK_BINARY_OPS) == 14
     assert len(REDUCE_UNARY_OPS + REDUCE_BINARY_OPS) == 16
-    assert len(MINUTE_ACTION_TOKENS) == 71
+    assert len(MINUTE_ACTION_TOKENS) == 92
 
 
 def test_all_chart_28_to_30_operator_paths_execute() -> None:
@@ -113,3 +113,17 @@ def test_minute_grammar_round_trip_and_policy_output_shape() -> None:
     token_ids = torch.tensor([[vocabulary.bos_id]], dtype=torch.long)
     logits = model(token_ids, torch.zeros((1, 3)))
     assert logits.shape == (1, len(MINUTE_ACTION_TOKENS))
+
+
+def test_report_daily_tree_executes_after_intraday_reduction() -> None:
+    data = _minute_prices()
+    expression = minute_expression_from_tokens(
+        ["neg", "ts_mean", "W5", "r_corr", "ret", "signed_amt"]
+    )
+    assert str(expression) == "neg(ts_mean(r_corr(ret,signed_amt),5))"
+    assert [node.render() for node in expression.block_nodes()] == [
+        "r_corr(ret,signed_amt)"
+    ]
+    result = expression.execute(data)
+    assert result.index.names == ["date", "code"]
+    assert len(result) == 4

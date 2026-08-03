@@ -74,6 +74,22 @@ RQAlphaPlus 是授权软件，需要通过米筐授权渠道独立安装，详�
 
 ## 训练与完整流水线
 
+### DolphinDB分钟数据流式CPU训练
+
+`cpu-training`分支支持研报定义的分钟信息因子：分钟特征先经过分钟算子与日内Mask，随后由`r_*`聚合为日频Block，再接`ts_*`、截面和日频组合算子形成最终日频因子。DolphinDB模式不会落地原始分钟PKL：标签行情在数据库端按日聚合；Reward按完整交易日流式读取分钟数据；同批表达式共享数据库扫描；重复日内Block使用有界LRU缓存。
+
+```bash
+python scripts/prepare_ddb_minute.py \
+  --config configs/minute_training_cpu_ddb.yaml \
+  --audit-only
+
+python scripts/train_cpu.py \
+  --mode minute \
+  --config configs/minute_training_cpu_ddb.yaml
+```
+
+正式运行前必须把配置中的结束日期改为数据库实际最后交易日，并确认OHLC已经复权后设置`prices_are_adjusted: true`。最终保存Checkpoint、Alpha Pool和日频因子矩阵`results/minute_cpu_ddb/alpha_factor_matrix.csv.gz`；不会创建`minute_*.pkl`。完整说明见[DolphinDB分钟数据CPU训练手册](docs/DolphinDB分钟数据CPU训练手册.md)。
+
 ### 推荐：单个 Colab Notebook
 
 Colab 一次只需打开：

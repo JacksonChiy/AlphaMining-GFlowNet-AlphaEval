@@ -149,6 +149,23 @@ class GFlowNetTrainer:
             unique.setdefault(str(expression), expression)
         unique_expressions = list(unique.values())
         evaluated_by_expression: dict[str, RewardBreakdown] = {}
+        evaluate_many = getattr(self.reward_evaluator, "evaluate_many", None)
+        if callable(evaluate_many):
+            batch_results = evaluate_many(unique_expressions)
+            for completed, (expression, result) in enumerate(
+                zip(unique_expressions, batch_results), start=1
+            ):
+                evaluated_by_expression[str(expression)] = result
+                if log_progress:
+                    cache = self.reward_evaluator.cache_stats()
+                    print(
+                        f"[GFlowNet] reward_progress completed={completed:03d}/"
+                        f"{len(unique_expressions):03d} expression={expression} "
+                        f"cache_hits={cache['hits']} cache_misses={cache['misses']} "
+                        f"cache_hit_rate={cache['hit_rate']:.2%}",
+                        flush=True,
+                    )
+            return [evaluated_by_expression[str(expression)] for expression in expressions]
         if executor is None:
             for completed, expression in enumerate(unique_expressions, start=1):
                 key = str(expression)

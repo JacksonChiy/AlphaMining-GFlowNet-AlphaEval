@@ -9,6 +9,7 @@ import pandas as pd
 
 from src.expression.minute import MinuteExpression, minute_expression_from_tokens
 from src.operators.minute import build_minute_features
+from src.data_loader.dolphindb_minute import DolphinDBMinuteLoader
 
 
 def _daily_keys(daily_data: pd.DataFrame) -> pd.MultiIndex:
@@ -119,33 +120,130 @@ def save_minute_alpha_pool_from_cache(
             "tokens": json.dumps(item["tokens"], ensure_ascii=False),
         })
 
+    block_nodes: dict[str, Any] = {}
+    for item in eligible:
+        for node in item["expression"].block_nodes():
+            block_nodes.setdefault(node.render(), node)
+    block_parts: dict[str, list[pd.Series]] = {key: [] for key in block_nodes}
+    executor_expression: MinuteExpression = eligible[0]["expression"]
     cache_dir = Path(cache_dir)
     manifest = json.loads((cache_dir / "manifest.json").read_text(encoding="utf-8"))
-    parts: list[pd.DataFrame] = []
     for partition_index, filename in enumerate(manifest["files"], start=1):
         minute_part = pd.read_pickle(cache_dir / filename)
-        dates = pd.to_datetime(minute_part["date"]).dt.normalize().unique()
-        daily_part = daily_data[pd.to_datetime(daily_data["date"]).dt.normalize().isin(dates)]
-        part = daily_part[["date", "code"]].copy()
-        keys = _daily_keys(part)
-        prepared = build_minute_features(minute_part)
-        for factor_name, item in zip(factor_names, eligible):
-            values = item["expression"].execute(prepared).reindex(keys)
-            part[factor_name] = pd.to_numeric(values, errors="coerce").replace(
-                [np.inf, -np.inf], np.nan
-            ).to_numpy()
-        parts.append(part)
+        computed = executor_expression.execute_blocks(list(block_nodes.values()), minute_part)
+        for key, values in computed.items():
+            block_parts[key].append(values)
         print(
             f"[MinuteFactorPool] cache_partition_complete "
             f"index={partition_index:03d}/{len(manifest['files']):03d} "
-            f"rows={len(part):,} file={filename}",
+            f"minute_rows={len(minute_part):,} blocks={len(block_nodes):03d} file={filename}",
             flush=True,
         )
-    matrix = pd.concat(parts, ignore_index=True).sort_values(["date", "code"], kind="stable")
+    blocks: dict[str, pd.Series] = {}
+    for key, parts in block_parts.items():
+        values = pd.concat(parts).sort_index()
+        blocks[key] = values[~values.index.duplicated(keep="last")]
+    matrix = daily_data[["date", "code"]].copy()
+    keys = _daily_keys(matrix)
+    for factor_name, item in zip(factor_names, eligible):
+        expression: MinuteExpression = item["expression"]
+        required = {node.render(): blocks[node.render()] for node in expression.block_nodes()}
+        values = expression.execute_from_blocks(required).reindex(keys)
+        matrix[factor_name] = pd.to_numeric(values, errors="coerce").replace(
+            [np.inf, -np.inf], np.nan
+        ).to_numpy()
     metadata = pd.DataFrame(metadata_rows)
     metadata_path, matrix_path = Path(metadata_path), Path(matrix_path)
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
     matrix_path.parent.mkdir(parents=True, exist_ok=True)
     metadata.to_csv(metadata_path, index=False)
     matrix.to_pickle(matrix_path)
+    return metadata, matrix
+
+
+def save_minute_alpha_pool_from_dolphindb_stream(
+    pool: list[dict[str, Any]],
+    loader: DolphinDBMinuteLoader,
+    daily_data: pd.DataFrame,
+    start_date: str,
+    end_date: str,
+    metadata_path: str | Path = "results/minute_cpu_ddb/alpha_pool.csv",
+    matrix_path: str | Path = "results/minute_cpu_ddb/alpha_factor_matrix.csv.gz",
+    min_coverage: float = 0.80,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Compute selected report factors in one DDB scan; no raw minute file is written."""
+    eligible = [
+        item for item in pool
+        if float(item.get("coverage", 0.0)) >= min_coverage
+        and float(item.get("valid_date_coverage", 0.0)) >= min_coverage
+    ]
+    if not eligible:
+        raise ValueError(f"No minute expression meets minimum coverage {min_coverage:.2%}")
+    factor_names = [f"minute_factor_{index:03d}" for index in range(1, len(eligible) + 1)]
+    block_nodes: dict[str, Any] = {}
+    for item in eligible:
+        for node in item["expression"].block_nodes():
+            block_nodes.setdefault(node.render(), node)
+    block_parts: dict[str, list[pd.Series]] = {key: [] for key in block_nodes}
+    executor_expression: MinuteExpression = eligible[0]["expression"]
+    chunks = 0
+    for chunks, (_, _, minute) in enumerate(
+        loader.iter_frames(start_date, end_date), start=1
+    ):
+        computed = executor_expression.execute_blocks(list(block_nodes.values()), minute)
+        for key, values in computed.items():
+            block_parts[key].append(values)
+        print(
+            f"[MinuteFactorPool] ddb_stream_chunk_complete index={chunks:03d} "
+            f"blocks={len(block_nodes):03d} factors={len(eligible):03d}",
+            flush=True,
+        )
+    if chunks == 0:
+        raise ValueError("DolphinDB stream returned no rows for factor pool generation")
+    blocks: dict[str, pd.Series] = {}
+    for key, parts in block_parts.items():
+        if not parts:
+            continue
+        values = pd.concat(parts).sort_index()
+        blocks[key] = values[~values.index.duplicated(keep="last")]
+    matrix = daily_data[["date", "code"]].copy()
+    dates = pd.to_datetime(matrix["date"]).dt.normalize()
+    matrix = matrix.loc[
+        dates.between(pd.Timestamp(start_date), pd.Timestamp(end_date))
+    ].copy()
+    keys = _daily_keys(matrix)
+    metadata_rows: list[dict[str, Any]] = []
+    for index, (factor_name, item) in enumerate(zip(factor_names, eligible), start=1):
+        expression: MinuteExpression = item["expression"]
+        required = {node.render(): blocks[node.render()] for node in expression.block_nodes()}
+        values = expression.execute_from_blocks(required).reindex(keys)
+        matrix[factor_name] = pd.to_numeric(values, errors="coerce").replace(
+            [np.inf, -np.inf], np.nan
+        ).to_numpy()
+        metadata_rows.append({
+            "factor": factor_name,
+            "expression": str(expression),
+            **{key: value for key, value in item.items() if key not in {"expression", "tokens"}},
+            "tokens": json.dumps(item["tokens"], ensure_ascii=False),
+        })
+        print(
+            f"[MinuteFactorPool] factor_complete index={index:03d}/{len(eligible):03d} "
+            f"factor={factor_name} coverage={matrix[factor_name].notna().mean():.2%}",
+            flush=True,
+        )
+    metadata = pd.DataFrame(metadata_rows)
+    metadata_path, matrix_path = Path(metadata_path), Path(matrix_path)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    matrix_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata.to_csv(metadata_path, index=False)
+    if matrix_path.name.endswith(".csv.gz"):
+        matrix.to_csv(matrix_path, index=False, compression="gzip")
+    elif matrix_path.suffix.lower() == ".csv":
+        matrix.to_csv(matrix_path, index=False)
+    elif matrix_path.suffix.lower() in {".parquet", ".pq"}:
+        matrix.to_parquet(matrix_path, index=False)
+    elif matrix_path.suffix.lower() in {".pkl", ".pickle"}:
+        matrix.to_pickle(matrix_path)
+    else:
+        raise ValueError("factor matrix must use .csv, .csv.gz, .parquet or .pkl")
     return metadata, matrix

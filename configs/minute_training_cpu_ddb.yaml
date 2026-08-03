@@ -1,6 +1,5 @@
 dataset:
   source: dolphindb
-  daily_file: data/daily_price_ddb.pkl
   mining_start_date: '2020-01-01'
   mining_end_date: '2023-12-31'
   out_of_sample_start_date: '2024-01-01'
@@ -17,10 +16,15 @@ dataset:
     keep_alive_seconds: 60
     reconnect_attempts: 3
 
-    # 按20个自然日分块查询并缓存；训练期间只读本地缓存。
+    # 研报式流式计算：不落地原始分钟PKL；按交易日读取、Reduce为日频Block后释放。
+    load_mode: stream
     start_date: '2020-01-01'
     end_date: '2026-12-31'
-    chunk_days: 20
+    # 审计和日频标签聚合只返回小结果，可用大日期块减少远程往返。
+    audit_chunk_days: 120
+    daily_aggregate_chunk_days: 120
+    # Reward读取原始分钟行，保持1天以限制Windows内存。
+    chunk_days: 1
     cache_dir: data/minute_ddb_cache
     force_refresh: false
 
@@ -50,7 +54,8 @@ training:
   max_depth: 5
   max_nodes: 12
   gradient_clip: 1.0
-  reward_workers: 4
+  # DDB流模式由一批表达式共享一次扫描，禁止多线程重复扫描数据库。
+  reward_workers: 1
   seed: 42
 
 reward:
@@ -62,6 +67,8 @@ reward:
   coverage_penalty_power: 2.0
   reward_floor: 1.0e-8
   subexpression_cache_enabled: false
+  # Reduce后的日频Block很小，可在表达式之间复用，对应研报block cache。
+  block_cache_max_entries: 256
 
 pipeline:
   pool_size: 50
@@ -72,4 +79,4 @@ outputs:
   metrics: results/minute_cpu_ddb/gflownet_training_metrics.csv
   trajectory_metrics: results/minute_cpu_ddb/gflownet_trajectory_metrics.csv
   alpha_pool: results/minute_cpu_ddb/alpha_pool.csv
-  factor_matrix: results/minute_cpu_ddb/alpha_factor_matrix.pkl
+  factor_matrix: results/minute_cpu_ddb/alpha_factor_matrix.csv.gz

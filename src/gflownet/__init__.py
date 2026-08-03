@@ -6,8 +6,9 @@ from .minute_factor_pool import (
     execute_saved_minute_alpha_pool,
     save_minute_alpha_pool,
     save_minute_alpha_pool_from_cache,
+    save_minute_alpha_pool_from_dolphindb_stream,
 )
-from .minute_reward import MinuteRewardEvaluator
+from .minute_reward import DolphinDBStreamingMinuteRewardEvaluator, MinuteRewardEvaluator
 from .minute_trainer import MinuteGFlowNetTrainer
 from .reward import RewardBreakdown, RewardEvaluator, make_forward_return
 from .trainer import GFlowNetTrainer, TrainerConfig
@@ -17,7 +18,8 @@ __all__ = [
     "RewardBreakdown", "RewardEvaluator", "make_forward_return", "GFlowNetTrainer", "TrainerConfig",
     "execute_saved_alpha_pool",
     "MINUTE_ACTION_TOKENS", "MinuteGrammarState", "MinuteVocabulary",
-    "MinuteRewardEvaluator", "MinuteGFlowNetTrainer",
+    "MinuteRewardEvaluator", "DolphinDBStreamingMinuteRewardEvaluator", "MinuteGFlowNetTrainer",
     "execute_saved_minute_alpha_pool", "save_minute_alpha_pool",
     "save_minute_alpha_pool_from_cache",
+    "save_minute_alpha_pool_from_dolphindb_stream",
 ]

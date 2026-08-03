@@ -39,7 +39,7 @@ def main() -> None:
     session = create_dolphindb_session(values)
     try:
         loader = DolphinDBMinuteLoader(config, session)
-        if args.audit_only:
+        if args.audit_only or config.load_mode == "stream":
             audit = loader.audit()
             output = Path(args.audit_output)
             output.parent.mkdir(parents=True, exist_ok=True)
@@ -54,6 +54,12 @@ def main() -> None:
                 f"output={output}",
                 flush=True,
             )
+            if config.load_mode == "stream" and not args.audit_only:
+                print(
+                    "[DDB] stream_ready raw_minute_files=false; "
+                    "training will query DolphinDB directly and cache only daily blocks in memory",
+                    flush=True,
+                )
         else:
             cache_dir, daily_file = loader.extract()
             print(

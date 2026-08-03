@@ -34,10 +34,10 @@ volume, amount, tradeCount
 - 数据实际最早、最晚日期是否覆盖配置区间；
 - OHLC 是否已经复权。
 
-审计结果保存为：
+流式模式的审计结果保存为：
 
 ```text
-data/minute_ddb_cache/field_audit.json
+results/minute_cpu_ddb/field_audit.json
 ```
 
 其中包含字段映射、源表类型、时间范围、标准输出约定和实际生成的 `dataSql`。
@@ -96,6 +96,19 @@ echo "$DDB_DATABASE/$DDB_TABLE"
 
 不要运行 `echo "$DDB_PASSWORD"`。
 
+Windows PowerShell 永久保存到当前用户时使用：
+
+```powershell
+[Environment]::SetEnvironmentVariable("DDB_HOST", "服务器地址", "User")
+[Environment]::SetEnvironmentVariable("DDB_PORT", "8848", "User")
+[Environment]::SetEnvironmentVariable("DDB_USER", "用户名", "User")
+[Environment]::SetEnvironmentVariable("DDB_PASSWORD", "密码", "User")
+[Environment]::SetEnvironmentVariable("DDB_DATABASE", "dfs://CYC", "User")
+[Environment]::SetEnvironmentVariable("DDB_TABLE", "minute_bar", "User")
+```
+
+保存后关闭并重新打开 PowerShell。
+
 ## 5. 修改复权确认
 
 打开：
@@ -142,22 +155,27 @@ results/minute_cpu_ddb/field_audit.json
 - `pricesAreAdjusted` 应与真实行情口径一致；
 - `dataSql` 中只应包含已确认的十个源字段。
 
-## 7. 第二步：分块抽取并缓存
+## 7. 第二步：确认研报式流模式
 
-确认复权并把配置改成 `true` 后运行：
+配置应保持：
+
+```yaml
+load_mode: stream
+chunk_days: 1
+audit_chunk_days: 120
+daily_aggregate_chunk_days: 120
+```
+
+`chunk_days`控制返回原始分钟行的Reward查询，建议保持1天；另外两个参数只执行聚合统计并返回小结果，可以使用120天以减少远程调用次数。
+
+确认复权并把 `prices_are_adjusted` 改成 `true` 后运行：
 
 ```bash
 python scripts/prepare_ddb_minute.py \
   --config configs/minute_training_cpu_ddb.yaml
 ```
 
-默认每 20 个自然日查询一次：
-
-```yaml
-chunk_days: 20
-```
-
-每个分块执行的 SQL 结构为：
+该命令在流模式下只检查字段和日期，不下载分钟文件。训练时每个交易日执行的 SQL 结构为：
 
 ```dos
 select sym, date, time, open, high, low, close,
@@ -167,20 +185,13 @@ where date >= 开始日期, date <= 结束日期
 order by date, sym, time
 ```
 
-缓存输出：
+命令应输出：
 
 ```text
-data/minute_ddb_cache/
-├── manifest.json
-├── field_audit.json
-├── minute_20200101_20200120.pkl
-├── minute_20200121_20200209.pkl
-└── ...
-
-data/daily_price_ddb.pkl
+[DDB] stream_ready raw_minute_files=false
 ```
 
-`daily_price_ddb.pkl` 由分钟数据聚合：
+程序不会创建 `minute_*.pkl` 或 `daily_price_ddb.pkl`。标签所需日行情直接由 DolphinDB 聚合后返回内存：
 
 - open：当日第一根分钟开盘价；
 - high：当日最高价；
@@ -188,14 +199,6 @@ data/daily_price_ddb.pkl
 - close：当日最后一根分钟收盘价；
 - volume/amount/trade_count：日内求和；
 - vwap：`amount / volume`。
-
-强制重新抽取：
-
-```bash
-python scripts/prepare_ddb_minute.py \
-  --config configs/minute_training_cpu_ddb.yaml \
-  --force-refresh
-```
 
 ## 8. 第三步：CPU 训练
 
@@ -207,24 +210,35 @@ python scripts/train_cpu.py \
   --config configs/minute_training_cpu_ddb.yaml
 ```
 
+Windows PowerShell：
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python scripts/train_cpu.py --mode minute --config configs/minute_training_cpu_ddb.yaml
+```
+
 该命令会自动执行：
 
 ```text
 DDB schema审计
-→ 分日期块抽取或复用现有缓存
-→ 分钟字段标准化
-→ 聚合日频行情和构造t+1到t+5标签
-→ 加载2020–2023分钟训练区间
+→ DolphinDB服务端聚合日频行情
+→ 构造t+1到t+5标签
+→ GFlowNet批量生成表达式
+→ 按交易日流式读取2020–2023分钟数据
+→ 分钟算子 + Mask + Reduce生成日频Block
+→ 复用日频Block缓存并执行日频Tree
+→ 计算IC、LongIR、风险和覆盖率Reward
 → CPU GFlowNet训练
 → 生成Alpha Pool
-→ 按缓存分区计算2020–2026日频因子值
-→ 保存因子矩阵
+→ 一次流式扫描计算2020–2026已选因子
+→ 保存日频因子CSV.GZ
 ```
 
-训练期间不会重复请求 DolphinDB；存在相同 fingerprint 的完整缓存时会直接输出：
+同一批表达式共享一次DolphinDB扫描，而不是每个表达式分别扫描。重复日内Block直接从内存缓存命中：
 
 ```text
-[DDB] cache_reused ...
+[DDBReward] chunk_complete ... new_blocks=... expressions=...
+[GFlowNet] reward_progress ... cache_hit_rate=...
 ```
 
 ## 9. CPU 训练输出
@@ -237,10 +251,10 @@ results/minute_cpu_ddb/
 ├── gflownet_training_metrics.csv
 ├── gflownet_trajectory_metrics.csv
 ├── alpha_pool.csv
-└── alpha_factor_matrix.pkl
+└── alpha_factor_matrix.csv.gz
 ```
 
-`alpha_factor_matrix.pkl` 已经是日频矩阵，可以继续进入 AlphaEval、LightGBM 和本地 RQAlphaPlus 回测。
+`alpha_factor_matrix.csv.gz` 是研报定义的“分钟信息生成、日内聚合后输出”的日频因子矩阵，可以继续进入 AlphaEval、LightGBM 和本地 RQAlphaPlus 回测。原始分钟数据不会落地到本机。
 
 ## 10. 防未来数据泄露说明
 
@@ -249,12 +263,18 @@ results/minute_cpu_ddb/
 - 分钟因子只使用信号日当日及以前的行情；
 - `m_rank/m_zscore` 使用完整当日分钟序列，因此信号定义为收盘后信号；
 - 标签为 `close(t+5) / close(t+1) - 1`，只进入 Reward/评价，不进入表达式计算；
-- 因子池对完整历史的执行按日期缓存分区完成，因为分钟表达式不会跨交易日，分区计算不会改变结果；
+- 日内Block按完整交易日计算，不在交易日内部截断，因此Mask、日内rank和Reduce语义不变；
+- Reduce之后的 `ts_*` 日频算子在完整日频Block上执行，滚动窗口只使用当日及历史日；
 - 行业和市值字段不在当前分钟表中，因此相关风险惩罚不会生效。如需正式风险中性化，应增加时点一致的行业/市值数据源。
 
 ## 11. 内存与速度
 
-DDB 抽取和最终因子池执行均按日期分区，不会一次性下载完整远程表。GFlowNet Reward 训练仍需要在内存中持有配置的训练区间分钟数据，这是当前 Pandas 表达式引擎的边界。
+DDB Reward和最终因子池执行均按交易日流式查询。内存中只同时存在一个查询分块、日频标签面板和Reduce后的日频Block，不再持有完整训练区间分钟表。
+
+研报使用MemMap减少重复读取；DDB版本用两层机制替代：
+
+- 一批轨迹共享一次DDB扫描；
+- `date_scope + block_expr`对应的日频Block在内存LRU中复用。
 
 CPU 首次验证建议临时改为：
 
@@ -262,14 +282,14 @@ CPU 首次验证建议临时改为：
 training:
   epochs: 2
   trajectories_per_epoch: 4
-  reward_workers: 2
+  reward_workers: 1
 
 pipeline:
   pool_size: 5
   pool_attempts: 50
 ```
 
-同时先把 DDB 的抽取日期缩短到几个月，验证字段、Reward、checkpoint 和因子池后，再恢复完整区间。缩短区间只用于系统测试，正式实验仍应保持训练期和样本外期隔离。
+同时先把DDB日期缩短到3至6个月，验证字段、Reward、checkpoint和因子池后，再恢复完整区间。流模式必须保持 `reward_workers: 1`，否则会产生重复数据库扫描。
 
 ## 12. 常见错误
 
@@ -287,8 +307,8 @@ pipeline:
 
 ### source starts later / ends earlier
 
-DDB 表的实际日期范围不能覆盖配置日期。修改抽取日期或补齐源数据。
+DDB表的实际日期范围不能覆盖配置日期。错误信息会显示`requested_end`和`actual_last_trade_date`；将`dataset.dolphindb.end_date`与`dataset.out_of_sample_end_date`改成实际最后交易日。
 
 ### 内存不足
 
-减小训练日期范围或使用明确的股票 Universe。不要随机删除分钟行，因为会破坏日内路径、Mask 和聚合算子的定义。
+保持`chunk_days: 1`，减小训练日期范围或使用明确的股票Universe。不要随机删除分钟行，因为会破坏日内路径、Mask和聚合算子的定义。
