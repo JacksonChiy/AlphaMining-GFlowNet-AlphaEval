@@ -225,12 +225,7 @@ class DolphinDBMinuteLoader:
                     else reason
                 ),
             })
-        stats = self.session.run(
-            f"select min(date) as minDate, max(date) as maxDate, count(*) as rows "
-            f"from {self.table_expression}"
-        )
-        stats_frame = pd.DataFrame(stats)
-        first = stats_frame.iloc[0] if not stats_frame.empty else {}
+        first = self._collect_requested_range_stats()
         audit = DolphinDBFieldAudit(
             database=self.config.database,
             table=self.config.table,
@@ -328,6 +323,45 @@ class DolphinDBMinuteLoader:
             "order by date, sym, time"
         )
 
+    def build_stats_sql(self, start: pd.Timestamp, end: pd.Timestamp) -> str:
+        """Build a partition-pruned audit query for one bounded date chunk."""
+        start_literal, end_literal = start.strftime("%Y.%m.%d"), end.strftime("%Y.%m.%d")
+        return (
+            "select min(date) as minDate, max(date) as maxDate, count(*) as rows "
+            f"from {self.table_expression} "
+            f"where date >= {start_literal}, date <= {end_literal}"
+        )
+
+    def _collect_requested_range_stats(self) -> dict[str, Any]:
+        """Aggregate audit statistics without ever scanning all table partitions."""
+        min_dates: list[pd.Timestamp] = []
+        max_dates: list[pd.Timestamp] = []
+        total_rows = 0
+        chunks = list(self._date_chunks())
+        for chunk_index, (start, end) in enumerate(chunks, start=1):
+            result = pd.DataFrame(self.session.run(self.build_stats_sql(start, end)))
+            if not result.empty:
+                row = result.iloc[0]
+                rows = int(row.get("rows", 0) or 0)
+                total_rows += rows
+                min_date = row.get("minDate")
+                max_date = row.get("maxDate")
+                if rows > 0 and min_date is not None and not pd.isna(min_date):
+                    min_dates.append(pd.Timestamp(min_date))
+                if rows > 0 and max_date is not None and not pd.isna(max_date):
+                    max_dates.append(pd.Timestamp(max_date))
+            if chunk_index == 1 or chunk_index == len(chunks) or chunk_index % 25 == 0:
+                print(
+                    f"[DDB] audit_progress chunks={chunk_index}/{len(chunks)} "
+                    f"rows={total_rows:,}",
+                    flush=True,
+                )
+        return {
+            "minDate": min(min_dates) if min_dates else None,
+            "maxDate": max(max_dates) if max_dates else None,
+            "rows": total_rows,
+        }
+
     def _date_chunks(self):
         current = pd.Timestamp(self.config.start_date).normalize()
         final = pd.Timestamp(self.config.end_date).normalize()
@@ -368,9 +402,15 @@ class DolphinDBMinuteLoader:
     def _validate_date_coverage(self, audit: DolphinDBFieldAudit) -> None:
         if audit.source_min_date is None or audit.source_max_date is None:
             raise ValueError("DolphinDB source table contains no valid date range")
-        if pd.Timestamp(audit.source_min_date) > pd.Timestamp(self.config.start_date):
+        # Calendar boundaries commonly fall on weekends or exchange holidays.
+        boundary_tolerance = pd.Timedelta(days=7)
+        if pd.Timestamp(audit.source_min_date) > (
+            pd.Timestamp(self.config.start_date) + boundary_tolerance
+        ):
             raise ValueError("DolphinDB source starts later than requested training start")
-        if pd.Timestamp(audit.source_max_date) < pd.Timestamp(self.config.end_date):
+        if pd.Timestamp(audit.source_max_date) < (
+            pd.Timestamp(self.config.end_date) - boundary_tolerance
+        ):
             raise ValueError("DolphinDB source ends earlier than requested extraction end")
 
 

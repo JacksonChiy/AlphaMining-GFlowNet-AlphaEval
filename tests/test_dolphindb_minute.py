@@ -56,10 +56,14 @@ class FakeDolphinDBSession:
             }
             return pd.DataFrame({"name": list(types), "typeString": list(types.values())})
         if script.startswith("select min(date)"):
+            dates = re.findall(r"date [<>]= (\d{4}\.\d{2}\.\d{2})", script)
+            assert len(dates) == 2
+            start, end = (pd.Timestamp(value.replace(".", "-")) for value in dates)
+            selected = self.frame[self.frame["date"].between(start, end)]
             return pd.DataFrame({
-                "minDate": [self.frame["date"].min()],
-                "maxDate": [self.frame["date"].max()],
-                "rows": [len(self.frame)],
+                "minDate": [selected["date"].min()],
+                "maxDate": [selected["date"].max()],
+                "rows": [len(selected)],
             })
         dates = re.findall(r"date [<>]= (\d{4}\.\d{2}\.\d{2})", script)
         assert len(dates) == 2
@@ -101,6 +105,9 @@ def test_field_audit_checks_names_types_dates_and_adjustment(tmp_path) -> None:
     assert audit.source_rows == 12
     assert audit.source_min_date == "2024-01-02"
     assert {item["status"] for item in audit.required_fields} == {"direct", "derived"}
+    stats_scripts = [script for script in session.scripts if script.startswith("select min(date)")]
+    assert stats_scripts
+    assert all("where date >=" in script for script in stats_scripts)
 
 
 def test_field_audit_rejects_incompatible_dolphindb_type(tmp_path) -> None:
@@ -127,7 +134,12 @@ def test_chunked_extract_daily_aggregation_and_partitioned_factor_pool(tmp_path)
     assert manifest["complete"] is True
     assert manifest["rows"] == 12
     assert len(manifest["files"]) == 2
-    assert all("order by date, sym, time" in script for script in session.scripts if "where date" in script)
+    data_scripts = [
+        script for script in session.scripts
+        if "where date" in script and "select sym, date, time" in script
+    ]
+    assert data_scripts
+    assert all("order by date, sym, time" in script for script in data_scripts)
 
     daily = pd.read_pickle(daily_path)
     assert len(daily) == 4
