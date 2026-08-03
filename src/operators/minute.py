@@ -253,14 +253,41 @@ def apply_reduce_binary(
     name: str, left: pd.Series, right: pd.Series, data: pd.DataFrame
 ) -> pd.Series:
     frame = pd.DataFrame({"date": data["date"], "code": data["code"], "left": left, "right": right})
-    grouped = frame.groupby(["date", "code"], observed=True, sort=True)
+    # Selecting value columns explicitly keeps grouping keys out of apply() on pandas >= 2.2.
+    grouped = frame.groupby(["date", "code"], observed=True, sort=True)[["left", "right"]]
     if name == "r_corr":
-        return grouped.apply(lambda x: x["left"].corr(x["right"]))
+        def safe_correlation(group: pd.DataFrame) -> float:
+            valid = group.replace([np.inf, -np.inf], np.nan).dropna()
+            if len(valid) < 2:
+                return np.nan
+            left_values = valid["left"].to_numpy(dtype=float)
+            right_values = valid["right"].to_numpy(dtype=float)
+            left_centered = left_values - left_values.mean()
+            right_centered = right_values - right_values.mean()
+            denominator = float(np.sqrt(
+                np.dot(left_centered, left_centered)
+                * np.dot(right_centered, right_centered)
+            ))
+            if denominator <= EPS:
+                return np.nan
+            return float(np.dot(left_centered, right_centered) / denominator)
+
+        return grouped.apply(safe_correlation)
     if name == "r_cov":
-        return grouped.apply(lambda x: x["left"].cov(x["right"]))
+        def safe_covariance(group: pd.DataFrame) -> float:
+            valid = group.replace([np.inf, -np.inf], np.nan).dropna()
+            if len(valid) < 2:
+                return np.nan
+            left_values = valid["left"].to_numpy(dtype=float)
+            right_values = valid["right"].to_numpy(dtype=float)
+            return float(np.dot(
+                left_values - left_values.mean(), right_values - right_values.mean()
+            ) / (len(valid) - 1))
+
+        return grouped.apply(safe_covariance)
     if name == "r_wmean":
         def weighted_mean(group: pd.DataFrame) -> float:
-            valid = group[["left", "right"]].dropna()
+            valid = group.replace([np.inf, -np.inf], np.nan).dropna()
             denominator = float(valid["right"].sum())
             return float((valid["left"] * valid["right"]).sum() / denominator) if abs(denominator) > EPS else np.nan
         return grouped.apply(weighted_mean)

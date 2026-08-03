@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import torch
+import warnings
 
 from src.expression.minute import (
     MASK_BINARY_OPS,
@@ -20,6 +21,7 @@ from src.expression.minute import (
 from src.gflownet.minute_grammar import MINUTE_ACTION_TOKENS, MinuteGrammarState, MinuteVocabulary
 from src.gflownet.model import GFlowNetPolicy, PolicyConfig
 from src.operators.minute import build_minute_features
+from src.operators.minute import apply_reduce_binary
 
 
 def _minute_prices() -> pd.DataFrame:
@@ -127,3 +129,18 @@ def test_report_daily_tree_executes_after_intraday_reduction() -> None:
     result = expression.execute(data)
     assert result.index.names == ["date", "code"]
     assert len(result) == 4
+
+
+def test_binary_reductions_handle_constant_inputs_without_warnings() -> None:
+    data = _minute_prices()
+    constant = pd.Series(1.0, index=data.index)
+    weights = pd.Series(2.0, index=data.index)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        warnings.simplefilter("error", FutureWarning)
+        correlation = apply_reduce_binary("r_corr", constant, constant, data)
+        covariance = apply_reduce_binary("r_cov", constant, constant, data)
+        weighted = apply_reduce_binary("r_wmean", constant, weights, data)
+    assert correlation.isna().all()
+    assert np.allclose(covariance, 0.0)
+    assert np.allclose(weighted, 1.0)
