@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from src.expression.minute import MinuteExpression
+from src.expression.dolphindb_minute import DolphinDBMinuteCompiler
 from src.operators.minute import build_minute_features
 from src.data_loader.dolphindb_minute import DolphinDBMinuteLoader
 
@@ -126,17 +127,47 @@ class DolphinDBStreamingMinuteRewardEvaluator:
             }
             nodes = list(required_blocks.values())
             executor_expression = pending[0]
-            for chunk_index, (_, _, minute) in enumerate(
-                self.loader.iter_frames(self.start_date, self.end_date), start=1
-            ):
-                computed = executor_expression.execute_blocks(nodes, minute)
-                for key, values in computed.items():
-                    block_parts[key].append(values)
-                print(
-                    f"[DDBReward] chunk_complete index={chunk_index:03d} "
-                    f"new_blocks={len(required_blocks):03d} expressions={len(pending):03d}",
-                    flush=True,
-                )
+            compiler = DolphinDBMinuteCompiler(self.loader.table_expression)
+            supported = (
+                [node for node in nodes if compiler.supports(node)]
+                if self.loader.config.pushdown_enabled else []
+            )
+            fallback = [node for node in nodes if node not in supported]
+            print(
+                f"[DDBReward] execution_plan pushdown_blocks={len(supported):03d} "
+                f"numpy_fallback_blocks={len(fallback):03d} coarse_screen=false",
+                flush=True,
+            )
+            if supported:
+                try:
+                    for _, _, computed in self.loader.iter_minute_blocks(
+                        supported, self.start_date, self.end_date
+                    ):
+                        for key, values in computed.items():
+                            block_parts[key].append(values)
+                except Exception as error:
+                    if not self.loader.config.pushdown_fallback:
+                        raise
+                    print(
+                        f"[DDBReward] pushdown_failed fallback_to_numpy=true "
+                        f"error={type(error).__name__}: {error}",
+                        flush=True,
+                    )
+                    for node in supported:
+                        block_parts[node.render()].clear()
+                    fallback = nodes
+            if fallback:
+                for chunk_index, (_, _, minute) in enumerate(
+                    self.loader.iter_frames(self.start_date, self.end_date), start=1
+                ):
+                    computed = executor_expression.execute_blocks(fallback, minute)
+                    for key, values in computed.items():
+                        block_parts[key].append(values)
+                    print(
+                        f"[DDBReward] numpy_chunk_complete index={chunk_index:03d} "
+                        f"fallback_blocks={len(fallback):03d} expressions={len(pending):03d}",
+                        flush=True,
+                    )
             for key, parts in block_parts.items():
                 if not parts:
                     continue

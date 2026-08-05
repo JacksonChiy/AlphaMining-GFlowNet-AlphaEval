@@ -73,12 +73,22 @@ class MinuteDolphinDBConfig:
     load_mode: str = "cache"
     audit_chunk_days: int = 120
     daily_aggregate_chunk_days: int = 120
+    trade_days_table: str = "TradeDays"
+    trade_days_date_column: str | None = None
+    pushdown_enabled: bool = True
+    pushdown_fallback: bool = True
 
     def __post_init__(self) -> None:
         if not re.fullmatch(r"dfs://[A-Za-z0-9_./-]+", self.database):
             raise ValueError("DolphinDB database must be an explicit dfs:// path")
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", self.table):
             raise ValueError("DolphinDB table contains unsupported characters")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", self.trade_days_table):
+            raise ValueError("DolphinDB TradeDays table contains unsupported characters")
+        if self.trade_days_date_column is not None and not re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*", self.trade_days_date_column
+        ):
+            raise ValueError("DolphinDB TradeDays date column contains unsupported characters")
         if min(self.chunk_days, self.audit_chunk_days, self.daily_aggregate_chunk_days) < 1:
             raise ValueError("DolphinDB chunk day settings must be positive")
         if self.load_mode not in {"cache", "stream"}:
@@ -112,6 +122,14 @@ class MinuteDolphinDBConfig:
             load_mode=str(values.get("load_mode", "cache")).lower(),
             audit_chunk_days=int(values.get("audit_chunk_days", 120)),
             daily_aggregate_chunk_days=int(values.get("daily_aggregate_chunk_days", 120)),
+            trade_days_table=str(values.get("trade_days_table", "TradeDays")),
+            trade_days_date_column=(
+                str(values["trade_days_date_column"])
+                if values.get("trade_days_date_column")
+                else None
+            ),
+            pushdown_enabled=bool(values.get("pushdown_enabled", True)),
+            pushdown_fallback=bool(values.get("pushdown_fallback", True)),
         )
 
 
@@ -128,6 +146,9 @@ class DolphinDBFieldAudit:
     requested_end_date: str
     prices_are_adjusted: bool
     data_sql: str
+    trade_days_table: str
+    trade_days_date_column: str
+    requested_trade_days: int
 
     @property
     def passed(self) -> bool:
@@ -153,6 +174,11 @@ class DolphinDBFieldAudit:
                 "sourceEnd": self.source_max_date,
             },
             "joinPlan": {"steps": []},
+            "tradeCalendar": {
+                "table": self.trade_days_table,
+                "dateColumn": self.trade_days_date_column,
+                "requestedTradeDays": self.requested_trade_days,
+            },
             "output": {
                 "frequency": "1min",
                 "timeColumn": "datetime(date + time)",
@@ -168,10 +194,89 @@ class DolphinDBMinuteLoader:
     def __init__(self, config: MinuteDolphinDBConfig, session: SessionLike) -> None:
         self.config = config
         self.session = session
+        self._trade_date_column: str | None = None
+        self._trade_dates_cache: dict[tuple[str, str], tuple[pd.Timestamp, ...]] = {}
 
     @property
     def table_expression(self) -> str:
         return f'loadTable("{self.config.database}", "{self.config.table}")'
+
+    @property
+    def trade_days_expression(self) -> str:
+        return f'loadTable("{self.config.database}", "{self.config.trade_days_table}")'
+
+    def resolve_trade_date_column(self) -> str:
+        """Resolve the calendar date column from schema, never by an unchecked guess."""
+        if self._trade_date_column is not None:
+            return self._trade_date_column
+        schema = self._schema_frame(
+            self.session.run(f"schema({self.trade_days_expression}).colDefs")
+        )
+        configured = self.config.trade_days_date_column
+        if configured is not None:
+            matches = schema.loc[schema["name"].astype(str) == configured]
+            if matches.empty:
+                raise ValueError(
+                    f"TradeDays date column '{configured}' does not exist; "
+                    f"available columns={schema['name'].astype(str).tolist()}"
+                )
+            type_name = str(matches.iloc[0]["typeString"]).upper().removeprefix("DT_")
+            if type_name != "DATE":
+                raise ValueError(
+                    f"TradeDays column '{configured}' must be DATE, actual={type_name}"
+                )
+            self._trade_date_column = configured
+            return configured
+        date_columns = schema.loc[
+            schema["typeString"].astype(str).str.upper().str.removeprefix("DT_") == "DATE",
+            "name",
+        ].astype(str).tolist()
+        if len(date_columns) != 1:
+            raise ValueError(
+                "TradeDays must have exactly one DATE column when "
+                "trade_days_date_column is omitted; "
+                f"DATE columns={date_columns}, all columns={schema['name'].astype(str).tolist()}"
+            )
+        self._trade_date_column = date_columns[0]
+        print(
+            f"[DDB] TradeDays date column resolved from schema: {self._trade_date_column}",
+            flush=True,
+        )
+        return self._trade_date_column
+
+    def load_trade_dates(
+        self,
+        start_date: str | pd.Timestamp | None = None,
+        end_date: str | pd.Timestamp | None = None,
+    ) -> tuple[pd.Timestamp, ...]:
+        start = pd.Timestamp(start_date or self.config.start_date).normalize()
+        end = pd.Timestamp(end_date or self.config.end_date).normalize()
+        key = (str(start.date()), str(end.date()))
+        cached = self._trade_dates_cache.get(key)
+        if cached is not None:
+            return cached
+        column = self.resolve_trade_date_column()
+        script = (
+            f"select distinct {column} as tradeDate from {self.trade_days_expression} "
+            f"where {column} >= {start:%Y.%m.%d}, {column} <= {end:%Y.%m.%d} "
+            "order by tradeDate"
+        )
+        result = pd.DataFrame(self.session.run(script))
+        if "tradeDate" not in result:
+            raise ValueError("TradeDays query did not return the required tradeDate column")
+        dates = tuple(
+            pd.DatetimeIndex(pd.to_datetime(result["tradeDate"], errors="coerce"))
+            .dropna().normalize().unique().sort_values()
+        )
+        if not dates:
+            raise ValueError(f"TradeDays contains no dates in {start.date()}..{end.date()}")
+        self._trade_dates_cache[key] = dates
+        print(
+            f"[DDB] trade_days_loaded count={len(dates):,} "
+            f"start={dates[0].date()} end={dates[-1].date()}",
+            flush=True,
+        )
+        return dates
 
     def audit(self) -> DolphinDBFieldAudit:
         schema = self.session.run(f"schema({self.table_expression}).colDefs")
@@ -234,6 +339,7 @@ class DolphinDBMinuteLoader:
                 ),
             })
         first = self._collect_requested_range_stats()
+        trade_dates = self.load_trade_dates(self.config.start_date, self.config.end_date)
         audit = DolphinDBFieldAudit(
             database=self.config.database,
             table=self.config.table,
@@ -248,6 +354,9 @@ class DolphinDBMinuteLoader:
             data_sql=self.build_data_sql(
                 pd.Timestamp(self.config.start_date), pd.Timestamp(self.config.end_date)
             ),
+            trade_days_table=self.config.trade_days_table,
+            trade_days_date_column=self.resolve_trade_date_column(),
+            requested_trade_days=len(trade_dates),
         )
         fields_passed = all(
             item["status"] in {"direct", "derived"} for item in required_fields
@@ -328,7 +437,12 @@ class DolphinDBMinuteLoader:
         end_date: str | pd.Timestamp | None = None,
     ):
         """Yield normalized DDB chunks directly from memory without local minute files."""
-        chunks = list(self._date_chunks(start_date, end_date, self.config.chunk_days))
+        trade_dates = self.load_trade_dates(start_date, end_date)
+        days = self.config.chunk_days
+        chunks = [
+            (trade_dates[index], trade_dates[min(index + days - 1, len(trade_dates) - 1)])
+            for index in range(0, len(trade_dates), days)
+        ]
         for chunk_index, (start, end) in enumerate(chunks, start=1):
             raw = self.session.run(self.build_data_sql(start, end))
             frame = normalize_dolphindb_minutes(pd.DataFrame(raw))
@@ -339,6 +453,63 @@ class DolphinDBMinuteLoader:
             )
             if not frame.empty:
                 yield start, end, frame
+
+    def execute_minute_blocks(
+        self,
+        nodes,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+    ) -> dict[str, pd.Series]:
+        """Execute supported minute blocks in DDB and return daily indexed series only."""
+        from src.expression.dolphindb_minute import DolphinDBMinuteCompiler
+
+        compiler = DolphinDBMinuteCompiler(self.table_expression)
+        compiled = compiler.compile(nodes, start, end)
+        frame = pd.DataFrame(self.session.run(compiled.script))
+        if frame.empty:
+            return {key: pd.Series(dtype=float) for key in compiled.aliases}
+        required = {"date", "sym", *compiled.aliases.values()}
+        missing = sorted(required.difference(frame.columns))
+        if missing:
+            raise ValueError(f"DolphinDB pushdown result is missing columns: {missing}")
+        index = pd.MultiIndex.from_arrays(
+            [
+                pd.to_datetime(frame["date"], errors="coerce").dt.normalize(),
+                frame["sym"].astype(str),
+            ],
+            names=["date", "code"],
+        )
+        output: dict[str, pd.Series] = {}
+        for rendered, alias in compiled.aliases.items():
+            values = pd.to_numeric(frame[alias], errors="coerce").replace(
+                [np.inf, -np.inf], np.nan
+            )
+            output[rendered] = pd.Series(values.to_numpy(dtype=float), index=index)
+        return output
+
+    def iter_minute_blocks(
+        self,
+        nodes,
+        start_date: str | pd.Timestamp | None = None,
+        end_date: str | pd.Timestamp | None = None,
+    ):
+        """Push a block batch to DDB one trade-date chunk at a time."""
+        trade_dates = self.load_trade_dates(start_date, end_date)
+        days = self.config.chunk_days
+        chunks = [
+            (trade_dates[index], trade_dates[min(index + days - 1, len(trade_dates) - 1)])
+            for index in range(0, len(trade_dates), days)
+        ]
+        for chunk_index, (start, end) in enumerate(chunks, start=1):
+            values = self.execute_minute_blocks(nodes, start, end)
+            rows = max((len(value) for value in values.values()), default=0)
+            print(
+                f"[DDBPushdown] chunk={chunk_index:03d}/{len(chunks):03d} "
+                f"start={start.date()} end={end.date()} blocks={len(nodes):03d} "
+                f"daily_rows={rows:,}",
+                flush=True,
+            )
+            yield start, end, values
 
     def build_daily_in_memory(
         self,

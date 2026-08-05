@@ -206,89 +206,127 @@ def _group_reduce(values: pd.Series, data: pd.DataFrame, operation: str) -> pd.S
     return result.astype(float)
 
 
-def _trend_stat(values: pd.Series, statistic: str) -> float:
-    clean = values.dropna().to_numpy(dtype=float)
-    if len(clean) < 2:
-        return np.nan
-    x = np.arange(len(clean), dtype=float)
-    x_centered = x - x.mean()
-    y_centered = clean - clean.mean()
-    denominator = float(np.dot(x_centered, x_centered))
-    slope = float(np.dot(x_centered, y_centered) / denominator) if denominator > EPS else np.nan
-    if statistic == "slope":
-        return slope
-    fitted = clean.mean() + slope * x_centered
-    total = float(np.dot(y_centered, y_centered))
-    residual = float(np.square(clean - fitted).sum())
-    return 1.0 - residual / total if total > EPS else np.nan
+def _numpy_group_layout(data: pd.DataFrame) -> tuple[np.ndarray, pd.MultiIndex]:
+    """Return contiguous group boundaries and their (date, code) keys."""
+    dates = pd.to_datetime(data["date"]).to_numpy()
+    codes = data["code"].astype(str).to_numpy()
+    if len(data) == 0:
+        return np.array([0], dtype=np.int64), pd.MultiIndex.from_arrays(
+            [[], []], names=["date", "code"]
+        )
+    changes = np.empty(len(data), dtype=bool)
+    changes[0] = True
+    changes[1:] = (dates[1:] != dates[:-1]) | (codes[1:] != codes[:-1])
+    starts = np.flatnonzero(changes)
+    bounds = np.r_[starts, len(data)].astype(np.int64)
+    keys = pd.MultiIndex.from_arrays(
+        [pd.to_datetime(dates[starts]).normalize(), codes[starts]], names=["date", "code"]
+    )
+    return bounds, keys
+
+
+def _numpy_unary_reduce(values: pd.Series, data: pd.DataFrame, name: str) -> pd.Series:
+    array = pd.to_numeric(values, errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    array = np.where(np.isfinite(array), array, np.nan)
+    bounds, keys = _numpy_group_layout(data)
+    output = np.full(len(keys), np.nan, dtype=np.float64)
+    for group_index, (start, end) in enumerate(zip(bounds[:-1], bounds[1:])):
+        raw = array[start:end]
+        clean = raw[np.isfinite(raw)]
+        n = clean.size
+        if n == 0:
+            continue
+        if name == "r_skew":
+            if n < 3:
+                continue
+            centered = clean - clean.mean()
+            m2 = np.mean(centered * centered)
+            if m2 <= EPS:
+                output[group_index] = 0.0
+            else:
+                g1 = np.mean(centered ** 3) / (m2 ** 1.5)
+                output[group_index] = np.sqrt(n * (n - 1)) / (n - 2) * g1
+        elif name == "r_kurt":
+            if n < 4:
+                continue
+            centered = clean - clean.mean()
+            m2 = np.mean(centered * centered)
+            if m2 <= EPS:
+                output[group_index] = 0.0
+            else:
+                g2 = np.mean(centered ** 4) / (m2 * m2) - 3.0
+                output[group_index] = ((n - 1) / ((n - 2) * (n - 3))) * (
+                    (n + 1) * g2 + 6.0
+                )
+        elif name in {"r_slope", "r_rsquare"}:
+            if n < 2:
+                continue
+            x = np.arange(n, dtype=np.float64)
+            xc = x - x.mean()
+            yc = clean - clean.mean()
+            denominator = float(xc @ xc)
+            slope = float(xc @ yc / denominator) if denominator > EPS else np.nan
+            if name == "r_slope":
+                output[group_index] = slope
+            else:
+                total = float(yc @ yc)
+                residual = float(np.square(clean - (clean.mean() + slope * xc)).sum())
+                output[group_index] = 1.0 - residual / total if total > EPS else np.nan
+        elif name == "r_argmax":
+            valid_positions = np.flatnonzero(np.isfinite(raw))
+            maximum_position = valid_positions[int(np.argmax(raw[valid_positions]))]
+            output[group_index] = maximum_position / max(1, len(raw) - 1)
+        else:
+            raise ValueError(f"Unknown NumPy unary reduction: {name}")
+    return pd.Series(output, index=keys, dtype=float)
+
+
+def _numpy_binary_reduce(
+    left: pd.Series, right: pd.Series, data: pd.DataFrame, name: str
+) -> pd.Series:
+    left_array = pd.to_numeric(left, errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    right_array = pd.to_numeric(right, errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    bounds, keys = _numpy_group_layout(data)
+    output = np.full(len(keys), np.nan, dtype=np.float64)
+    for group_index, (start, end) in enumerate(zip(bounds[:-1], bounds[1:])):
+        x, y = left_array[start:end], right_array[start:end]
+        valid = np.isfinite(x) & np.isfinite(y)
+        x, y = x[valid], y[valid]
+        if name == "r_wmean":
+            denominator = float(y.sum())
+            if abs(denominator) > EPS:
+                output[group_index] = float(np.dot(x, y) / denominator)
+            continue
+        if x.size < 2:
+            continue
+        xc, yc = x - x.mean(), y - y.mean()
+        cross = float(np.dot(xc, yc))
+        if name == "r_cov":
+            output[group_index] = cross / (x.size - 1)
+        elif name == "r_corr":
+            denominator = float(np.sqrt(np.dot(xc, xc) * np.dot(yc, yc)))
+            if denominator > EPS:
+                output[group_index] = cross / denominator
+        else:
+            raise ValueError(f"Unknown NumPy binary reduction: {name}")
+    return pd.Series(output, index=keys, dtype=float)
 
 
 def apply_reduce_unary(name: str, values: pd.Series, data: pd.DataFrame) -> pd.Series:
     simple = {
         "r_mean": "mean", "r_std": "std", "r_sum": "sum", "r_max": "max",
         "r_min": "min", "r_median": "median", "r_first": "first", "r_last": "last",
-        "r_skew": "skew",
     }
     if name in simple:
         return _group_reduce(values, data, simple[name])
-    grouped = values.groupby([data["date"], data["code"]], observed=True, sort=True)
-    if name == "r_kurt":
-        return grouped.apply(lambda value: value.kurt())
-    if name == "r_slope":
-        return grouped.apply(_trend_stat, statistic="slope")
-    if name == "r_rsquare":
-        return grouped.apply(_trend_stat, statistic="rsquare")
-    if name == "r_argmax":
-        def normalized_argmax(group: pd.Series) -> float:
-            clean = group.dropna()
-            if clean.empty:
-                return np.nan
-            positions = np.flatnonzero(group.index.to_numpy() == clean.idxmax())
-            return float(positions[0] / max(1, len(group) - 1)) if len(positions) else np.nan
-        return grouped.apply(normalized_argmax)
+    if name in {"r_skew", "r_kurt", "r_slope", "r_rsquare", "r_argmax"}:
+        return _numpy_unary_reduce(values, data, name)
     raise ValueError(f"Unknown unary reduction operator: {name}")
 
 
 def apply_reduce_binary(
     name: str, left: pd.Series, right: pd.Series, data: pd.DataFrame
 ) -> pd.Series:
-    frame = pd.DataFrame({"date": data["date"], "code": data["code"], "left": left, "right": right})
-    # Selecting value columns explicitly keeps grouping keys out of apply() on pandas >= 2.2.
-    grouped = frame.groupby(["date", "code"], observed=True, sort=True)[["left", "right"]]
-    if name == "r_corr":
-        def safe_correlation(group: pd.DataFrame) -> float:
-            valid = group.replace([np.inf, -np.inf], np.nan).dropna()
-            if len(valid) < 2:
-                return np.nan
-            left_values = valid["left"].to_numpy(dtype=float)
-            right_values = valid["right"].to_numpy(dtype=float)
-            left_centered = left_values - left_values.mean()
-            right_centered = right_values - right_values.mean()
-            denominator = float(np.sqrt(
-                np.dot(left_centered, left_centered)
-                * np.dot(right_centered, right_centered)
-            ))
-            if denominator <= EPS:
-                return np.nan
-            return float(np.dot(left_centered, right_centered) / denominator)
-
-        return grouped.apply(safe_correlation)
-    if name == "r_cov":
-        def safe_covariance(group: pd.DataFrame) -> float:
-            valid = group.replace([np.inf, -np.inf], np.nan).dropna()
-            if len(valid) < 2:
-                return np.nan
-            left_values = valid["left"].to_numpy(dtype=float)
-            right_values = valid["right"].to_numpy(dtype=float)
-            return float(np.dot(
-                left_values - left_values.mean(), right_values - right_values.mean()
-            ) / (len(valid) - 1))
-
-        return grouped.apply(safe_covariance)
-    if name == "r_wmean":
-        def weighted_mean(group: pd.DataFrame) -> float:
-            valid = group.replace([np.inf, -np.inf], np.nan).dropna()
-            denominator = float(valid["right"].sum())
-            return float((valid["left"] * valid["right"]).sum() / denominator) if abs(denominator) > EPS else np.nan
-        return grouped.apply(weighted_mean)
+    if name in {"r_corr", "r_cov", "r_wmean"}:
+        return _numpy_binary_reduce(left, right, data, name)
     raise ValueError(f"Unknown binary reduction operator: {name}")

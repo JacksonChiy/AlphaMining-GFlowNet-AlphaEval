@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from src.expression.minute import MinuteExpression, minute_expression_from_tokens
+from src.expression.dolphindb_minute import DolphinDBMinuteCompiler
 from src.operators.minute import build_minute_features
 from src.data_loader.dolphindb_minute import DolphinDBMinuteLoader
 
@@ -186,20 +187,50 @@ def save_minute_alpha_pool_from_dolphindb_stream(
             block_nodes.setdefault(node.render(), node)
     block_parts: dict[str, list[pd.Series]] = {key: [] for key in block_nodes}
     executor_expression: MinuteExpression = eligible[0]["expression"]
+    nodes = list(block_nodes.values())
+    compiler = DolphinDBMinuteCompiler(loader.table_expression)
+    supported = (
+        [node for node in nodes if compiler.supports(node)]
+        if loader.config.pushdown_enabled else []
+    )
+    fallback = [node for node in nodes if node not in supported]
+    print(
+        f"[MinuteFactorPool] execution_plan pushdown_blocks={len(supported):03d} "
+        f"numpy_fallback_blocks={len(fallback):03d} coarse_screen=false",
+        flush=True,
+    )
+    if supported:
+        try:
+            for _, _, computed in loader.iter_minute_blocks(supported, start_date, end_date):
+                for key, values in computed.items():
+                    block_parts[key].append(values)
+        except Exception as error:
+            if not loader.config.pushdown_fallback:
+                raise
+            print(
+                f"[MinuteFactorPool] pushdown_failed fallback_to_numpy=true "
+                f"error={type(error).__name__}: {error}",
+                flush=True,
+            )
+            for node in supported:
+                block_parts[node.render()].clear()
+            fallback = nodes
     chunks = 0
-    for chunks, (_, _, minute) in enumerate(
-        loader.iter_frames(start_date, end_date), start=1
-    ):
-        computed = executor_expression.execute_blocks(list(block_nodes.values()), minute)
-        for key, values in computed.items():
-            block_parts[key].append(values)
-        print(
-            f"[MinuteFactorPool] ddb_stream_chunk_complete index={chunks:03d} "
-            f"blocks={len(block_nodes):03d} factors={len(eligible):03d}",
-            flush=True,
-        )
-    if chunks == 0:
-        raise ValueError("DolphinDB stream returned no rows for factor pool generation")
+    if fallback:
+        for chunks, (_, _, minute) in enumerate(
+            loader.iter_frames(start_date, end_date), start=1
+        ):
+            computed = executor_expression.execute_blocks(fallback, minute)
+            for key, values in computed.items():
+                block_parts[key].append(values)
+            print(
+                f"[MinuteFactorPool] numpy_stream_chunk_complete index={chunks:03d} "
+                f"blocks={len(fallback):03d} factors={len(eligible):03d}",
+                flush=True,
+            )
+    if any(not parts for parts in block_parts.values()):
+        missing = [key for key, parts in block_parts.items() if not parts]
+        raise ValueError(f"No values were produced for minute blocks: {missing}")
     blocks: dict[str, pd.Series] = {}
     for key, parts in block_parts.items():
         if not parts:

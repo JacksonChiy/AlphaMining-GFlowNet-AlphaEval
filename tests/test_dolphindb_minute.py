@@ -14,6 +14,7 @@ from src.data_loader.dolphindb_minute import (
     normalize_dolphindb_minutes,
 )
 from src.expression.minute import minute_expression_from_tokens
+from src.expression.dolphindb_minute import DolphinDBMinuteCompiler
 from src.gflownet.minute_factor_pool import (
     save_minute_alpha_pool_from_cache,
     save_minute_alpha_pool_from_dolphindb_stream,
@@ -52,6 +53,8 @@ class FakeDolphinDBSession:
     def run(self, script: str):
         self.scripts.append(script)
         if script.startswith("schema("):
+            if '"TradeDays"' in script:
+                return pd.DataFrame({"name": ["tradeDate"], "typeString": ["DATE"]})
             types = {
                 "sym": "SYMBOL", "date": "DATE", "time": "MINUTE",
                 "open": "DOUBLE", "high": "DOUBLE", "low": "DOUBLE",
@@ -59,6 +62,21 @@ class FakeDolphinDBSession:
                 "volume": "LONG", "amount": "DOUBLE", "tradeCount": "INT",
             }
             return pd.DataFrame({"name": list(types), "typeString": list(types.values())})
+        if script.startswith("select distinct") and '"TradeDays"' in script:
+            dates = re.findall(r"tradeDate [<>]= (\d{4}\.\d{2}\.\d{2})", script)
+            assert len(dates) == 2
+            start, end = (pd.Timestamp(value.replace(".", "-")) for value in dates)
+            selected = self.frame.loc[self.frame["date"].between(start, end), "date"]
+            return pd.DataFrame({"tradeDate": sorted(selected.drop_duplicates())})
+        if "ALPHAMINING_MINUTE_PUSHDOWN_V1" in script:
+            dates = re.findall(r"date [<>]= (\d{4}\.\d{2}\.\d{2})", script)
+            assert len(dates) == 2
+            start, end = (pd.Timestamp(value.replace(".", "-")) for value in dates)
+            selected = self.frame[self.frame["date"].between(start, end)]
+            alias = re.search(r"avg\(__ddb_vec_000_0\) as (ddb_[a-f0-9]+)", script)
+            assert alias is not None
+            result = selected.groupby(["date", "sym"], observed=True, sort=True)["close"].mean().reset_index()
+            return result.rename(columns={"close": alias.group(1)})
         if script.startswith("select min(date)"):
             dates = re.findall(r"date [<>]= (\d{4}\.\d{2}\.\d{2})", script)
             assert len(dates) == 2
@@ -192,12 +210,34 @@ def test_streaming_reward_batch_shares_ddb_scan_and_daily_block(tmp_path) -> Non
     first = minute_expression_from_tokens(["r_mean", "close"])
     second = minute_expression_from_tokens(["neg", "r_mean", "close"])
     results = evaluator.evaluate_many([first, second])
-    data_scripts = [script for script in session.scripts if "select sym, date, time" in script]
+    pushdown_scripts = [script for script in session.scripts if "ALPHAMINING_MINUTE_PUSHDOWN_V1" in script]
     assert len(results) == 2
-    assert len(data_scripts) == 2
+    assert len(pushdown_scripts) == 2
     assert evaluator.cache_stats()["entries"] == 1
     evaluator.evaluate_many([first, second])
-    assert len([script for script in session.scripts if "select sym, date, time" in script]) == 2
+    assert len([script for script in session.scripts if "ALPHAMINING_MINUTE_PUSHDOWN_V1" in script]) == 2
+
+
+def test_trade_days_drive_stream_and_skip_non_trading_calendar_dates(tmp_path) -> None:
+    session = FakeDolphinDBSession(_source_minutes())
+    loader = DolphinDBMinuteLoader(_config(tmp_path), session)
+    chunks = list(loader.iter_frames("2024-01-01", "2024-01-07"))
+    assert [(start.date(), end.date()) for start, end, _ in chunks] == [
+        (dt.date(2024, 1, 2), dt.date(2024, 1, 2)),
+        (dt.date(2024, 1, 3), dt.date(2024, 1, 3)),
+    ]
+    assert len([script for script in session.scripts if '"TradeDays"' in script]) == 2
+
+
+def test_ddb_compiler_pushes_supported_blocks_and_marks_complex_fallback() -> None:
+    compiler = DolphinDBMinuteCompiler('loadTable("dfs://minuteBars", "minuteKline")')
+    supported = minute_expression_from_tokens(["r_mean", "m_ma", "W5", "close"]).block_nodes()[0]
+    unsupported = minute_expression_from_tokens(["r_slope", "close"]).block_nodes()[0]
+    compiled = compiler.compile([supported], pd.Timestamp("2024-01-02"), pd.Timestamp("2024-01-02"))
+    assert "mavg(close, 5, 2)" in compiled.script
+    assert "group by date, sym" in compiled.script
+    assert "where date >= 2024.01.02, date <= 2024.01.02" in compiled.script
+    assert compiler.supports(unsupported) is False
 
 
 def test_streaming_factor_pool_writes_daily_csv_without_minute_pickle(tmp_path) -> None:

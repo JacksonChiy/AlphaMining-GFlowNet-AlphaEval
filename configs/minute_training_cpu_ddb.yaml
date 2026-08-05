@@ -16,6 +16,11 @@ dataset:
     keep_alive_seconds: 60
     reconnect_attempts: 3
 
+    # 交易日表与分钟表位于同一个DFS数据库。日期列未配置时，程序只会在Schema中
+    # 恰好存在一个DATE列时自动识别；若有多个DATE列，请显式填写列名。
+    trade_days_table: TradeDays
+    # trade_days_date_column: tradeDate
+
     # 研报式流式计算：不落地原始分钟PKL；按交易日读取、Reduce为日频Block后释放。
     load_mode: stream
     start_date: '2020-01-01'
@@ -27,6 +32,11 @@ dataset:
     chunk_days: 1
     cache_dir: data/minute_ddb_cache
     force_refresh: false
+
+    # 支持的分钟表达式在DDB服务端Reduce为日频后再传输；不支持的复杂趋势算子
+    # 使用NumPy回退。关闭fallback可在任何下推失败时立即停止，便于严格验收。
+    pushdown_enabled: true
+    pushdown_fallback: true
 
     # 当前表没有复权因子。确认OHLC已复权后必须改成true，否则程序会停止。
     prices_are_adjusted: false
@@ -71,6 +81,7 @@ reward:
   block_cache_max_entries: 256
 
 pipeline:
+  # 不进行粗筛；所有候选均进入完整Reward评估。
   pool_size: 50
   pool_attempts: 600
 

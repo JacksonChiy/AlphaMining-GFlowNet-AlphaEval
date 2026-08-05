@@ -21,7 +21,7 @@ from src.expression.minute import (
 from src.gflownet.minute_grammar import MINUTE_ACTION_TOKENS, MinuteGrammarState, MinuteVocabulary
 from src.gflownet.model import GFlowNetPolicy, PolicyConfig
 from src.operators.minute import build_minute_features
-from src.operators.minute import apply_reduce_binary
+from src.operators.minute import apply_reduce_binary, apply_reduce_unary
 
 
 def _minute_prices() -> pd.DataFrame:
@@ -144,3 +144,16 @@ def test_binary_reductions_handle_constant_inputs_without_warnings() -> None:
     assert correlation.isna().all()
     assert np.allclose(covariance, 0.0)
     assert np.allclose(weighted, 1.0)
+
+
+def test_complex_numpy_reductions_match_pandas_group_semantics() -> None:
+    data = _minute_prices()
+    values = data["close"] + np.sin(np.arange(len(data), dtype=float) / 7.0)
+    expected_skew = values.groupby([data["date"], data["code"]], observed=True).skew()
+    expected_kurt = values.groupby([data["date"], data["code"]], observed=True).apply(
+        lambda group: group.kurt()
+    )
+    actual_skew = apply_reduce_unary("r_skew", values, data)
+    actual_kurt = apply_reduce_unary("r_kurt", values, data)
+    assert np.allclose(actual_skew.sort_index(), expected_skew.sort_index(), atol=1e-10)
+    assert np.allclose(actual_kurt.sort_index(), expected_kurt.sort_index(), atol=1e-10)

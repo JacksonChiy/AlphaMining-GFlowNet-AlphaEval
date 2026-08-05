@@ -50,7 +50,15 @@ results/minute_cpu_ddb/field_audit.json
 2. 用户名和密码；
 3. DFS 数据库路径，例如 `dfs://minuteBars`；
 4. 分区表名；
-5. 表中的 OHLC 是否已经完成前复权或后复权。
+5. 同一 DFS 数据库中存在 `TradeDays` 表；
+6. 表中的 OHLC 是否已经完成前复权或后复权。
+
+`TradeDays` 的日期列不会由代码猜测：如果 Schema 中恰好只有一个 `DATE` 列，程序会自动识别；如果存在多个 `DATE` 列，需在配置中明确填写：
+
+```yaml
+trade_days_table: TradeDays
+trade_days_date_column: 实际日期列名
+```
 
 当前字段没有 `adjFactor`。如果 OHLC 是未复权价格，不能直接用于跨日未来收益标签，应先在 DolphinDB 表中完成复权或补充复权因子。
 
@@ -164,9 +172,12 @@ load_mode: stream
 chunk_days: 1
 audit_chunk_days: 120
 daily_aggregate_chunk_days: 120
+trade_days_table: TradeDays
+pushdown_enabled: true
+pushdown_fallback: true
 ```
 
-`chunk_days`控制返回原始分钟行的Reward查询，建议保持1天；另外两个参数只执行聚合统计并返回小结果，可以使用120天以减少远程调用次数。
+`chunk_days`按交易日而不是自然日计数，建议保持1天；程序先查询`TradeDays`，周末和节假日不会再向分钟表发起空查询。另外两个参数只执行聚合统计并返回小结果，可以使用120天以减少远程调用次数。
 
 确认复权并把 `prices_are_adjusted` 改成 `true` 后运行：
 
@@ -175,15 +186,19 @@ python scripts/prepare_ddb_minute.py \
   --config configs/minute_training_cpu_ddb.yaml
 ```
 
-该命令在流模式下只检查字段和日期，不下载分钟文件。训练时每个交易日执行的 SQL 结构为：
+该命令在流模式下只检查字段和日期，不下载分钟文件。训练时优先执行服务端分钟算子和Reduce，SQL结构为：
 
 ```dos
-select sym, date, time, open, high, low, close,
-       volume, amount, tradeCount
-from loadTable("dfs://数据库", "表名")
-where date >= 开始日期, date <= 结束日期
-order by date, sym, time
+source = select ... from loadTable("dfs://数据库", "表名")
+         where date >= 交易日, date <= 交易日
+         order by date, sym, time
+vectors = select ..., mavg(...), rank(...), ...
+          from source context by date, sym csort time
+select avg(...), corr(...), ...
+from vectors group by date, sym
 ```
+
+因此网络传输的是每日每只股票一行的日频Block，而不是约百万行的原始分钟数据。
 
 命令应输出：
 
@@ -224,22 +239,29 @@ DDB schema审计
 → DolphinDB服务端聚合日频行情
 → 构造t+1到t+5标签
 → GFlowNet批量生成表达式
-→ 按交易日流式读取2020–2023分钟数据
-→ 分钟算子 + Mask + Reduce生成日频Block
+→ 从TradeDays读取2020–2023真实交易日
+→ 支持的分钟算子 + Mask + Reduce下推到DDB生成日频Block
+→ 暂不支持下推的复杂算子使用NumPy分组内核回退
 → 复用日频Block缓存并执行日频Tree
 → 计算IC、LongIR、风险和覆盖率Reward
 → CPU GFlowNet训练
 → 生成Alpha Pool
-→ 一次流式扫描计算2020–2026已选因子
+→ 按同一规则计算2020–2026已选因子
 → 保存日频因子CSV.GZ
 ```
 
-同一批表达式共享一次DolphinDB扫描，而不是每个表达式分别扫描。重复日内Block直接从内存缓存命中：
+同一批表达式共享一次DolphinDB分区装载，而不是每个表达式分别扫描。重复日内Block直接从内存缓存命中。日志会明确显示执行计划：
 
 ```text
-[DDBReward] chunk_complete ... new_blocks=... expressions=...
+[DDB] trade_days_loaded count=...
+[DDBReward] execution_plan pushdown_blocks=... numpy_fallback_blocks=... coarse_screen=false
+[DDBPushdown] chunk=... blocks=... daily_rows=...
 [GFlowNet] reward_progress ... cache_hit_rate=...
 ```
+
+当前安全下推范围包括基础/衍生分钟特征、四则运算、分钟收益/排名/ZScore、`m_delay/m_delta/m_ma/m_std`、基于排名或分位数的Mask，以及常用Reduce（均值、标准差、求和、极值、中位数、首尾、相关、协方差、加权均值）。`r_skew/r_kurt/r_slope/r_rsquare/r_argmax`和位置型`m_head/m_tail/m_mid`使用NumPy回退，以保证与本地定义一致。
+
+这里没有粗筛：每个GFlowNet候选表达式都进入完整区间Reward评估。`coarse_screen=false`会写入每批日志。
 
 ## 9. CPU 训练输出
 
@@ -269,12 +291,14 @@ results/minute_cpu_ddb/
 
 ## 11. 内存与速度
 
-DDB Reward和最终因子池执行均按交易日流式查询。内存中只同时存在一个查询分块、日频标签面板和Reduce后的日频Block，不再持有完整训练区间分钟表。
+DDB Reward和最终因子池执行均由`TradeDays`驱动。完全可下推的表达式只在Python中保留日频标签面板和Reduce后的日频Block；包含回退算子的批次才会临时读取一个交易日的原始分钟行，计算完成后立即释放。
 
 研报使用MemMap减少重复读取；DDB版本用两层机制替代：
 
 - 一批轨迹共享一次DDB扫描；
 - `date_scope + block_expr`对应的日频Block在内存LRU中复用。
+- DDB服务端完成分钟算子和日内Reduce，显著减少网络传输；
+- 复杂回退Reduce使用NumPy数组内核，不再使用`DataFrameGroupBy.apply`。
 
 CPU 首次验证建议临时改为：
 
@@ -308,6 +332,14 @@ pipeline:
 ### source starts later / ends earlier
 
 DDB表的实际日期范围不能覆盖配置日期。错误信息会显示`requested_end`和`actual_last_trade_date`；将`dataset.dolphindb.end_date`与`dataset.out_of_sample_end_date`改成实际最后交易日。
+
+### TradeDays date column
+
+如果`TradeDays`没有DATE列或存在多个DATE列，审计会停止并打印全部列名。请查看真实Schema后设置`trade_days_date_column`，不要凭名称猜测。
+
+### pushdown_failed fallback_to_numpy=true
+
+DDB版本或函数语法与当前环境不兼容。默认会自动转为NumPy并保证训练继续，但速度会下降。先把`pushdown_fallback: false`运行一小段日期，可获得原始服务端错误并定位不兼容算子；修正后再恢复完整训练。
 
 ### 内存不足
 
