@@ -49,7 +49,7 @@ class DolphinDBMinuteCompiler:
             output_alias = "ddb_" + hashlib.sha1(rendered.encode("utf-8")).hexdigest()[:16]
             vector_aliases = []
             for child_index, vector in enumerate(vectors):
-                vector_alias = f"__ddb_vec_{index:03d}_{child_index}"
+                vector_alias = f"am_vec_{index:03d}_{child_index}"
                 vector_columns.append(f"{vector} as {vector_alias}")
                 vector_aliases.append(vector_alias)
             reductions.append(f"{reducer(vector_aliases)} as {output_alias}")
@@ -60,13 +60,13 @@ class DolphinDBMinuteCompiler:
         start_literal, end_literal = start.strftime("%Y.%m.%d"), end.strftime("%Y.%m.%d")
         script = (
             "// ALPHAMINING_MINUTE_PUSHDOWN_V1\n"
-            f"__ddb_source = select {columns} from {self.table_expression} "
+            f"am_source = select {columns} from {self.table_expression} "
             f"where date >= {start_literal}, date <= {end_literal} "
             "order by date, sym, time;\n"
-            "__ddb_vectors = select date, sym, time, " + ", ".join(vector_columns) +
-            " from __ddb_source context by date, sym csort time;\n"
+            "am_vectors = select date, sym, time, " + ", ".join(vector_columns) +
+            " from am_source context by date, sym csort time;\n"
             "select " + ", ".join(reductions) +
-            " from __ddb_vectors group by date, sym order by date, sym"
+            " from am_vectors group by date, sym order by date, sym"
         )
         return CompiledMinuteBlocks(script=script, aliases=aliases)
 

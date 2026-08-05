@@ -74,7 +74,7 @@ class FakeDolphinDBSession:
             assert len(dates) == 2
             start, end = (pd.Timestamp(value.replace(".", "-")) for value in dates)
             selected = self.frame[self.frame["date"].between(start, end)]
-            alias = re.search(r"avg\(__ddb_vec_000_0\) as (ddb_[a-f0-9]+)", script)
+            alias = re.search(r"avg\(am_vec_000_0\) as (ddb_[a-f0-9]+)", script)
             assert alias is not None
             result = selected.groupby(["date", "sym"], observed=True, sort=True)["close"].mean().reset_index()
             return result.rename(columns={"close": alias.group(1)})
@@ -246,6 +246,9 @@ def test_ddb_compiler_pushes_supported_blocks_and_marks_complex_fallback() -> No
     unsupported = minute_expression_from_tokens(["r_slope", "close"]).block_nodes()[0]
     compiled = compiler.compile([supported], pd.Timestamp("2024-01-02"), pd.Timestamp("2024-01-02"))
     assert "mavg(close, 5, 2)" in compiled.script
+    assert "am_source = select" in compiled.script
+    assert "am_vectors = select" in compiled.script
+    assert "__ddb" not in compiled.script
     assert "group by date, sym" in compiled.script
     assert "where date >= 2024.01.02, date <= 2024.01.02" in compiled.script
     assert compiler.supports(unsupported) is False
