@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
+from dataclasses import replace
 
 import numpy as np
 import pandas as pd
@@ -227,6 +228,16 @@ def test_trade_days_drive_stream_and_skip_non_trading_calendar_dates(tmp_path) -
         (dt.date(2024, 1, 3), dt.date(2024, 1, 3)),
     ]
     assert len([script for script in session.scripts if '"TradeDays"' in script]) == 2
+
+
+def test_trade_days_can_be_loaded_from_a_separate_database(tmp_path) -> None:
+    session = FakeDolphinDBSession(_source_minutes())
+    config = replace(_config(tmp_path), trade_days_database="dfs://calendar")
+    loader = DolphinDBMinuteLoader(config, session)
+    assert len(loader.load_trade_dates()) == 2
+    calendar_scripts = [script for script in session.scripts if '"TradeDays"' in script]
+    assert calendar_scripts
+    assert all('loadTable("dfs://calendar", "TradeDays")' in script for script in calendar_scripts)
 
 
 def test_ddb_compiler_pushes_supported_blocks_and_marks_complex_fallback() -> None:

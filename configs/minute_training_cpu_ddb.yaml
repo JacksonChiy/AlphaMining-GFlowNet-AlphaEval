@@ -16,9 +16,11 @@ dataset:
     keep_alive_seconds: 60
     reconnect_attempts: 3
 
-    # 交易日表与分钟表位于同一个DFS数据库。日期列未配置时，程序只会在Schema中
-    # 恰好存在一个DATE列时自动识别；若有多个DATE列，请显式填写列名。
+    # TradeDays位于独立DFS数据库，库路径从环境变量读取，不写入仓库。
+    trade_days_database_env: DDB_TRADE_DAYS_DATABASE
     trade_days_table: TradeDays
+    # 日期列未配置时，只在Schema中恰好存在一个DATE列时自动识别；
+    # 若有多个DATE列，请显式填写列名。
     # trade_days_date_column: tradeDate
 
     # 研报式流式计算：不落地原始分钟PKL；按交易日读取、Reduce为日频Block后释放。

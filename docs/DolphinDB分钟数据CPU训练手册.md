@@ -50,10 +50,10 @@ results/minute_cpu_ddb/field_audit.json
 2. 用户名和密码；
 3. DFS 数据库路径，例如 `dfs://minuteBars`；
 4. 分区表名；
-5. 同一 DFS 数据库中存在 `TradeDays` 表；
+5. `TradeDays` 所在的独立 DFS 数据库路径；
 6. 表中的 OHLC 是否已经完成前复权或后复权。
 
-`TradeDays` 的日期列不会由代码猜测：如果 Schema 中恰好只有一个 `DATE` 列，程序会自动识别；如果存在多个 `DATE` 列，需在配置中明确填写：
+分钟表和交易日表可以位于两个不同的DFS数据库。`TradeDays`的日期列不会由代码猜测：如果Schema中恰好只有一个`DATE`列，程序会自动识别；如果存在多个`DATE`列，需在配置中明确填写：
 
 ```yaml
 trade_days_table: TradeDays
@@ -91,6 +91,7 @@ export DDB_PASSWORD
 
 export DDB_DATABASE='dfs://实际数据库路径'
 export DDB_TABLE='实际分区表名'
+export DDB_TRADE_DAYS_DATABASE='dfs://交易日数据库路径'
 ```
 
 `read -s` 输入密码时终端不会显示字符，也不会把密码写入 shell 命令历史。
@@ -100,6 +101,7 @@ export DDB_TABLE='实际分区表名'
 ```bash
 echo "$DDB_HOST:$DDB_PORT"
 echo "$DDB_DATABASE/$DDB_TABLE"
+echo "$DDB_TRADE_DAYS_DATABASE/TradeDays"
 ```
 
 不要运行 `echo "$DDB_PASSWORD"`。
@@ -113,6 +115,7 @@ Windows PowerShell 永久保存到当前用户时使用：
 [Environment]::SetEnvironmentVariable("DDB_PASSWORD", "密码", "User")
 [Environment]::SetEnvironmentVariable("DDB_DATABASE", "dfs://CYC", "User")
 [Environment]::SetEnvironmentVariable("DDB_TABLE", "minute_bar", "User")
+[Environment]::SetEnvironmentVariable("DDB_TRADE_DAYS_DATABASE", "dfs://实际交易日库", "User")
 ```
 
 保存后关闭并重新打开 PowerShell。
@@ -173,6 +176,7 @@ chunk_days: 1
 audit_chunk_days: 120
 daily_aggregate_chunk_days: 120
 trade_days_table: TradeDays
+trade_days_database_env: DDB_TRADE_DAYS_DATABASE
 pushdown_enabled: true
 pushdown_fallback: true
 ```
@@ -336,6 +340,10 @@ DDB表的实际日期范围不能覆盖配置日期。错误信息会显示`requ
 ### TradeDays date column
 
 如果`TradeDays`没有DATE列或存在多个DATE列，审计会停止并打印全部列名。请查看真实Schema后设置`trade_days_date_column`，不要凭名称猜测。
+
+### Missing DolphinDB TradeDays database environment variable
+
+当前Shell没有设置`DDB_TRADE_DAYS_DATABASE`。该变量应填写`TradeDays`所在的完整`dfs://`库路径，它与分钟表使用的`DDB_DATABASE`相互独立。
 
 ### pushdown_failed fallback_to_numpy=true
 

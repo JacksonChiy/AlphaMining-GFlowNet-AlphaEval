@@ -73,6 +73,7 @@ class MinuteDolphinDBConfig:
     load_mode: str = "cache"
     audit_chunk_days: int = 120
     daily_aggregate_chunk_days: int = 120
+    trade_days_database: str | None = None
     trade_days_table: str = "TradeDays"
     trade_days_date_column: str | None = None
     pushdown_enabled: bool = True
@@ -83,6 +84,10 @@ class MinuteDolphinDBConfig:
             raise ValueError("DolphinDB database must be an explicit dfs:// path")
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", self.table):
             raise ValueError("DolphinDB table contains unsupported characters")
+        if self.trade_days_database is not None and not re.fullmatch(
+            r"dfs://[A-Za-z0-9_./-]+", self.trade_days_database
+        ):
+            raise ValueError("DolphinDB TradeDays database must be an explicit dfs:// path")
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", self.trade_days_table):
             raise ValueError("DolphinDB TradeDays table contains unsupported characters")
         if self.trade_days_date_column is not None and not re.fullmatch(
@@ -109,6 +114,17 @@ class MinuteDolphinDBConfig:
         table = values.get("table") or os.environ.get(
             str(values.get("table_env", "DDB_TABLE")), ""
         )
+        trade_days_database_env = str(
+            values.get("trade_days_database_env", "DDB_TRADE_DAYS_DATABASE")
+        )
+        trade_days_database = values.get("trade_days_database") or os.environ.get(
+            trade_days_database_env, ""
+        )
+        if "trade_days_database_env" in values and not trade_days_database:
+            raise ValueError(
+                "Missing DolphinDB TradeDays database environment variable: "
+                f"{trade_days_database_env}"
+            )
         return cls(
             database=str(database),
             table=str(table),
@@ -122,6 +138,9 @@ class MinuteDolphinDBConfig:
             load_mode=str(values.get("load_mode", "cache")).lower(),
             audit_chunk_days=int(values.get("audit_chunk_days", 120)),
             daily_aggregate_chunk_days=int(values.get("daily_aggregate_chunk_days", 120)),
+            trade_days_database=(
+                str(trade_days_database) if trade_days_database else str(database)
+            ),
             trade_days_table=str(values.get("trade_days_table", "TradeDays")),
             trade_days_date_column=(
                 str(values["trade_days_date_column"])
@@ -147,6 +166,7 @@ class DolphinDBFieldAudit:
     prices_are_adjusted: bool
     data_sql: str
     trade_days_table: str
+    trade_days_database: str
     trade_days_date_column: str
     requested_trade_days: int
 
@@ -175,6 +195,7 @@ class DolphinDBFieldAudit:
             },
             "joinPlan": {"steps": []},
             "tradeCalendar": {
+                "database": self.trade_days_database,
                 "table": self.trade_days_table,
                 "dateColumn": self.trade_days_date_column,
                 "requestedTradeDays": self.requested_trade_days,
@@ -203,7 +224,8 @@ class DolphinDBMinuteLoader:
 
     @property
     def trade_days_expression(self) -> str:
-        return f'loadTable("{self.config.database}", "{self.config.trade_days_table}")'
+        database = self.config.trade_days_database or self.config.database
+        return f'loadTable("{database}", "{self.config.trade_days_table}")'
 
     def resolve_trade_date_column(self) -> str:
         """Resolve the calendar date column from schema, never by an unchecked guess."""
@@ -355,6 +377,7 @@ class DolphinDBMinuteLoader:
                 pd.Timestamp(self.config.start_date), pd.Timestamp(self.config.end_date)
             ),
             trade_days_table=self.config.trade_days_table,
+            trade_days_database=self.config.trade_days_database or self.config.database,
             trade_days_date_column=self.resolve_trade_date_column(),
             requested_trade_days=len(trade_dates),
         )
@@ -648,6 +671,8 @@ class DolphinDBMinuteLoader:
             "end_date": self.config.end_date,
             "columns": SOURCE_COLUMNS,
             "prices_are_adjusted": self.config.prices_are_adjusted,
+            "trade_days_database": self.config.trade_days_database or self.config.database,
+            "trade_days_table": self.config.trade_days_table,
         }
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
