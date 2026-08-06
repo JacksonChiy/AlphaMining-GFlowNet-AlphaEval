@@ -13,16 +13,19 @@ from src.data_loader.dolphindb_minute import (
     load_minute_cache,
     prepare_dolphindb_minute_data,
 )
+from src.data_loader.minute_memmap import MinuteMemMapConfig, MinuteMemMapStore
 from src.gflownet.minute_factor_pool import (
     save_minute_alpha_pool,
     save_minute_alpha_pool_from_cache,
     save_minute_alpha_pool_from_dolphindb_stream,
+    save_minute_alpha_pool_from_memmap,
 )
 from src.gflownet.minute_grammar import MinuteVocabulary
 from src.gflownet.minute_reward import (
     DolphinDBStreamingMinuteRewardEvaluator,
     MinuteRewardEvaluator,
 )
+from src.gflownet.memmap_reward import MemMapMinuteRewardEvaluator
 from src.gflownet.minute_trainer import MinuteGFlowNetTrainer
 from src.gflownet.model import GFlowNetPolicy, PolicyConfig
 from src.gflownet.run_training import gpu_report
@@ -70,13 +73,29 @@ def run(
 
     ddb_cache: Path | None = None
     ddb_loader: DolphinDBMinuteLoader | None = None
+    memmap_store: MinuteMemMapStore | None = None
     ddb_session = None
     minute_data: pd.DataFrame | None
     try:
         if str(dataset.get("source", "local")).lower() == "dolphindb":
             values = dataset.get("dolphindb", {})
-            ddb_config = MinuteDolphinDBConfig.from_mapping(dataset, values)
-            if ddb_config.load_mode == "stream":
+            load_mode = str(values.get("load_mode", "cache")).lower()
+            if load_mode == "memmap":
+                memmap_config = MinuteMemMapConfig.from_mapping(
+                    dataset.get("memmap", {})
+                )
+                memmap_store = MinuteMemMapStore(memmap_config)
+                daily_data = pd.read_csv(memmap_store.daily_file)
+                minute_data = None
+                print(
+                    f"[MinuteGFlowNet] memmap_enabled remote_ddb_queries_during_training=0 "
+                    f"root={memmap_config.root} dates={len(memmap_store.dates):,} "
+                    f"stocks={len(memmap_store.stocks):,}",
+                    flush=True,
+                )
+            else:
+                ddb_config = MinuteDolphinDBConfig.from_mapping(dataset, values)
+            if load_mode == "stream":
                 ddb_session = create_dolphindb_session(values)
                 ddb_loader = DolphinDBMinuteLoader(ddb_config, ddb_session)
                 audit = ddb_loader.audit()
@@ -95,7 +114,7 @@ def run(
                     ddb_config.start_date, ddb_config.end_date
                 )
                 minute_data = None
-            else:
+            elif load_mode == "cache":
                 ddb_cache, daily_path = prepare_dolphindb_minute_data(dataset)
                 minute_data = load_minute_cache(
                     ddb_cache,
@@ -116,6 +135,7 @@ def run(
             daily_data=daily_data,
             ddb_cache=ddb_cache,
             ddb_loader=ddb_loader,
+            memmap_store=memmap_store,
         )
     finally:
         if ddb_session is not None:
@@ -132,6 +152,7 @@ def _run_loaded_pipeline(
     daily_data: pd.DataFrame,
     ddb_cache: Path | None,
     ddb_loader: DolphinDBMinuteLoader | None,
+    memmap_store: MinuteMemMapStore | None,
 ) -> Path:
     frames = [(daily_data, "daily")]
     if minute_data is not None:
@@ -164,7 +185,16 @@ def _run_loaded_pipeline(
     )
     reward_options = dict(config["reward"])
     block_cache_max_entries = int(reward_options.pop("block_cache_max_entries", 256))
-    if ddb_loader is not None:
+    if memmap_store is not None:
+        evaluator = MemMapMinuteRewardEvaluator(
+            memmap_store,
+            daily_mining,
+            start_date=str(mining_start),
+            end_date=str(mining_end),
+            block_cache_max_entries=block_cache_max_entries,
+            **reward_options,
+        )
+    elif ddb_loader is not None:
         evaluator = DolphinDBStreamingMinuteRewardEvaluator(
             ddb_loader,
             daily_mining,
@@ -215,7 +245,17 @@ def _run_loaded_pipeline(
         "matrix_path": outputs.get("factor_matrix", "results/minute_alpha_factor_matrix.pkl"),
         "min_coverage": evaluator.min_coverage,
     }
-    if ddb_loader is not None:
+    if memmap_store is not None:
+        ddb_values = dataset["dolphindb"]
+        metadata, matrix = save_minute_alpha_pool_from_memmap(
+            pool,
+            memmap_store,
+            daily_data,
+            start_date=str(ddb_values.get("start_date", dataset.get("mining_start_date"))),
+            end_date=str(ddb_values.get("end_date", dataset.get("out_of_sample_end_date"))),
+            **save_arguments,
+        )
+    elif ddb_loader is not None:
         ddb_values = dataset["dolphindb"]
         metadata, matrix = save_minute_alpha_pool_from_dolphindb_stream(
             pool,

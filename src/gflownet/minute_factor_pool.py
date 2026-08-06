@@ -11,6 +11,11 @@ from src.expression.minute import MinuteExpression, minute_expression_from_token
 from src.expression.dolphindb_minute import DolphinDBMinuteCompiler
 from src.operators.minute import build_minute_features
 from src.data_loader.dolphindb_minute import DolphinDBMinuteLoader
+from src.data_loader.minute_memmap import MinuteMemMapStore
+from src.gflownet.memmap_reward import (
+    PersistentMinuteBlockCache,
+    execute_memmap_blocks,
+)
 
 
 def _daily_keys(daily_data: pd.DataFrame) -> pd.MultiIndex:
@@ -277,4 +282,74 @@ def save_minute_alpha_pool_from_dolphindb_stream(
         matrix.to_pickle(matrix_path)
     else:
         raise ValueError("factor matrix must use .csv, .csv.gz, .parquet or .pkl")
+    return metadata, matrix
+
+
+def save_minute_alpha_pool_from_memmap(
+    pool: list[dict[str, Any]],
+    store: MinuteMemMapStore,
+    daily_data: pd.DataFrame,
+    start_date: str,
+    end_date: str,
+    metadata_path: str | Path = "results/minute_cpu_ddb/alpha_pool.csv",
+    matrix_path: str | Path = "results/minute_cpu_ddb/alpha_factor_matrix.csv.gz",
+    min_coverage: float = 0.80,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    eligible = [
+        item for item in pool
+        if float(item.get("coverage", 0.0)) >= min_coverage
+        and float(item.get("valid_date_coverage", 0.0)) >= min_coverage
+    ]
+    if not eligible:
+        raise ValueError(f"No minute expression meets minimum coverage {min_coverage:.2%}")
+    block_nodes: dict[str, Any] = {}
+    for item in eligible:
+        for node in item["expression"].block_nodes():
+            block_nodes.setdefault(node.render(), node)
+    persistent_cache = PersistentMinuteBlockCache(store, store.config.block_cache_dir)
+    blocks = execute_memmap_blocks(
+        store, list(block_nodes.values()), start_date, end_date, persistent_cache
+    )
+    matrix = daily_data[["date", "code"]].copy()
+    dates = pd.to_datetime(matrix["date"]).dt.normalize()
+    matrix = matrix.loc[
+        dates.between(pd.Timestamp(start_date), pd.Timestamp(end_date))
+    ].copy()
+    keys = _daily_keys(matrix)
+    metadata_rows: list[dict[str, Any]] = []
+    for index, item in enumerate(eligible, start=1):
+        factor_name = f"minute_factor_{index:03d}"
+        expression: MinuteExpression = item["expression"]
+        required = {
+            node.render(): blocks[node.render()] for node in expression.block_nodes()
+        }
+        values = expression.execute_from_blocks(required).reindex(keys)
+        matrix[factor_name] = pd.to_numeric(values, errors="coerce").replace(
+            [np.inf, -np.inf], np.nan
+        ).to_numpy()
+        metadata_rows.append({
+            "factor": factor_name,
+            "expression": str(expression),
+            **{key: value for key, value in item.items() if key not in {"expression", "tokens"}},
+            "tokens": json.dumps(item["tokens"], ensure_ascii=False),
+        })
+        print(
+            f"[MinuteFactorPool] memmap_factor_complete "
+            f"index={index:03d}/{len(eligible):03d} factor={factor_name} "
+            f"coverage={matrix[factor_name].notna().mean():.2%}",
+            flush=True,
+        )
+    metadata = pd.DataFrame(metadata_rows)
+    metadata_path, matrix_path = Path(metadata_path), Path(matrix_path)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    matrix_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata.to_csv(metadata_path, index=False)
+    if matrix_path.name.endswith(".csv.gz"):
+        matrix.to_csv(matrix_path, index=False, compression="gzip")
+    elif matrix_path.suffix.lower() == ".csv":
+        matrix.to_csv(matrix_path, index=False)
+    elif matrix_path.suffix.lower() in {".pkl", ".pickle"}:
+        matrix.to_pickle(matrix_path)
+    else:
+        raise ValueError("MemMap factor matrix must use .csv, .csv.gz or .pkl")
     return metadata, matrix

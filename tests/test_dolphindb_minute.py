@@ -16,6 +16,13 @@ from src.data_loader.dolphindb_minute import (
 )
 from src.expression.minute import minute_expression_from_tokens
 from src.expression.dolphindb_minute import DolphinDBMinuteCompiler
+from src.data_loader.minute_memmap import (
+    DolphinDBMinuteMemMapBuilder,
+    MEMMAP_CHANNELS,
+    MinuteMemMapConfig,
+    MinuteMemMapStore,
+)
+from src.gflownet.memmap_reward import PersistentMinuteBlockCache, execute_memmap_blocks
 from src.gflownet.minute_factor_pool import (
     save_minute_alpha_pool_from_cache,
     save_minute_alpha_pool_from_dolphindb_stream,
@@ -69,6 +76,12 @@ class FakeDolphinDBSession:
             start, end = (pd.Timestamp(value.replace(".", "-")) for value in dates)
             selected = self.frame.loc[self.frame["date"].between(start, end), "date"]
             return pd.DataFrame({"tradeDate": sorted(selected.drop_duplicates())})
+        if script.startswith("select distinct time as minuteTime"):
+            dates = re.findall(r"date = (\d{4}\.\d{2}\.\d{2})", script)
+            assert len(dates) == 1
+            date = pd.Timestamp(dates[0].replace(".", "-"))
+            values = self.frame.loc[self.frame["date"] == date, "time"]
+            return pd.DataFrame({"minuteTime": sorted(values.drop_duplicates())})
         if "ALPHAMINING_MINUTE_PUSHDOWN_V1" in script:
             dates = re.findall(r"date [<>]= (\d{4}\.\d{2}\.\d{2})", script)
             assert len(dates) == 2
@@ -316,3 +329,67 @@ def test_chunked_extract_daily_aggregation_and_partitioned_factor_pool(tmp_path)
     )
     assert metadata["factor"].tolist() == ["minute_factor_001"]
     assert matrix["minute_factor_001"].notna().all()
+
+
+def test_ddb_to_local_memmap_build_read_and_persistent_block_cache(tmp_path) -> None:
+    session = FakeDolphinDBSession(_source_minutes())
+    loader = DolphinDBMinuteLoader(_config(tmp_path), session)
+    memmap_config = MinuteMemMapConfig(
+        root=tmp_path / "minute_memmap",
+        block_cache_dir=tmp_path / "block_cache",
+        expected_minutes=3,
+        stock_tile_size=1,
+    )
+    manifest_path = DolphinDBMinuteMemMapBuilder(loader, memmap_config).build()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["complete"] is True
+    assert (memmap_config.root / "field_audit.json").exists()
+    assert manifest["n_minutes"] == 3
+    assert manifest["n_stocks"] == 2
+    assert set(manifest["channels"]) == set(MEMMAP_CHANNELS)
+    assert not list((tmp_path / "minute_memmap").rglob("minute_*.pkl"))
+
+    manifest["complete"] = False
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    session.scripts.clear()
+    DolphinDBMinuteMemMapBuilder(loader, memmap_config).build()
+    assert not [script for script in session.scripts if "select first(open)" in script]
+
+    store = MinuteMemMapStore(memmap_config)
+    frames = [frame for _, _, frame in store.iter_frames("2024-01-02", "2024-01-03")]
+    assert len(frames) == 4
+    assert all(frame.attrs.get("minute_features_ready") for frame in frames)
+    expression = minute_expression_from_tokens(["r_mean", "close"])
+    cache = PersistentMinuteBlockCache(store, memmap_config.block_cache_dir)
+    blocks = execute_memmap_blocks(
+        store, list(expression.block_nodes()), "2024-01-02", "2024-01-03", cache
+    )
+    actual = expression.execute_from_blocks(blocks).sort_index()
+    expected = expression.execute(normalize_dolphindb_minutes(_source_minutes())).sort_index()
+    assert np.allclose(actual, expected)
+    assert cache.writes == 1
+
+    second_cache = PersistentMinuteBlockCache(store, memmap_config.block_cache_dir)
+    cached_blocks = execute_memmap_blocks(
+        store, list(expression.block_nodes()), "2024-01-02", "2024-01-03", second_cache
+    )
+    assert np.allclose(cached_blocks["r_mean(close)"].sort_index(), expected)
+    assert second_cache.disk_hits == 1
+
+    parallel_config = replace(
+        memmap_config,
+        workers=2,
+        block_cache_dir=tmp_path / "parallel_block_cache",
+    )
+    parallel_store = MinuteMemMapStore(parallel_config)
+    parallel_cache = PersistentMinuteBlockCache(
+        parallel_store, parallel_config.block_cache_dir
+    )
+    parallel_blocks = execute_memmap_blocks(
+        parallel_store,
+        list(expression.block_nodes()),
+        "2024-01-02",
+        "2024-01-03",
+        parallel_cache,
+    )
+    assert np.allclose(parallel_blocks["r_mean(close)"].sort_index(), expected)

@@ -74,21 +74,24 @@ RQAlphaPlus 是授权软件，需要通过米筐授权渠道独立安装，详�
 
 ## 训练与完整流水线
 
-### DolphinDB分钟数据流式CPU训练
+### DolphinDB分钟数据MemMap CPU训练
 
-`cpu-training`分支支持研报定义的分钟信息因子：分钟特征先经过分钟算子与日内Mask，随后由`r_*`聚合为日频Block，再接`ts_*`、截面和日频组合算子形成最终日频因子。DolphinDB模式不会落地原始分钟PKL：标签行情在数据库端按日聚合；Reward按完整交易日流式读取分钟数据；同批表达式共享数据库扫描；重复日内Block使用有界LRU缓存。
+`cpu-training`分支支持DDB与训练分离部署。远程DolphinDB只在首次构建时按交易日传输数据，训练服务器将19个分钟通道保存为按年组织的`float32 (n_days, 241, n_stocks)`本地MemMap；GFlowNet训练阶段不再连接DDB。日内Block按`source_fingerprint + date_scope + block_expr`持久化，内存中使用有界LRU，重复实验可直接复用磁盘Block缓存。不会创建原始分钟PKL。
 
 ```bash
 python scripts/prepare_ddb_minute.py \
   --config configs/minute_training_cpu_ddb.yaml \
   --audit-only
 
+python scripts/build_ddb_memmap.py \
+  --config configs/minute_training_cpu_ddb.yaml
+
 python scripts/train_cpu.py \
   --mode minute \
   --config configs/minute_training_cpu_ddb.yaml
 ```
 
-正式运行前必须把配置中的结束日期改为数据库实际最后交易日，并确认OHLC已经复权后设置`prices_are_adjusted: true`。最终保存Checkpoint、Alpha Pool和日频因子矩阵`results/minute_cpu_ddb/alpha_factor_matrix.csv.gz`；不会创建`minute_*.pkl`。完整说明见[DolphinDB分钟数据CPU训练手册](docs/DolphinDB分钟数据CPU训练手册.md)。
+先运行`python scripts/build_ddb_memmap.py --config configs/minute_training_cpu_ddb.yaml`完成可断点续传构建，再运行CPU训练入口。正式运行前必须把结束日期改为数据库实际最后交易日，并确认OHLC已经复权后设置`prices_are_adjusted: true`。完整两机部署步骤见[DDB与训练分离的MemMap运行手册](docs/DDB与训练分离的MemMap运行手册.md)。
 
 ### 推荐：单个 Colab Notebook
 

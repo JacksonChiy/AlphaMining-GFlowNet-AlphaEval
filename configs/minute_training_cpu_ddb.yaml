@@ -23,8 +23,8 @@ dataset:
     # 若有多个DATE列，请显式填写列名。
     # trade_days_date_column: tradeDate
 
-    # 研报式流式计算：不落地原始分钟PKL；按交易日读取、Reduce为日频Block后释放。
-    load_mode: stream
+    # 两机部署：DDB只用于一次性构建；训练从训练服务器本地MemMap读取。
+    load_mode: memmap
     start_date: '2020-01-01'
     end_date: '2026-12-31'
     # 审计和日频标签聚合只返回小结果，可用大日期块减少远程往返。
@@ -42,6 +42,16 @@ dataset:
 
     # 当前表没有复权因子。确认OHLC已复权后必须改成true，否则程序会停止。
     prices_are_adjusted: false
+
+  memmap:
+    # MemMap必须位于训练服务器本地SSD/NVMe，不要放DDB服务器或网络共享盘。
+    root_env: ALPHAMINING_MEMMAP_DIR
+    block_cache_env: ALPHAMINING_BLOCK_CACHE_DIR
+    expected_minutes: 241
+    stock_tile_size: 256
+    workers: 4
+    flush_every_days: 1
+    force_rebuild: false
 
 cpu_runtime:
   torch_threads: 8
@@ -80,7 +90,8 @@ reward:
   reward_floor: 1.0e-8
   subexpression_cache_enabled: false
   # Reduce后的日频Block很小，可在表达式之间复用，对应研报block cache。
-  block_cache_max_entries: 256
+  # 内存LRU只保留少量日频Block；所有Block同时持久化到本地磁盘。
+  block_cache_max_entries: 16
 
 pipeline:
   # 不进行粗筛；所有候选均进入完整Reward评估。
