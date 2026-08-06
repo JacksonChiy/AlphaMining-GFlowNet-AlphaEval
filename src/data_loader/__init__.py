@@ -14,6 +14,11 @@ from .minute_memmap import (
     MinuteMemMapConfig,
     MinuteMemMapStore,
 )
+from .minute_quality_audit import (
+    DolphinDBMinuteQualityAuditor,
+    MinuteQualityAuditConfig,
+    build_expected_minute_grid,
+)
 
 __all__ = [
     "DataQualityReport", "PriceDataPreprocessor", "prepare_price_csv",
@@ -22,4 +27,6 @@ __all__ = [
     "normalize_dolphindb_minutes", "prepare_dolphindb_minute_data",
     "DolphinDBMinuteMemMapBuilder", "MEMMAP_CHANNELS",
     "MinuteMemMapConfig", "MinuteMemMapStore",
+    "DolphinDBMinuteQualityAuditor", "MinuteQualityAuditConfig",
+    "build_expected_minute_grid",
 ]

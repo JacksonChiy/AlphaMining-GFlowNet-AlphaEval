@@ -22,6 +22,10 @@ from src.data_loader.minute_memmap import (
     MinuteMemMapConfig,
     MinuteMemMapStore,
 )
+from src.data_loader.minute_quality_audit import (
+    DolphinDBMinuteQualityAuditor,
+    MinuteQualityAuditConfig,
+)
 from src.gflownet.memmap_reward import PersistentMinuteBlockCache, execute_memmap_blocks
 from src.gflownet.minute_factor_pool import (
     save_minute_alpha_pool_from_cache,
@@ -60,6 +64,36 @@ class FakeDolphinDBSession:
 
     def run(self, script: str):
         self.scripts.append(script)
+        if "ALPHAMINING_QUALITY_" in script:
+            dates = re.findall(r"date [<>]= (\d{4}\.\d{2}\.\d{2})", script)
+            assert len(dates) == 2
+            start, end = (pd.Timestamp(value.replace(".", "-")) for value in dates)
+            selected = self.frame[self.frame["date"].between(start, end)].copy()
+            if "ALPHAMINING_QUALITY_TIME_V1" in script:
+                return selected.groupby(["date", "time"], observed=True).size().rename(
+                    "rowCount"
+                ).reset_index()
+            if "ALPHAMINING_QUALITY_VALUES_V1" in script:
+                return pd.DataFrame({
+                    "date": sorted(selected["date"].drop_duplicates()),
+                    "invalidKeyRows": 0,
+                    "nullValueRows": 0,
+                    "nonPositivePriceRows": 0,
+                    "invalidOhlcRows": 0,
+                    "negativeActivityRows": 0,
+                })
+            if "ALPHAMINING_QUALITY_DUPLICATES_V1" in script:
+                counts = selected.groupby(
+                    ["date", "sym", "time"], observed=True
+                ).size().rename("duplicateCount").reset_index()
+                return counts.loc[counts["duplicateCount"] > 1]
+            if "ALPHAMINING_QUALITY_SYMBOL_V1" in script:
+                return selected.groupby(["date", "sym"], observed=True).agg(
+                    rowCount=("time", "size"),
+                    firstTime=("time", "min"),
+                    lastTime=("time", "max"),
+                ).reset_index()
+            raise AssertionError(f"Unknown quality audit query: {script}")
         if script.startswith("schema("):
             if '"TradeDays"' in script:
                 return pd.DataFrame({"name": ["tradeDate"], "typeString": ["DATE"]})
@@ -393,3 +427,32 @@ def test_ddb_to_local_memmap_build_read_and_persistent_block_cache(tmp_path) -> 
         parallel_cache,
     )
     assert np.allclose(parallel_blocks["r_mean(close)"].sort_index(), expected)
+
+
+def test_minute_quality_audit_reports_extra_time_and_duplicate_key(tmp_path) -> None:
+    source = _source_minutes()
+    extra = source.iloc[[0]].copy()
+    extra["time"] = dt.time(9, 29)
+    duplicate = source.iloc[[1]].copy()
+    source = pd.concat([source, extra, duplicate], ignore_index=True)
+    session = FakeDolphinDBSession(source)
+    loader = DolphinDBMinuteLoader(_config(tmp_path), session)
+    audit_config = MinuteQualityAuditConfig(
+        output_dir=tmp_path / "quality",
+        expected_minutes=3,
+        sessions=(("09:30:00", "09:32:00"),),
+        chunk_days=1,
+        scope="full",
+    )
+    summary_path = DolphinDBMinuteQualityAuditor(loader, audit_config).run()
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    dates = pd.read_csv(tmp_path / "quality" / "date_quality.csv")
+    presence = pd.read_csv(tmp_path / "quality" / "time_presence.csv")
+    duplicates = pd.read_csv(tmp_path / "quality" / "duplicate_keys.csv")
+    assert summary["status"] == "failed"
+    assert summary["counts"]["problem_dates"] == 1
+    assert dates.loc[0, "extra_times"] == "09:29:00"
+    assert dates.loc[0, "duplicate_extra_rows"] == 1
+    assert presence.loc[presence["time"] == "09:29:00", "in_expected_session"].eq(False).all()
+    assert len(duplicates) == 1
+    assert (tmp_path / "quality" / "problem_symbols.csv").exists()

@@ -83,6 +83,10 @@ python scripts/prepare_ddb_minute.py \
   --config configs/minute_training_cpu_ddb.yaml \
   --audit-only
 
+python scripts/audit_ddb_minute_quality.py \
+  --config configs/minute_training_cpu_ddb.yaml \
+  --scope grid
+
 python scripts/build_ddb_memmap.py \
   --config configs/minute_training_cpu_ddb.yaml
 

@@ -118,6 +118,32 @@ pip install -r requirements-ddb.txt
 
 ## 7. 先构建短区间MemMap
 
+在构建前，先运行只读质量审计：
+
+```powershell
+python scripts/audit_ddb_minute_quality.py `
+  --config configs/minute_training_cpu_ddb.yaml `
+  --scope grid
+```
+
+结果保存在`results/minute_cpu_ddb/data_quality/`：
+
+- `summary.json`：总体通过/失败状态和问题日期数；
+- `date_quality.csv`：每个交易日的实际分钟数、多出/缺失时间、重复行和值异常；
+- `time_presence.csv`：每个时间点出现在多少个交易日，以及是否属于预期连续竞价时段；
+- `duplicate_keys.csv`：重复的`date + sym + time`键；
+- `value_issues.csv`：空值、非正价格、OHLC关系错误、负成交量/成交额。
+
+当需要继续定位到具体股票时，运行：
+
+```powershell
+python scripts/audit_ddb_minute_quality.py `
+  --config configs/minute_training_cpu_ddb.yaml `
+  --scope full
+```
+
+`full`会额外生成`problem_symbols.csv`，数据库计算量和本地传输量都大于`grid`，建议先跑`grid`。默认的241分钟口径是`09:30-11:29` + `13:00-15:00`；如果数据使用另一种分钟标签口径，请修改配置中的`minute_sessions`，不要直接把`expected_minutes`改成264。
+
 首次验证建议复制配置：
 
 ```powershell
