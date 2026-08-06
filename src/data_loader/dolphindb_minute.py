@@ -538,6 +538,7 @@ class DolphinDBMinuteLoader:
         self,
         start_date: str | pd.Timestamp | None = None,
         end_date: str | pd.Timestamp | None = None,
+        time_filter_sql: str | None = None,
     ) -> pd.DataFrame:
         """Let DolphinDB aggregate daily OHLCV so raw minutes never cross the network here."""
         daily_parts: list[pd.DataFrame] = []
@@ -545,7 +546,9 @@ class DolphinDBMinuteLoader:
             start_date, end_date, self.config.daily_aggregate_chunk_days
         ))
         for chunk_index, (start, end) in enumerate(chunks, start=1):
-            raw = pd.DataFrame(self.session.run(self.build_daily_sql(start, end)))
+            raw = pd.DataFrame(self.session.run(
+                self.build_daily_sql(start, end, time_filter_sql=time_filter_sql)
+            ))
             if raw.empty:
                 continue
             required = {
@@ -583,12 +586,18 @@ class DolphinDBMinuteLoader:
         )
         return daily
 
-    def build_daily_sql(self, start: pd.Timestamp, end: pd.Timestamp) -> str:
+    def build_daily_sql(
+        self,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+        time_filter_sql: str | None = None,
+    ) -> str:
         start_literal, end_literal = start.strftime("%Y.%m.%d"), end.strftime("%Y.%m.%d")
+        time_filter = f", ({time_filter_sql})" if time_filter_sql else ""
         return (
             "dailySource = select date, sym, time, open, high, low, close, volume, "
             f"amount, tradeCount from {self.table_expression} "
-            f"where date >= {start_literal}, date <= {end_literal} "
+            f"where date >= {start_literal}, date <= {end_literal}{time_filter} "
             "order by date, sym, time; "
             "select first(open) as open, max(high) as high, min(low) as low, "
             "last(close) as close, sum(volume) as volume, sum(amount) as amount, "

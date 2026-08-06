@@ -48,11 +48,12 @@ dataset:
     root_env: ALPHAMINING_MEMMAP_DIR
     block_cache_env: ALPHAMINING_BLOCK_CACHE_DIR
     expected_minutes: 241
-    # 当前按“分钟开始时刻”标记：上午120根、下午121根（包含15:00收盘记录）。
-    # 先运行质量审计确认你的DDB口径；若时间标签不同，应修改区间而非直接改成264。
+    # 固定241根：09:25集合竞价1根 + 上午120根 + 下午120根。
     minute_sessions:
-      - ['09:30:00', '11:29:00']
-      - ['13:00:00', '15:00:00']
+      - ['09:31:00', '11:30:00']
+      - ['13:01:00', '15:00:00']
+    minute_extra_times:
+      - '09:25:00'
     quality_audit_dir: results/minute_cpu_ddb/data_quality
     quality_audit_chunk_days: 20
     quality_audit_scope: grid

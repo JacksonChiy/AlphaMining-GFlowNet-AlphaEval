@@ -12,9 +12,10 @@ from .dolphindb_minute import DolphinDBMinuteLoader
 
 
 DEFAULT_MINUTE_SESSIONS = (
-    ("09:30:00", "11:29:00"),
-    ("13:00:00", "15:00:00"),
+    ("09:31:00", "11:30:00"),
+    ("13:01:00", "15:00:00"),
 )
+DEFAULT_MINUTE_EXTRA_TIMES = ("09:25:00",)
 
 
 def _time_key(value: Any) -> str:
@@ -30,8 +31,9 @@ def _time_key(value: Any) -> str:
 
 def build_expected_minute_grid(
     sessions: Sequence[Sequence[str]],
+    extra_times: Sequence[str] = (),
 ) -> tuple[str, ...]:
-    values: list[str] = []
+    values: list[str] = [_time_key(value) for value in extra_times]
     for item in sessions:
         if len(item) != 2:
             raise ValueError("Each minute session must contain exactly [start, end]")
@@ -42,7 +44,7 @@ def build_expected_minute_grid(
         values.extend(value.strftime("%H:%M:%S") for value in pd.date_range(start, end, freq="min"))
     if len(values) != len(set(values)):
         raise ValueError("Configured minute sessions overlap")
-    return tuple(values)
+    return tuple(sorted(values))
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,7 @@ class MinuteQualityAuditConfig:
     output_dir: Path
     expected_minutes: int = 241
     sessions: tuple[tuple[str, str], ...] = DEFAULT_MINUTE_SESSIONS
+    extra_times: tuple[str, ...] = DEFAULT_MINUTE_EXTRA_TIMES
     chunk_days: int = 20
     scope: str = "grid"
 
@@ -58,7 +61,7 @@ class MinuteQualityAuditConfig:
             raise ValueError("Audit expected_minutes and chunk_days must be positive")
         if self.scope not in {"grid", "full"}:
             raise ValueError("Audit scope must be 'grid' or 'full'")
-        grid = build_expected_minute_grid(self.sessions)
+        grid = build_expected_minute_grid(self.sessions, self.extra_times)
         if len(grid) != self.expected_minutes:
             raise ValueError(
                 f"Configured sessions produce {len(grid)} minutes, "
@@ -75,12 +78,18 @@ class MinuteQualityAuditConfig:
     ) -> "MinuteQualityAuditConfig":
         raw_sessions = values.get("minute_sessions", DEFAULT_MINUTE_SESSIONS)
         sessions = tuple((str(item[0]), str(item[1])) for item in raw_sessions)
+        extra_times = tuple(
+            str(value) for value in values.get(
+                "minute_extra_times", DEFAULT_MINUTE_EXTRA_TIMES
+            )
+        )
         return cls(
             output_dir=Path(output_dir or values.get(
                 "quality_audit_dir", "results/minute_cpu_ddb/data_quality"
             )),
             expected_minutes=int(values.get("expected_minutes", 241)),
             sessions=sessions,
+            extra_times=extra_times,
             chunk_days=int(values.get("quality_audit_chunk_days", 20)),
             scope=str(scope or values.get("quality_audit_scope", "grid")).lower(),
         )
@@ -96,7 +105,9 @@ class DolphinDBMinuteQualityAuditor:
     ) -> None:
         self.loader = loader
         self.config = config
-        self.expected_grid = build_expected_minute_grid(config.sessions)
+        self.expected_grid = build_expected_minute_grid(
+            config.sessions, config.extra_times
+        )
 
     def run(self) -> Path:
         output = self.config.output_dir
@@ -155,6 +166,7 @@ class DolphinDBMinuteQualityAuditor:
             "expected": {
                 "minutes": self.config.expected_minutes,
                 "sessions": [list(item) for item in self.config.sessions],
+                "extra_times": list(self.config.extra_times),
             },
             "counts": {
                 "trade_dates": len(dates),

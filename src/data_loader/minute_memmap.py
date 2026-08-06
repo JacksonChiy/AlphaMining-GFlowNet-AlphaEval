@@ -13,6 +13,11 @@ import pandas as pd
 from src.operators.minute import build_minute_features, validate_minute_data
 
 from .dolphindb_minute import DolphinDBMinuteLoader, normalize_dolphindb_minutes
+from .minute_quality_audit import (
+    DEFAULT_MINUTE_EXTRA_TIMES,
+    DEFAULT_MINUTE_SESSIONS,
+    build_expected_minute_grid,
+)
 
 
 MEMMAP_CHANNELS = (
@@ -28,6 +33,8 @@ class MinuteMemMapConfig:
     root: Path
     block_cache_dir: Path
     expected_minutes: int = 241
+    minute_sessions: tuple[tuple[str, str], ...] = DEFAULT_MINUTE_SESSIONS
+    minute_extra_times: tuple[str, ...] = DEFAULT_MINUTE_EXTRA_TIMES
     stock_tile_size: int = 256
     workers: int = 1
     flush_every_days: int = 1
@@ -38,6 +45,20 @@ class MinuteMemMapConfig:
             self.expected_minutes, self.stock_tile_size, self.workers, self.flush_every_days
         ) < 1:
             raise ValueError("MemMap size settings must be positive")
+        actual = len(build_expected_minute_grid(
+            self.minute_sessions, self.minute_extra_times
+        ))
+        if actual != self.expected_minutes:
+            raise ValueError(
+                f"Configured minute grid contains {actual} points, "
+                f"expected_minutes={self.expected_minutes}"
+            )
+
+    @property
+    def minute_grid(self) -> tuple[str, ...]:
+        return build_expected_minute_grid(
+            self.minute_sessions, self.minute_extra_times
+        )
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> "MinuteMemMapConfig":
@@ -50,10 +71,21 @@ class MinuteMemMapConfig:
             raise ValueError(f"Missing minute MemMap directory: set {root_env}")
         cache = values.get("block_cache_dir") or os.environ.get(cache_env)
         cache_path = Path(str(cache)) if cache else Path(str(root)) / "block_cache"
+        raw_sessions = values.get("minute_sessions", DEFAULT_MINUTE_SESSIONS)
+        minute_sessions = tuple(
+            (str(item[0]), str(item[1])) for item in raw_sessions
+        )
+        minute_extra_times = tuple(
+            str(value) for value in values.get(
+                "minute_extra_times", DEFAULT_MINUTE_EXTRA_TIMES
+            )
+        )
         return cls(
             root=Path(str(root)),
             block_cache_dir=cache_path,
             expected_minutes=int(values.get("expected_minutes", 241)),
+            minute_sessions=minute_sessions,
+            minute_extra_times=minute_extra_times,
             stock_tile_size=int(values.get("stock_tile_size", 256)),
             workers=int(values.get("workers", 1)),
             flush_every_days=int(values.get("flush_every_days", 1)),
@@ -65,14 +97,18 @@ def _time_key(value: Any) -> str:
     if isinstance(value, pd.Timestamp):
         value = value.time()
     if hasattr(value, "strftime"):
-        return value.strftime("%H:%M:%S.%f")
+        return value.strftime("%H:%M:%S")
     parsed = pd.to_datetime(str(value), errors="coerce")
     if pd.isna(parsed):
         raise ValueError(f"Cannot normalize minute time value: {value!r}")
-    return parsed.strftime("%H:%M:%S.%f")
+    return parsed.strftime("%H:%M:%S")
 
 
-def _source_fingerprint(loader: DolphinDBMinuteLoader, dates: Sequence[pd.Timestamp]) -> str:
+def _source_fingerprint(
+    loader: DolphinDBMinuteLoader,
+    dates: Sequence[pd.Timestamp],
+    minute_grid: Sequence[str],
+) -> str:
     payload = {
         "format_version": MEMMAP_FORMAT_VERSION,
         "database": loader.config.database,
@@ -81,6 +117,7 @@ def _source_fingerprint(loader: DolphinDBMinuteLoader, dates: Sequence[pd.Timest
         "end_date": str(pd.Timestamp(dates[-1]).date()),
         "prices_are_adjusted": loader.config.prices_are_adjusted,
         "channels": MEMMAP_CHANNELS,
+        "minute_grid": list(minute_grid),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -111,7 +148,8 @@ class DolphinDBMinuteMemMapBuilder:
         audit_path = root / "field_audit.json"
         self._write_json(audit_path, audit.to_dict())
         manifest_path = root / "manifest.json"
-        fingerprint = _source_fingerprint(self.loader, dates)
+        configured_grid = self.config.minute_grid
+        fingerprint = _source_fingerprint(self.loader, dates, configured_grid)
         existing = self._read_json(manifest_path)
         if (
             existing
@@ -146,13 +184,15 @@ class DolphinDBMinuteMemMapBuilder:
                 f"[MemMapBuild] metadata_reused resume=true root={root}", flush=True
             )
         else:
+            minute_grid = self._load_minute_grid(dates)
             daily = self.loader.build_daily_in_memory(
-                self.loader.config.start_date, self.loader.config.end_date
+                self.loader.config.start_date,
+                self.loader.config.end_date,
+                time_filter_sql=self._ddb_time_filter_sql(),
             )
             daily.to_csv(daily_path, index=False, compression="gzip")
             stocks = np.array(sorted(daily["code"].astype(str).unique()), dtype=str)
             np.save(root / "stocks.npy", stocks, allow_pickle=False)
-            minute_grid = self._load_minute_grid(dates)
             np.save(
                 root / "minute_grid.npy", np.array(minute_grid, dtype=str), allow_pickle=False
             )
@@ -168,6 +208,9 @@ class DolphinDBMinuteMemMapBuilder:
                     "prices_are_adjusted": self.loader.config.prices_are_adjusted,
                 },
                 "field_audit_file": audit_path.name,
+                "minute_grid_audit_file": "minute_grid_audit.json",
+                "minute_sessions": [list(item) for item in self.config.minute_sessions],
+                "minute_extra_times": list(self.config.minute_extra_times),
                 "layout": "year/channel -> (n_days, n_minutes, n_stocks)",
                 "dtype": "float32",
                 "channels": list(MEMMAP_CHANNELS),
@@ -211,7 +254,9 @@ class DolphinDBMinuteMemMapBuilder:
         sample_dates = []
         for year in sorted({date.year for date in dates}):
             sample_dates.append(next(date for date in dates if date.year == year))
-        values: set[str] = set()
+        configured = self.config.minute_grid
+        expected = set(configured)
+        sample_audit: list[dict[str, Any]] = []
         for date in sample_dates:
             script = (
                 "select distinct time as minuteTime from "
@@ -221,20 +266,62 @@ class DolphinDBMinuteMemMapBuilder:
             result = pd.DataFrame(self.loader.session.run(script))
             if "minuteTime" not in result:
                 raise ValueError("DolphinDB minute-grid query returned no minuteTime column")
-            values.update(_time_key(value) for value in result["minuteTime"].dropna())
-        grid = tuple(sorted(values))
-        if len(grid) != self.config.expected_minutes:
+            observed = {
+                _time_key(value) for value in result["minuteTime"].dropna()
+            }
+            missing = sorted(expected - observed)
+            extra = sorted(observed - expected)
+            sample_audit.append({
+                "date": str(date.date()),
+                "observed_minutes": len(observed),
+                "missing_configured_times": missing,
+                "excluded_source_times": extra,
+            })
+        audit = {
+            "policy": "explicit_configured_grid",
+            "expected_minutes": self.config.expected_minutes,
+            "sessions": [list(item) for item in self.config.minute_sessions],
+            "extra_times": list(self.config.minute_extra_times),
+            "selected_grid": list(configured),
+            "sample_dates": sample_audit,
+        }
+        self._write_json(self.config.root / "minute_grid_audit.json", audit)
+        missing_samples = [item for item in sample_audit if item["missing_configured_times"]]
+        if missing_samples:
             raise ValueError(
-                f"Expected {self.config.expected_minutes} minute points, got {len(grid)}. "
-                "Inspect the source time convention and set memmap.expected_minutes only "
-                "after confirming the actual grid."
+                "Configured 241-point minute grid is absent on sampled dates. "
+                f"See {self.config.root / 'minute_grid_audit.json'} for exact missing times."
             )
+        excluded = sorted({
+            value for item in sample_audit for value in item["excluded_source_times"]
+        })
         print(
-            f"[MemMapBuild] minute_grid_ready count={len(grid)} "
-            f"first={grid[0]} last={grid[-1]}",
+            f"[MemMapBuild] minute_grid_ready count={len(configured)} "
+            f"first={configured[0]} last={configured[-1]} "
+            f"excluded_source_times={len(excluded)}",
             flush=True,
         )
-        return grid
+        return configured
+
+    def _ddb_time_filter_sql(self) -> str:
+        clauses = [
+            f"minute(time) = {self._ddb_minute_literal(value)}"
+            for value in self.config.minute_extra_times
+        ]
+        clauses.extend(
+            "(minute(time) >= "
+            f"{self._ddb_minute_literal(start)} and minute(time) <= "
+            f"{self._ddb_minute_literal(end)})"
+            for start, end in self.config.minute_sessions
+        )
+        return " or ".join(clauses)
+
+    @staticmethod
+    def _ddb_minute_literal(value: str) -> str:
+        parsed = pd.Timestamp(f"2000-01-01 {value}")
+        if parsed.second or parsed.microsecond:
+            raise ValueError(f"Minute-grid values must align to whole minutes: {value}")
+        return parsed.strftime("%H:%M") + "m"
 
     def _build_year(
         self,
@@ -281,9 +368,20 @@ class DolphinDBMinuteMemMapBuilder:
         for day_index in range(completed_days, len(dates)):
             date = pd.Timestamp(dates[day_index])
             raw = self.loader.session.run(self.loader.build_data_sql(date, date))
-            frame = build_minute_features(
-                normalize_dolphindb_minutes(pd.DataFrame(raw))
-            )
+            normalized = normalize_dolphindb_minutes(pd.DataFrame(raw))
+            time_keys = normalized["datetime"].map(_time_key)
+            in_grid = time_keys.isin(minute_lookup)
+            excluded_rows = int((~in_grid).sum())
+            normalized = normalized.loc[in_grid].copy()
+            if normalized.empty:
+                raise ValueError(f"No configured minute rows remain on {date.date()}")
+            frame = build_minute_features(normalized)
+            duplicate_rows = frame.duplicated(["date", "code", "datetime"], keep=False)
+            if duplicate_rows.any():
+                raise ValueError(
+                    f"Duplicate date/code/time keys on {date.date()}: "
+                    f"rows={int(duplicate_rows.sum())}. Run the quality audit first."
+                )
             codes = frame["code"].astype(str).map(stock_lookup)
             minutes = frame["datetime"].map(lambda value: minute_lookup.get(_time_key(value)))
             valid_index = codes.notna() & minutes.notna()
@@ -320,7 +418,7 @@ class DolphinDBMinuteMemMapBuilder:
             print(
                 f"[MemMapBuild] day_complete year={year} "
                 f"day={day_index + 1:03d}/{len(dates):03d} date={date.date()} "
-                f"minute_rows={len(frame):,}",
+                f"minute_rows={len(frame):,} excluded_rows={excluded_rows:,}",
                 flush=True,
             )
 

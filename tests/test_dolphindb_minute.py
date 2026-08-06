@@ -366,12 +366,19 @@ def test_chunked_extract_daily_aggregation_and_partitioned_factor_pool(tmp_path)
 
 
 def test_ddb_to_local_memmap_build_read_and_persistent_block_cache(tmp_path) -> None:
-    session = FakeDolphinDBSession(_source_minutes())
+    base_source = _source_minutes()
+    excluded = base_source.groupby(["date", "sym"], observed=True).head(1).copy()
+    excluded["time"] = dt.time(9, 29)
+    session = FakeDolphinDBSession(
+        pd.concat([base_source, excluded], ignore_index=True)
+    )
     loader = DolphinDBMinuteLoader(_config(tmp_path), session)
     memmap_config = MinuteMemMapConfig(
         root=tmp_path / "minute_memmap",
         block_cache_dir=tmp_path / "block_cache",
         expected_minutes=3,
+        minute_sessions=(("09:30:00", "09:32:00"),),
+        minute_extra_times=(),
         stock_tile_size=1,
     )
     manifest_path = DolphinDBMinuteMemMapBuilder(loader, memmap_config).build()
@@ -382,6 +389,13 @@ def test_ddb_to_local_memmap_build_read_and_persistent_block_cache(tmp_path) -> 
     assert manifest["n_stocks"] == 2
     assert set(manifest["channels"]) == set(MEMMAP_CHANNELS)
     assert not list((tmp_path / "minute_memmap").rglob("minute_*.pkl"))
+    grid_audit = json.loads(
+        (memmap_config.root / "minute_grid_audit.json").read_text(encoding="utf-8")
+    )
+    assert grid_audit["sample_dates"][0]["excluded_source_times"] == ["09:29:00"]
+    daily_scripts = [script for script in session.scripts if "select first(open)" in script]
+    assert daily_scripts
+    assert all("minute(time)" in script for script in daily_scripts)
 
     manifest["complete"] = False
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -399,7 +413,7 @@ def test_ddb_to_local_memmap_build_read_and_persistent_block_cache(tmp_path) -> 
         store, list(expression.block_nodes()), "2024-01-02", "2024-01-03", cache
     )
     actual = expression.execute_from_blocks(blocks).sort_index()
-    expected = expression.execute(normalize_dolphindb_minutes(_source_minutes())).sort_index()
+    expected = expression.execute(normalize_dolphindb_minutes(base_source)).sort_index()
     assert np.allclose(actual, expected)
     assert cache.writes == 1
 
@@ -441,6 +455,7 @@ def test_minute_quality_audit_reports_extra_time_and_duplicate_key(tmp_path) -> 
         output_dir=tmp_path / "quality",
         expected_minutes=3,
         sessions=(("09:30:00", "09:32:00"),),
+        extra_times=(),
         chunk_days=1,
         scope="full",
     )

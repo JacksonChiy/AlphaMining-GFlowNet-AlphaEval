@@ -95,6 +95,11 @@ dataset:
     root_env: ALPHAMINING_MEMMAP_DIR
     block_cache_env: ALPHAMINING_BLOCK_CACHE_DIR
     expected_minutes: 241
+    minute_sessions:
+      - ['09:31:00', '11:30:00']
+      - ['13:01:00', '15:00:00']
+    minute_extra_times:
+      - '09:25:00'
     stock_tile_size: 256
     workers: 4
     flush_every_days: 1
@@ -142,7 +147,7 @@ python scripts/audit_ddb_minute_quality.py `
   --scope full
 ```
 
-`full`会额外生成`problem_symbols.csv`，数据库计算量和本地传输量都大于`grid`，建议先跑`grid`。默认的241分钟口径是`09:30-11:29` + `13:00-15:00`；如果数据使用另一种分钟标签口径，请修改配置中的`minute_sessions`，不要直接把`expected_minutes`改成264。
+`full`会额外生成`problem_symbols.csv`，数据库计算量和本地传输量都大于`grid`，建议先跑`grid`。固定的241分钟口径为`09:25`集合竞价1一根 + `09:31-11:30` 120根 + `13:01-15:00` 120根。其他时间点会在MemMap构建时被显式过滤，且不参与派生分钟特征或日频OHLCV的计算。
 
 首次验证建议复制配置：
 
@@ -207,6 +212,7 @@ E:\AlphaMining\minute_memmap\
 
 数值通道使用`float32`，有效值Mask使用`uint8`。没有生成原始分钟PKL。
 `field_audit.json`记录构建时的字段映射、日期覆盖和复权检查结果，便于在无DDB连接的训练服务器上追溯数据口径。
+`minute_grid_audit.json`保存抽样日的原始时间网格差异、被排除时点和最终选中的241个时间点。
 
 训练计算按`year × stock_tile`切分，并由`workers`个loky进程只读共享操作系统Page Cache。Windows首次建议使用`workers: 2`，确认内存稳定后再提高到4或8。
 
