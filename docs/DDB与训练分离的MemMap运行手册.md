@@ -101,8 +101,9 @@ dataset:
     minute_extra_times:
       - '09:25:00'
     stock_tile_size: 256
+    build_workers: 4
     workers: 4
-    flush_every_days: 1
+    flush_every_days: 8
     force_rebuild: false
 ```
 
@@ -175,12 +176,21 @@ python scripts/build_ddb_memmap.py `
 [DDB] audit_progress ...
 [DDB] trade_days_loaded ...
 [MemMapBuild] minute_grid_ready count=241 ...
-[MemMapBuild] year_start ...
+[MemMapBuild] year_start ... build_workers=4 ...
 [MemMapBuild] day_complete ...
+[MemMapBuild] batch_flushed ...
 [MemMapBuild] complete ...
 ```
 
-构建中断后，使用相同配置和目录重新执行同一命令，会从`progress.json`记录的完整交易日继续。
+构建中断后，使用相同配置和目录重新执行同一命令，会跳过`progress.json`记录的所有已完成交易日，不要求并行任务按日期顺序完成。
+
+### 构建并发参数
+
+- `build_workers`：构建线程数，每个线程创建独立DolphinDB session。
+- `workers`：训练时的MemMap读取和因子Block并发，与`build_workers`无关。
+- `flush_every_days`：每批至少完成多少个交易日后统一落盘，实际批次不会小于`build_workers`。
+
+Windows 16核CPU建议从`build_workers: 4`开始。如果DDB服务器CPU、网络和并发连接数仍有余量，可提高到8；如果出现连接拒绝、查询排队或服务器CPU持续满载，应降回2至4，不建议直接设成16。
 
 ## 8. MemMap目录
 

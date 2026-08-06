@@ -380,8 +380,19 @@ def test_ddb_to_local_memmap_build_read_and_persistent_block_cache(tmp_path) -> 
         minute_sessions=(("09:30:00", "09:32:00"),),
         minute_extra_times=(),
         stock_tile_size=1,
+        build_workers=2,
+        flush_every_days=2,
     )
-    manifest_path = DolphinDBMinuteMemMapBuilder(loader, memmap_config).build()
+    worker_sessions: list[FakeDolphinDBSession] = []
+
+    def loader_factory() -> DolphinDBMinuteLoader:
+        worker_session = FakeDolphinDBSession(session.frame.copy())
+        worker_sessions.append(worker_session)
+        return DolphinDBMinuteLoader(_config(tmp_path), worker_session)
+
+    manifest_path = DolphinDBMinuteMemMapBuilder(
+        loader, memmap_config, loader_factory=loader_factory
+    ).build()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["complete"] is True
     assert (memmap_config.root / "field_audit.json").exists()
@@ -396,11 +407,19 @@ def test_ddb_to_local_memmap_build_read_and_persistent_block_cache(tmp_path) -> 
     daily_scripts = [script for script in session.scripts if "select first(open)" in script]
     assert daily_scripts
     assert all("minute(time)" in script for script in daily_scripts)
+    assert worker_sessions
+    assert all(worker.closed for worker in worker_sessions)
+    assert sum(
+        "select sym, date, time" in script
+        for worker in worker_sessions for script in worker.scripts
+    ) == 2
 
     manifest["complete"] = False
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     session.scripts.clear()
-    DolphinDBMinuteMemMapBuilder(loader, memmap_config).build()
+    DolphinDBMinuteMemMapBuilder(
+        loader, memmap_config, loader_factory=loader_factory
+    ).build()
     assert not [script for script in session.scripts if "select first(open)" in script]
 
     store = MinuteMemMapStore(memmap_config)

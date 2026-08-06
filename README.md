@@ -76,7 +76,7 @@ RQAlphaPlus 是授权软件，需要通过米筐授权渠道独立安装，详�
 
 ### DolphinDB分钟数据MemMap CPU训练
 
-`cpu-training`分支支持DDB与训练分离部署。远程DolphinDB只在首次构建时按交易日传输数据，训练服务器将19个分钟通道保存为按年组织的`float32 (n_days, 241, n_stocks)`本地MemMap；GFlowNet训练阶段不再连接DDB。日内Block按`source_fingerprint + date_scope + block_expr`持久化，内存中使用有界LRU，重复实验可直接复用磁盘Block缓存。不会创建原始分钟PKL。
+`cpu-training`分支支持DDB与训练分离部署。远程DolphinDB只在首次构建时按交易日传输数据；构建器使用多线程独立DDB session并行写入不同交易日切片。训练服务器将19个分钟通道保存为按年组织的`float32 (n_days, 241, n_stocks)`本地MemMap；GFlowNet训练阶段不再连接DDB。日内Block按`source_fingerprint + date_scope + block_expr`持久化，内存中使用有界LRU，重复实验可直接复用磁盘Block缓存。不会创建原始分钟PKL。
 
 ```bash
 python scripts/prepare_ddb_minute.py \

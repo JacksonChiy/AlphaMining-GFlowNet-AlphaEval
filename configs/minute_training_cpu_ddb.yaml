@@ -58,8 +58,12 @@ dataset:
     quality_audit_chunk_days: 20
     quality_audit_scope: grid
     stock_tile_size: 256
+    # MemMap构建并发：每个线程创建独立DDB连接，并写入不同交易日切片。
+    build_workers: 4
+    # 训练阶段按year x stock_tile并行读取MemMap，与build_workers相互独立。
     workers: 4
-    flush_every_days: 1
+    # 每批至少处理该数量的交易日后统一flush；实际批次不会小于build_workers。
+    flush_every_days: 8
     force_rebuild: false
 
 cpu_runtime:

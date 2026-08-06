@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -37,12 +39,14 @@ class MinuteMemMapConfig:
     minute_extra_times: tuple[str, ...] = DEFAULT_MINUTE_EXTRA_TIMES
     stock_tile_size: int = 256
     workers: int = 1
+    build_workers: int = 1
     flush_every_days: int = 1
     force_rebuild: bool = False
 
     def __post_init__(self) -> None:
         if min(
-            self.expected_minutes, self.stock_tile_size, self.workers, self.flush_every_days
+            self.expected_minutes, self.stock_tile_size, self.workers,
+            self.build_workers, self.flush_every_days,
         ) < 1:
             raise ValueError("MemMap size settings must be positive")
         actual = len(build_expected_minute_grid(
@@ -88,6 +92,7 @@ class MinuteMemMapConfig:
             minute_extra_times=minute_extra_times,
             stock_tile_size=int(values.get("stock_tile_size", 256)),
             workers=int(values.get("workers", 1)),
+            build_workers=int(values.get("build_workers", 1)),
             flush_every_days=int(values.get("flush_every_days", 1)),
             force_rebuild=bool(values.get("force_rebuild", False)),
         )
@@ -129,9 +134,16 @@ class DolphinDBMinuteMemMapBuilder:
         self,
         loader: DolphinDBMinuteLoader,
         config: MinuteMemMapConfig,
+        loader_factory: Callable[[], DolphinDBMinuteLoader] | None = None,
     ) -> None:
         self.loader = loader
         self.config = config
+        self.loader_factory = loader_factory
+        if config.build_workers > 1 and loader_factory is None:
+            raise ValueError(
+                "MemMap build_workers > 1 requires a loader_factory so each thread "
+                "uses an independent DolphinDB session"
+            )
 
     def build(self) -> Path:
         audit = self.loader.audit()
@@ -345,7 +357,13 @@ class DolphinDBMinuteMemMapBuilder:
             progress.get("fingerprint") == fingerprint
             and progress.get("shape") == list(shape)
         )
-        completed_days = int(progress.get("completed_days", 0)) if resume else 0
+        completed_indices: set[int] = set()
+        if resume:
+            saved_indices = progress.get("completed_day_indices")
+            if isinstance(saved_indices, list):
+                completed_indices = {int(value) for value in saved_indices}
+            else:
+                completed_indices = set(range(int(progress.get("completed_days", 0))))
         mode = "r+" if resume and all(
             (year_dir / f"{channel}.npy").exists() for channel in MEMMAP_CHANNELS
         ) and (year_dir / "valid_mask.npy").exists() else "w+"
@@ -359,68 +377,167 @@ class DolphinDBMinuteMemMapBuilder:
             year_dir / "valid_mask.npy", mode=mode, dtype=np.uint8, shape=shape
         )
         if mode == "w+":
-            completed_days = 0
+            completed_indices.clear()
+        pending_indices = [
+            index for index in range(len(dates)) if index not in completed_indices
+        ]
         print(
             f"[MemMapBuild] year_start year={year} days={len(dates)} "
-            f"resume_from={completed_days} shape={shape}",
+            f"completed={len(completed_indices)} pending={len(pending_indices)} "
+            f"build_workers={self.config.build_workers} shape={shape}",
             flush=True,
         )
-        for day_index in range(completed_days, len(dates)):
-            date = pd.Timestamp(dates[day_index])
-            raw = self.loader.session.run(self.loader.build_data_sql(date, date))
-            normalized = normalize_dolphindb_minutes(pd.DataFrame(raw))
-            time_keys = normalized["datetime"].map(_time_key)
-            in_grid = time_keys.isin(minute_lookup)
-            excluded_rows = int((~in_grid).sum())
-            normalized = normalized.loc[in_grid].copy()
-            if normalized.empty:
-                raise ValueError(f"No configured minute rows remain on {date.date()}")
-            frame = build_minute_features(normalized)
-            duplicate_rows = frame.duplicated(["date", "code", "datetime"], keep=False)
-            if duplicate_rows.any():
-                raise ValueError(
-                    f"Duplicate date/code/time keys on {date.date()}: "
-                    f"rows={int(duplicate_rows.sum())}. Run the quality audit first."
+        if not pending_indices:
+            return
+        batch_size = max(self.config.build_workers, self.config.flush_every_days)
+        if self.config.build_workers == 1:
+            for offset in range(0, len(pending_indices), batch_size):
+                batch = pending_indices[offset:offset + batch_size]
+                results = [
+                    self._write_day(
+                        self.loader, index, pd.Timestamp(dates[index]), arrays, mask,
+                        stock_lookup, minute_lookup,
+                    )
+                    for index in batch
+                ]
+                self._commit_batch(
+                    year, dates, results, arrays, mask, completed_indices,
+                    progress_path, fingerprint, shape,
                 )
-            codes = frame["code"].astype(str).map(stock_lookup)
-            minutes = frame["datetime"].map(lambda value: minute_lookup.get(_time_key(value)))
-            valid_index = codes.notna() & minutes.notna()
-            if not valid_index.all():
-                raise ValueError(
-                    f"MemMap index mismatch on {date.date()}: "
-                    f"unmapped_rows={int((~valid_index).sum())}"
-                )
-            stock_index = codes.to_numpy(dtype=np.int64)
-            minute_index = minutes.to_numpy(dtype=np.int64)
-            for channel, array in arrays.items():
-                array[day_index, :, :] = np.nan
-                values = pd.to_numeric(frame[channel], errors="coerce").to_numpy(
-                    dtype=np.float32
-                )
-                array[day_index, minute_index, stock_index] = values
-            mask[day_index, :, :] = 0
-            # The mask records source-row presence, not close validity. Individual channel
-            # NaNs must remain visible so reductions keep exactly the same row-position semantics.
-            mask[day_index, minute_index, stock_index] = 1
-            if (
-                (day_index + 1) % self.config.flush_every_days == 0
-                or day_index + 1 == len(dates)
-            ):
-                for array in arrays.values():
-                    array.flush()
-                mask.flush()
-                self._write_json(progress_path, {
-                    "fingerprint": fingerprint,
-                    "shape": list(shape),
-                    "completed_days": day_index + 1,
-                    "complete": day_index + 1 == len(dates),
-                })
+            return
+
+        worker_local = threading.local()
+        worker_loaders: list[DolphinDBMinuteLoader] = []
+        worker_lock = threading.Lock()
+
+        def initialize_worker() -> None:
+            assert self.loader_factory is not None
+            worker_local.loader = self.loader_factory()
+            with worker_lock:
+                worker_loaders.append(worker_local.loader)
+
+        def process_day(day_index: int) -> dict[str, Any]:
+            return self._write_day(
+                worker_local.loader,
+                day_index,
+                pd.Timestamp(dates[day_index]),
+                arrays,
+                mask,
+                stock_lookup,
+                minute_lookup,
+            )
+
+        try:
+            with ThreadPoolExecutor(
+                max_workers=self.config.build_workers,
+                thread_name_prefix="ddb-memmap",
+                initializer=initialize_worker,
+            ) as executor:
+                for offset in range(0, len(pending_indices), batch_size):
+                    batch = pending_indices[offset:offset + batch_size]
+                    futures = {executor.submit(process_day, index): index for index in batch}
+                    results = [future.result() for future in as_completed(futures)]
+                    self._commit_batch(
+                        year, dates, results, arrays, mask, completed_indices,
+                        progress_path, fingerprint, shape,
+                    )
+        finally:
+            for worker_loader in worker_loaders:
+                worker_loader.session.close()
+
+    def _write_day(
+        self,
+        loader: DolphinDBMinuteLoader,
+        day_index: int,
+        date: pd.Timestamp,
+        arrays: Mapping[str, np.memmap],
+        mask: np.memmap,
+        stock_lookup: Mapping[str, int],
+        minute_lookup: Mapping[str, int],
+    ) -> dict[str, Any]:
+        raw = loader.session.run(loader.build_data_sql(date, date))
+        normalized = normalize_dolphindb_minutes(pd.DataFrame(raw))
+        time_keys = normalized["datetime"].map(_time_key)
+        in_grid = time_keys.isin(minute_lookup)
+        excluded_rows = int((~in_grid).sum())
+        normalized = normalized.loc[in_grid].copy()
+        if normalized.empty:
+            raise ValueError(f"No configured minute rows remain on {date.date()}")
+        frame = build_minute_features(normalized)
+        duplicate_rows = frame.duplicated(["date", "code", "datetime"], keep=False)
+        if duplicate_rows.any():
+            raise ValueError(
+                f"Duplicate date/code/time keys on {date.date()}: "
+                f"rows={int(duplicate_rows.sum())}. Run the quality audit first."
+            )
+        codes = frame["code"].astype(str).map(stock_lookup)
+        minutes = frame["datetime"].map(
+            lambda value: minute_lookup.get(_time_key(value))
+        )
+        valid_index = codes.notna() & minutes.notna()
+        if not valid_index.all():
+            raise ValueError(
+                f"MemMap index mismatch on {date.date()}: "
+                f"unmapped_rows={int((~valid_index).sum())}"
+            )
+        stock_index = codes.to_numpy(dtype=np.int64)
+        minute_index = minutes.to_numpy(dtype=np.int64)
+        for channel, array in arrays.items():
+            array[day_index, :, :] = np.nan
+            values = pd.to_numeric(frame[channel], errors="coerce").to_numpy(
+                dtype=np.float32
+            )
+            array[day_index, minute_index, stock_index] = values
+        mask[day_index, :, :] = 0
+        # Each thread writes a disjoint day slice. Channel NaNs remain visible so
+        # reductions preserve the source row-position semantics.
+        mask[day_index, minute_index, stock_index] = 1
+        return {
+            "day_index": day_index,
+            "date": str(date.date()),
+            "minute_rows": len(frame),
+            "excluded_rows": excluded_rows,
+        }
+
+    def _commit_batch(
+        self,
+        year: int,
+        dates: Sequence[pd.Timestamp],
+        results: Sequence[Mapping[str, Any]],
+        arrays: Mapping[str, np.memmap],
+        mask: np.memmap,
+        completed_indices: set[int],
+        progress_path: Path,
+        fingerprint: str,
+        shape: Sequence[int],
+    ) -> None:
+        for array in arrays.values():
+            array.flush()
+        mask.flush()
+        completed_indices.update(int(result["day_index"]) for result in results)
+        contiguous_days = 0
+        while contiguous_days in completed_indices:
+            contiguous_days += 1
+        self._write_json(progress_path, {
+            "fingerprint": fingerprint,
+            "shape": list(shape),
+            "completed_days": contiguous_days,
+            "completed_day_indices": sorted(completed_indices),
+            "complete": len(completed_indices) == len(dates),
+        })
+        for result in sorted(results, key=lambda item: int(item["day_index"])):
             print(
                 f"[MemMapBuild] day_complete year={year} "
-                f"day={day_index + 1:03d}/{len(dates):03d} date={date.date()} "
-                f"minute_rows={len(frame):,} excluded_rows={excluded_rows:,}",
+                f"day={int(result['day_index']) + 1:03d}/{len(dates):03d} "
+                f"date={result['date']} minute_rows={int(result['minute_rows']):,} "
+                f"excluded_rows={int(result['excluded_rows']):,}",
                 flush=True,
             )
+        print(
+            f"[MemMapBuild] batch_flushed year={year} "
+            f"completed={len(completed_indices):03d}/{len(dates):03d}",
+            flush=True,
+        )
 
     @staticmethod
     def _read_json(path: Path) -> dict[str, Any] | None:

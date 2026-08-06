@@ -38,7 +38,15 @@ def main() -> None:
     session = create_dolphindb_session(ddb_values)
     try:
         loader = DolphinDBMinuteLoader(ddb_config, session)
-        manifest = DolphinDBMinuteMemMapBuilder(loader, memmap_config).build()
+        def loader_factory() -> DolphinDBMinuteLoader:
+            worker_session = create_dolphindb_session(ddb_values)
+            return DolphinDBMinuteLoader(ddb_config, worker_session)
+
+        manifest = DolphinDBMinuteMemMapBuilder(
+            loader,
+            memmap_config,
+            loader_factory=loader_factory if memmap_config.build_workers > 1 else None,
+        ).build()
         print(f"[MemMapBuild] manifest={manifest}", flush=True)
     finally:
         session.close()
@@ -46,4 +54,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
