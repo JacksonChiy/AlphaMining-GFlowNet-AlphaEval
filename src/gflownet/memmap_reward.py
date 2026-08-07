@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Sequence
@@ -14,7 +15,18 @@ from joblib import Parallel, delayed
 from src.data_loader.minute_memmap import MinuteMemMapStore
 from src.expression.minute import MinuteExpression, MinuteNode
 
+from .numpy_minute_executor import (
+    NUMPY_MINUTE_EXECUTOR_VERSION,
+    NumpyMinuteBlockExecutor,
+    UnsupportedNumpyNode,
+    required_memmap_channels,
+    validate_numpy_nodes,
+    )
+
 from .reward import RewardBreakdown, RewardEvaluator
+
+
+_NUMPY_WORKER_STORES: dict[str, MinuteMemMapStore] = {}
 
 
 def _compute_memmap_tile(
@@ -38,6 +50,22 @@ def _compute_memmap_tile(
         key: pd.concat(values).sort_index() if values else pd.Series(dtype=float)
         for key, values in parts.items()
     }
+
+
+def _compute_numpy_chunk(
+    store_config,
+    nodes: Sequence[MinuteNode],
+    spec: tuple[int, int, int, int, int],
+) -> tuple[tuple[int, int, int, int, int], dict[str, np.ndarray], tuple[str, ...]]:
+    store_key = str(store_config.root.resolve())
+    store = _NUMPY_WORKER_STORES.get(store_key)
+    if store is None:
+        store = MinuteMemMapStore(store_config)
+        _NUMPY_WORKER_STORES[store_key] = store
+    channels = required_memmap_channels(nodes)
+    _, mask, arrays = store.read_numpy_chunk(spec, channels)
+    values = NumpyMinuteBlockExecutor(mask, arrays).execute(nodes)
+    return spec, values, channels
 
 
 class PersistentMinuteBlockCache:
@@ -130,6 +158,215 @@ class PersistentMinuteBlockCache:
         return self.root / f"{digest}.npy", self.root / f"{digest}.json"
 
 
+class PartialMinuteBlockCache:
+    """Small daily chunk files make long reward scans resumable after interruption."""
+
+    def __init__(
+        self,
+        store: MinuteMemMapStore,
+        root: Path,
+        start_date: str,
+        end_date: str,
+    ) -> None:
+        scope = "|".join((
+            store.fingerprint, str(pd.Timestamp(start_date).date()),
+            str(pd.Timestamp(end_date).date()), str(NUMPY_MINUTE_EXECUTOR_VERSION),
+        ))
+        self.root = root / "partials" / hashlib.sha256(scope.encode()).hexdigest()[:20]
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.hits = 0
+        self.writes = 0
+
+    def path(self, expression: str, spec: tuple[int, int, int, int, int]) -> Path:
+        expression_key = hashlib.sha256(expression.encode()).hexdigest()[:20]
+        return self.root / expression_key / ("_".join(map(str, spec)) + ".npy")
+
+    def load(
+        self, expression: str, spec: tuple[int, int, int, int, int]
+    ) -> np.ndarray | None:
+        path = self.path(expression, spec)
+        if not path.exists():
+            return None
+        expected = (spec[2] - spec[1], spec[4] - spec[3])
+        values = np.load(path, mmap_mode="r", allow_pickle=False)
+        if values.shape != expected:
+            return None
+        self.hits += 1
+        return values
+
+    def save(
+        self,
+        expression: str,
+        spec: tuple[int, int, int, int, int],
+        values: np.ndarray,
+    ) -> None:
+        path = self.path(expression, spec)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".npy.tmp")
+        with temporary.open("wb") as handle:
+            np.save(handle, np.asarray(values, dtype=np.float32), allow_pickle=False)
+        temporary.replace(path)
+        self.writes += 1
+
+
+def _run_pandas_blocks(
+    store: MinuteMemMapStore,
+    nodes: Sequence[MinuteNode],
+    start_date: str,
+    end_date: str,
+) -> dict[str, pd.Series]:
+    parts: dict[str, list[pd.Series]] = {node.render(): [] for node in nodes}
+    specs = store.tile_specs(start_date, end_date)
+    print(
+        f"[MemMapReward] pandas_fallback_start workers={store.config.workers} "
+        f"year_stock_tiles={len(specs)}",
+        flush=True,
+    )
+    if store.config.workers > 1:
+        try:
+            results = Parallel(n_jobs=store.config.workers, backend="loky", verbose=10)(
+                delayed(_compute_memmap_tile)(
+                    store.config, nodes, spec, start_date, end_date
+                )
+                for spec in specs
+            )
+        except (PermissionError, NotImplementedError) as error:
+            print(
+                f"[MemMapReward] pandas_loky_unavailable sequential_fallback=true "
+                f"error={type(error).__name__}: {error}",
+                flush=True,
+            )
+            results = [
+                _compute_memmap_tile(store.config, nodes, spec, start_date, end_date)
+                for spec in specs
+            ]
+    else:
+        results = [
+            _compute_memmap_tile(store.config, nodes, spec, start_date, end_date)
+            for spec in specs
+        ]
+    for completed, computed in enumerate(results, start=1):
+        for key, values in computed.items():
+            if not values.empty:
+                parts[key].append(values)
+        if completed == 1 or completed == len(results) or completed % 10 == 0:
+            print(f"[MemMapReward] pandas_progress={completed}/{len(results)}", flush=True)
+    return {
+        key: pd.concat(values).sort_index()
+        for key, values in parts.items() if values
+    }
+
+
+def _execute_numpy_blocks(
+    store: MinuteMemMapStore,
+    nodes: Sequence[MinuteNode],
+    start_date: str,
+    end_date: str,
+) -> dict[str, pd.Series]:
+    validate_numpy_nodes(nodes)
+    specs = store.chunk_specs(start_date, end_date)
+    if not specs:
+        raise ValueError("MemMap store returned no dates for the requested range")
+    partial = PartialMinuteBlockCache(
+        store, store.config.block_cache_dir, start_date, end_date
+    )
+    missing_tasks: list[tuple[tuple[int, int, int, int, int], list[MinuteNode]]] = []
+    cached_parts = 0
+    for spec in specs:
+        missing = []
+        for node in nodes:
+            if partial.load(node.render(), spec) is None:
+                missing.append(node)
+            else:
+                cached_parts += 1
+        if missing:
+            missing_tasks.append((spec, missing))
+    channels = required_memmap_channels(nodes)
+    total_parts = len(specs) * len(nodes)
+    print(
+        f"[MemMapReward] numpy_start workers={store.config.workers} "
+        f"date_chunk_days={store.config.reward_chunk_days} chunks={len(specs)} "
+        f"blocks={len(nodes)} required_channels={len(channels)}/{len(store.manifest['channels'])} "
+        f"partial_hits={cached_parts}/{total_parts} pending_tasks={len(missing_tasks)}",
+        flush=True,
+    )
+    started = time.monotonic()
+    if missing_tasks:
+        if store.config.workers > 1:
+            try:
+                results = Parallel(
+                    n_jobs=store.config.workers,
+                    backend="loky",
+                    batch_size=1,
+                    # Ordered streaming is supported by both the pinned project
+                    # joblib and newer releases, and still lets the parent save
+                    # each completed chunk instead of buffering the full scan.
+                    return_as="generator",
+                )(
+                    delayed(_compute_numpy_chunk)(store.config, task_nodes, spec)
+                    for spec, task_nodes in missing_tasks
+                )
+            except (PermissionError, NotImplementedError) as error:
+                print(
+                    f"[MemMapReward] loky_unavailable sequential_fallback=true "
+                    f"error={type(error).__name__}: {error}",
+                    flush=True,
+                )
+                results = (
+                    _compute_numpy_chunk(store.config, task_nodes, spec)
+                    for spec, task_nodes in missing_tasks
+                )
+        else:
+            results = (
+                _compute_numpy_chunk(store.config, task_nodes, spec)
+                for spec, task_nodes in missing_tasks
+            )
+        completed = 0
+        for spec, computed, _ in results:
+            completed += 1
+            for expression, values in computed.items():
+                partial.save(expression, spec, values)
+            elapsed = max(time.monotonic() - started, 1e-9)
+            if completed == 1 or completed == len(missing_tasks) or completed % 10 == 0:
+                rate = completed / elapsed
+                eta = (len(missing_tasks) - completed) / max(rate, 1e-9)
+                print(
+                    f"[MemMapReward] numpy_progress tasks={completed}/{len(missing_tasks)} "
+                    f"rate={rate:.2f}/s eta={eta/60:.1f}m partial_writes={partial.writes}",
+                    flush=True,
+                )
+
+    selected_dates = store.dates[
+        (store.dates >= pd.Timestamp(start_date)) & (store.dates <= pd.Timestamp(end_date))
+    ]
+    date_lookup = {date: index for index, date in enumerate(selected_dates)}
+    output: dict[str, pd.Series] = {}
+    for node in nodes:
+        dense = np.full((len(selected_dates), len(store.stocks)), np.nan, dtype=np.float32)
+        for spec in specs:
+            year, day_start, day_end, stock_start, stock_end = spec
+            dates = store._year_dates(year)[day_start:day_end]
+            row_start = date_lookup[dates[0]]
+            values = partial.load(node.render(), spec)
+            if values is None:
+                raise RuntimeError(f"Missing partial cache after computation: {node.render()} {spec}")
+            dense[row_start:row_start + len(dates), stock_start:stock_end] = values
+        row_index, stock_index = np.nonzero(np.isfinite(dense))
+        index = pd.MultiIndex.from_arrays(
+            [selected_dates[row_index], store.stocks[stock_index].astype(str)],
+            names=["date", "code"],
+        )
+        output[node.render()] = pd.Series(
+            dense[row_index, stock_index].astype(float), index=index, name=node.render()
+        )
+    print(
+        f"[MemMapReward] numpy_complete seconds={time.monotonic()-started:.1f} "
+        f"partial_hits={partial.hits} partial_writes={partial.writes} pandas_rows_built=0",
+        flush=True,
+    )
+    return output
+
+
 def execute_memmap_blocks(
     store: MinuteMemMapStore,
     nodes: Sequence[MinuteNode],
@@ -147,69 +384,24 @@ def execute_memmap_blocks(
             output[node.render()] = cached
     if not pending:
         return output
-    parts: dict[str, list[pd.Series]] = {node.render(): [] for node in pending}
-    if store.config.workers > 1:
-        specs = store.tile_specs(start_date, end_date)
-        print(
-            f"[MemMapReward] parallel_start workers={store.config.workers} "
-            f"year_stock_tiles={len(specs)} inner_blas_threads=1",
-            flush=True,
-        )
+    if store.config.reward_backend == "pandas":
+        computed_blocks = _run_pandas_blocks(store, pending, start_date, end_date)
+    else:
         try:
-            tile_results = Parallel(
-                n_jobs=store.config.workers,
-                backend="loky",
-                verbose=10,
-            )(
-                delayed(_compute_memmap_tile)(
-                    store.config, pending, spec, start_date, end_date
-                )
-                for spec in specs
-            )
-        except (PermissionError, NotImplementedError) as error:
+            computed_blocks = _execute_numpy_blocks(store, pending, start_date, end_date)
+        except UnsupportedNumpyNode as error:
+            if not store.config.numpy_fallback:
+                raise
             print(
-                f"[MemMapReward] loky_unavailable sequential_fallback=true "
-                f"error={type(error).__name__}: {error}",
+                f"[MemMapReward] numpy_unsupported pandas_fallback=true error={error}",
                 flush=True,
             )
-            tile_results = [
-                _compute_memmap_tile(
-                    store.config, pending, spec, start_date, end_date
-                )
-                for spec in specs
-            ]
-        for tile_index, computed in enumerate(tile_results, start=1):
-            for key, values in computed.items():
-                if not values.empty:
-                    parts[key].append(values)
-            if tile_index == 1 or tile_index == len(tile_results) or tile_index % 10 == 0:
-                print(
-                    f"[MemMapReward] parallel_progress "
-                    f"tiles={tile_index}/{len(tile_results)} new_blocks={len(pending):03d}",
-                    flush=True,
-                )
-    else:
-        executor = MinuteExpression(pending[0])
-        chunks = 0
-        for chunks, (_, _, frame) in enumerate(
-            store.iter_frames(start_date, end_date), start=1
-        ):
-            computed = executor.execute_blocks(pending, frame)
-            for key, values in computed.items():
-                parts[key].append(values)
-            if chunks == 1 or chunks % 100 == 0:
-                print(
-                    f"[MemMapReward] tile_complete index={chunks:05d} "
-                    f"new_blocks={len(pending):03d}",
-                    flush=True,
-                )
-        if chunks == 0:
-            raise ValueError("MemMap store returned no minute rows for the requested date range")
+            computed_blocks = _run_pandas_blocks(store, pending, start_date, end_date)
     for node in pending:
         key = node.render()
-        if not parts[key]:
+        if key not in computed_blocks or computed_blocks[key].empty:
             raise ValueError(f"MemMap produced no values for block: {key}")
-        values = pd.concat(parts[key]).sort_index()
+        values = computed_blocks[key].sort_index()
         values = values[~values.index.duplicated(keep="last")]
         cache.save(key, start_date, end_date, values)
         output[key] = values

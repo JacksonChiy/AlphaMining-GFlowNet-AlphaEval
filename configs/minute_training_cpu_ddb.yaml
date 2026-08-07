@@ -62,6 +62,12 @@ dataset:
     build_workers: 4
     # 训练阶段按year x stock_tile并行读取MemMap，与build_workers相互独立。
     workers: 4
+    # Reward直接在(day, minute, stock)数组上运行；不构造分钟Pandas长表。
+    reward_backend: numpy
+    # 每个任务最多处理20个交易日。越小进度越细、峰值内存越低，但任务调度更多。
+    reward_chunk_days: 20
+    # 若未来Grammar加入尚未迁移的算子，自动回退旧Pandas实现；当前92个动作均已支持。
+    numpy_fallback: true
     # 每批至少处理该数量的交易日后统一flush；实际批次不会小于build_workers。
     flush_every_days: 8
     force_rebuild: false

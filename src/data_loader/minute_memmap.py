@@ -41,12 +41,15 @@ class MinuteMemMapConfig:
     workers: int = 1
     build_workers: int = 1
     flush_every_days: int = 1
+    reward_chunk_days: int = 20
+    reward_backend: str = "numpy"
+    numpy_fallback: bool = True
     force_rebuild: bool = False
 
     def __post_init__(self) -> None:
         if min(
             self.expected_minutes, self.stock_tile_size, self.workers,
-            self.build_workers, self.flush_every_days,
+            self.build_workers, self.flush_every_days, self.reward_chunk_days,
         ) < 1:
             raise ValueError("MemMap size settings must be positive")
         actual = len(build_expected_minute_grid(
@@ -57,6 +60,8 @@ class MinuteMemMapConfig:
                 f"Configured minute grid contains {actual} points, "
                 f"expected_minutes={self.expected_minutes}"
             )
+        if self.reward_backend not in {"numpy", "pandas"}:
+            raise ValueError("reward_backend must be 'numpy' or 'pandas'")
 
     @property
     def minute_grid(self) -> tuple[str, ...]:
@@ -94,6 +99,9 @@ class MinuteMemMapConfig:
             workers=int(values.get("workers", 1)),
             build_workers=int(values.get("build_workers", 1)),
             flush_every_days=int(values.get("flush_every_days", 1)),
+            reward_chunk_days=int(values.get("reward_chunk_days", 20)),
+            reward_backend=str(values.get("reward_backend", "numpy")).lower(),
+            numpy_fallback=bool(values.get("numpy_fallback", True)),
             force_rebuild=bool(values.get("force_rebuild", False)),
         )
 
@@ -628,6 +636,51 @@ class MinuteMemMapStore:
             for year in years
             for stock_start in range(0, len(self.stocks), self.config.stock_tile_size)
         ]
+
+    def chunk_specs(
+        self,
+        start_date: str | pd.Timestamp,
+        end_date: str | pd.Timestamp,
+        chunk_days: int | None = None,
+    ) -> list[tuple[int, int, int, int, int]]:
+        """Return year-local day chunks crossed with stock tiles."""
+        start = pd.Timestamp(start_date).normalize()
+        end = pd.Timestamp(end_date).normalize()
+        days = int(chunk_days or self.config.reward_chunk_days)
+        specs: list[tuple[int, int, int, int, int]] = []
+        for year in sorted(int(value) for value in self.manifest["years"]):
+            dates = self._year_dates(year)
+            selected = np.flatnonzero((dates >= start) & (dates <= end))
+            if not len(selected):
+                continue
+            for offset in range(0, len(selected), days):
+                block = selected[offset:offset + days]
+                day_start, day_end = int(block[0]), int(block[-1]) + 1
+                for stock_start in range(0, len(self.stocks), self.config.stock_tile_size):
+                    specs.append((
+                        year, day_start, day_end, stock_start,
+                        min(stock_start + self.config.stock_tile_size, len(self.stocks)),
+                    ))
+        return specs
+
+    def read_numpy_chunk(
+        self,
+        spec: tuple[int, int, int, int, int],
+        channels: Sequence[str],
+    ) -> tuple[pd.DatetimeIndex, np.ndarray, dict[str, np.ndarray]]:
+        """Read only requested channels without constructing a Pandas minute frame."""
+        year, day_start, day_end, stock_start, stock_end = spec
+        unknown = sorted(set(channels).difference(MEMMAP_CHANNELS))
+        if unknown:
+            raise KeyError(f"Unknown MemMap channels: {unknown}")
+        dates = self._year_dates(year)[day_start:day_end]
+        key = np.s_[day_start:day_end, :, stock_start:stock_end]
+        mask = np.asarray(self._array(year, "valid_mask")[key], dtype=bool)
+        arrays = {
+            channel: np.asarray(self._array(year, channel)[key], dtype=np.float32)
+            for channel in channels
+        }
+        return dates, mask, arrays
 
     def iter_tile_frames(
         self,

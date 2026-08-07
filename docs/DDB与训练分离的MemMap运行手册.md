@@ -261,7 +261,9 @@ python scripts/train_cpu.py `
 ```text
 [MinuteGFlowNet] memmap_enabled remote_ddb_queries_during_training=0
 [MemMapReward] execution_plan ... remote_ddb_queries=0 coarse_screen=false
-[MemMapRead] progress=...
+[MemMapReward] numpy_start ... date_chunk_days=20 ... required_channels=.../19
+[MemMapReward] numpy_progress tasks=... rate=... eta=... partial_writes=...
+[MemMapReward] numpy_complete ... pandas_rows_built=0
 ```
 
 不应再出现：
@@ -273,10 +275,11 @@ python scripts/train_cpu.py `
 
 ## 11. Block持久化缓存
 
-每个日内Block保存为：
+计算中的小块和完成后的日内Block分别保存为：
 
 ```text
 E:\AlphaMining\block_cache\
+├── partials\日期范围哈希\表达式哈希\年份_日起_日止_股起_股止.npy
 ├── 表达式哈希.npy
 └── 表达式哈希.json
 ```
@@ -288,6 +291,24 @@ E:\AlphaMining\block_cache\
 ```
 
 同一数据源和日期范围下，重新运行训练可直接命中已有Block。源表、复权状态或日期范围发生变化时不会错误复用旧缓存。
+
+训练按`reward_chunk_days × stock_tile_size`切块。每完成一个小块便立即写入
+`partials`，因此关闭进程、Windows重启或训练异常后，重新执行同一命令会跳过已完成
+的小块。只有日内Reduce完成后的二维日频结果才转换为Pandas，远程DDB查询数始终为0。
+
+默认优化参数：
+
+```yaml
+memmap:
+  workers: 4
+  reward_backend: numpy
+  reward_chunk_days: 20
+  numpy_fallback: true
+```
+
+内存不足时先把`reward_chunk_days`调为10，再减少`stock_tile_size`；机械硬盘任务过碎时
+可把`reward_chunk_days`提高到40。`reward_backend: pandas`只用于结果核验或兼容未来尚未
+迁移的新算子，不建议正式训练使用。
 
 ## 12. 正式构建与训练
 

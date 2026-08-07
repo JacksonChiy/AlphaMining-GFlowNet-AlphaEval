@@ -20,6 +20,11 @@ from src.expression.minute import (
 )
 from src.gflownet.minute_grammar import MINUTE_ACTION_TOKENS, MinuteGrammarState, MinuteVocabulary
 from src.gflownet.model import GFlowNetPolicy, PolicyConfig
+from src.gflownet.numpy_minute_executor import (
+    NumpyMinuteBlockExecutor,
+    required_memmap_channels,
+)
+from src.data_loader.minute_memmap import MEMMAP_CHANNELS
 from src.operators.minute import build_minute_features
 from src.operators.minute import apply_reduce_binary, apply_reduce_unary
 
@@ -80,6 +85,68 @@ def test_all_chart_28_to_30_operator_paths_execute() -> None:
         result = minute_expression_from_tokens(tokens).execute(data)
         assert result.index.names == ["date", "code"]
         assert len(result) == 4
+
+
+def test_numpy_memmap_executor_matches_pandas_for_all_minute_operators() -> None:
+    data = _minute_prices().drop(index=[3, 78, 201]).reset_index(drop=True)
+    prepared = build_minute_features(data)
+    dates = pd.DatetimeIndex(sorted(prepared["date"].unique()))
+    stocks = np.array(sorted(prepared["code"].unique()))
+    minutes = sorted(prepared["datetime"].dt.time.astype(str).unique())
+    date_lookup = {value: index for index, value in enumerate(dates)}
+    stock_lookup = {value: index for index, value in enumerate(stocks)}
+    minute_lookup = {value: index for index, value in enumerate(minutes)}
+    shape = (len(dates), len(minutes), len(stocks))
+    mask = np.zeros(shape, dtype=bool)
+    channels = {name: np.full(shape, np.nan, dtype=np.float32) for name in MEMMAP_CHANNELS}
+    for row in prepared.itertuples():
+        key = (
+            date_lookup[pd.Timestamp(row.date)],
+            minute_lookup[str(row.datetime.time())],
+            stock_lookup[str(row.code)],
+        )
+        mask[key] = True
+        for name in MEMMAP_CHANNELS:
+            channels[name][key] = getattr(row, name)
+    expected_data = prepared.copy()
+    expected_data[list(MEMMAP_CHANNELS)] = expected_data[list(MEMMAP_CHANNELS)].astype(
+        np.float32
+    )
+    previous = expected_data.groupby(["date", "code"], observed=True)["close"].shift(1)
+    ratio = expected_data["close"].div(previous.where(previous.abs() > 1e-12))
+    expected_data["logret"] = np.log(ratio.where(ratio > 0))
+    expected_data["oc_ret"] = expected_data["close"].div(
+        expected_data["open"].where(expected_data["open"].abs() > 1e-12)
+    ) - 1.0
+    expected_data.attrs["minute_features_ready"] = True
+
+    token_sets: list[list[str]] = []
+    token_sets.extend([[operator, "close"] for operator in REDUCE_UNARY_OPS])
+    token_sets.extend([[operator, "close", "vol"] for operator in REDUCE_BINARY_OPS])
+    token_sets.extend([["r_mean", operator, "close"] for operator in MINUTE_UNARY_OPS])
+    token_sets.extend([["r_mean", operator, "W5", "close"] for operator in MINUTE_WINDOW_OPS])
+    token_sets.extend([["r_mean", operator, "close", "vol"] for operator in MINUTE_BINARY_OPS])
+    token_sets.extend([["r_mean", operator, "W5", "close"] for operator in MASK_WINDOW_OPS])
+    token_sets.extend([["r_mean", operator, "close"] for operator in MASK_UNARY_OPS])
+    token_sets.extend(
+        [["r_mean", operator, "W5", "close", "vol"] for operator in MASK_BINARY_WINDOW_OPS]
+    )
+    token_sets.extend([["r_mean", operator, "close", "vol"] for operator in MASK_BINARY_OPS])
+    token_sets.extend([
+        ["r_mean", "m_logret", "close"],
+        ["r_mean", "m_abs", "logret"],
+        ["r_mean", "m_add", "oc_ret", "ret"],
+    ])
+    full_index = pd.MultiIndex.from_product([dates, stocks], names=["date", "code"])
+    for tokens in token_sets:
+        expression = minute_expression_from_tokens(tokens)
+        node = expression.block_nodes()[0]
+        selected = required_memmap_channels([node])
+        actual = NumpyMinuteBlockExecutor(
+            mask, {name: channels[name] for name in selected}
+        ).execute([node])[node.render()].reshape(-1)
+        expected = expression.execute_block(node, expected_data).reindex(full_index).to_numpy()
+        assert np.allclose(actual, expected, rtol=2e-4, atol=2e-5, equal_nan=True), str(expression)
 
 
 def test_minute_delay_resets_at_each_trading_day() -> None:
