@@ -155,6 +155,11 @@ python -m scripts.run_daily_pipeline --pool-size 100
 使用`scripts/train_cpu.py`启动时，以上终端输出、警告和异常会同时实时写入
 `outputs.log_dir`，默认分钟DDB路径为`results/minute_cpu_ddb/logs/`。
 
+阿里 PPU/JupyterLab 节点可直接使用
+[07_train_minute_ppu_jupyterlab.ipynb](notebooks/07_train_minute_ppu_jupyterlab.ipynb)。
+Notebook 按“DDB构建与训练分离”模式运行本地 MemMap，使用独立后台进程训练，保留平台
+预装 PyTorch，并提供硬件检查、数据审计、运行时配置、日志跟踪和产物验收。
+
 ## GFlowNet 模型
 
 状态包含动作 Token、部分表达式、当前与最大深度、算子数量、特征数量及归一化节点统计。Transformer Encoder 预测下一个合法的特征、算子或窗口动作，非法文法动作会被屏蔽。训练目标为：
