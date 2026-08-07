@@ -335,6 +335,32 @@ memmap:
 使用标准64位Python 3.11或3.12虚拟环境；Windows embeddable发行版更适合程序嵌入，
 不建议作为长时间多进程训练环境。
 
+## 11.1 分钟算子向量化
+
+正式训练默认使用批量NumPy路径：
+
+- `m_rank`对无并列的有效组批量排序，存在并列值时保留平均排名精确路径；
+- `m_zscore`沿分钟轴批量计算样本标准差；
+- `m_ma`和`m_std`对完整241分钟组使用二维累计和，缺分钟组按有效行压缩计算；
+- `m_top`、`m_bot`、`m_xtreme`和条件掩码使用批量排名或分位数；
+- `r_corr`、`r_cov`、`r_wmean`、`r_skew`、`r_kurt`、`r_slope`、
+  `r_rsquare`、`r_argmax`使用批量中心化统计公式；
+- 上市前、退市后或全天无分钟记录的股票日直接跳过。
+
+所有滚动运算仍只使用当日当前分钟及之前的数据；日期和证券分组边界没有改变。
+可以用以下命令测试当前机器的单任务速度：
+
+```powershell
+python scripts/benchmark_minute_numpy.py `
+  --days 10 `
+  --minutes 241 `
+  --stocks 256 `
+  --repeats 5
+```
+
+输出中的`million_block_elements_per_second`用于比较同一台机器、相同Python环境和相同
+代码版本，不建议直接与不同CPU或不同任务形状的结果比较。
+
 ## 12. 正式构建与训练
 
 短区间验证通过后，将环境变量恢复到正式目录，配置恢复到完整日期：

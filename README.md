@@ -76,7 +76,7 @@ RQAlphaPlus 是授权软件，需要通过米筐授权渠道独立安装，详�
 
 ### DolphinDB分钟数据MemMap CPU训练
 
-`cpu-training`分支支持DDB与训练分离部署。远程DolphinDB只在首次构建时按交易日传输数据；构建器使用多线程独立DDB session并行写入不同交易日切片。训练服务器将19个分钟通道保存为按年组织的`float32 (n_days, 241, n_stocks)`本地MemMap；GFlowNet训练阶段不再连接DDB。Reward默认直接在NumPy三维数组上执行，只读取表达式需要的通道，并按日期小块持续打印进度。每个小块立即持久化，训练中断后可以续算；只有日内Reduce后的日频结果才转换为Pandas。旧Pandas执行器保留为显式兼容回退，不会创建原始分钟PKL。
+`cpu-training`分支支持DDB与训练分离部署。远程DolphinDB只在首次构建时按交易日传输数据；构建器使用多线程独立DDB session并行写入不同交易日切片。训练服务器将19个分钟通道保存为按年组织的`float32 (n_days, 241, n_stocks)`本地MemMap；GFlowNet训练阶段不再连接DDB。Reward默认直接在NumPy三维数组上执行，只读取表达式需要的通道，并按日期小块持续打印进度。排名、滚动、掩码、相关性、协方差、加权均值、高阶矩和趋势统计均提供批量向量化路径；全空组直接跳过，缺分钟与并列值保留精确兼容路径。每个小块立即持久化，训练中断后可以续算；只有日内Reduce后的日频结果才转换为Pandas。旧Pandas执行器保留为显式兼容回退，不会创建原始分钟PKL。
 
 ```bash
 python scripts/prepare_ddb_minute.py \
@@ -93,6 +93,12 @@ python scripts/build_ddb_memmap.py \
 python scripts/train_cpu.py \
   --mode minute \
   --config configs/minute_training_cpu_ddb.yaml
+```
+
+可在训练服务器运行分钟执行器基准：
+
+```bash
+python scripts/benchmark_minute_numpy.py --days 10 --minutes 241 --stocks 256 --repeats 5
 ```
 
 先运行`python scripts/build_ddb_memmap.py --config configs/minute_training_cpu_ddb.yaml`完成可断点续传构建，再运行CPU训练入口。正式运行前必须把结束日期改为数据库实际最后交易日，并确认OHLC已经复权后设置`prices_are_adjusted: true`。完整两机部署步骤见[DDB与训练分离的MemMap运行手册](docs/DDB与训练分离的MemMap运行手册.md)。

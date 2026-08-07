@@ -16,6 +16,7 @@ from src.expression.minute import (
     MINUTE_WINDOW_OPS,
     REDUCE_BINARY_OPS,
     REDUCE_UNARY_OPS,
+    MinuteExpression,
     minute_expression_from_tokens,
 )
 from src.gflownet.minute_grammar import MINUTE_ACTION_TOKENS, MinuteGrammarState, MinuteVocabulary
@@ -89,6 +90,7 @@ def test_all_chart_28_to_30_operator_paths_execute() -> None:
 
 def test_numpy_memmap_executor_matches_pandas_for_all_minute_operators() -> None:
     data = _minute_prices().drop(index=[3, 78, 201]).reset_index(drop=True)
+    data.loc[4, "close"] = data.loc[5, "close"]  # exercise average-rank tie fallback
     prepared = build_minute_features(data)
     dates = pd.DatetimeIndex(sorted(prepared["date"].unique()))
     stocks = np.array(sorted(prepared["code"].unique()))
@@ -147,6 +149,55 @@ def test_numpy_memmap_executor_matches_pandas_for_all_minute_operators() -> None
         ).execute([node])[node.render()].reshape(-1)
         expected = expression.execute_block(node, expected_data).reindex(full_index).to_numpy()
         assert np.allclose(actual, expected, rtol=2e-4, atol=2e-5, equal_nan=True), str(expression)
+
+
+def test_vectorized_reductions_are_stable_for_sparse_near_constant_groups() -> None:
+    days, minutes, stocks = 2, 70, 3
+    minute_axis = np.arange(minutes, dtype=np.float64)
+    close = np.empty((days, minutes, stocks), dtype=np.float32)
+    volume = np.empty_like(close)
+    for day in range(days):
+        for stock in range(stocks):
+            close[day, :, stock] = (
+                10_000.0 + stock * 100 + day + np.sin(minute_axis / 9.0) * 0.1
+            )
+            volume[day, :, stock] = 1_000.0 + minute_axis * (stock + 1)
+    mask = np.ones_like(close, dtype=bool)
+    mask[1, 5:10, 1] = False
+    mask[:, :, 2] = False
+    close[0, 12, 0] = np.nan
+    tokens = [
+        ["r_skew", "close"], ["r_kurt", "close"], ["r_slope", "close"],
+        ["r_rsquare", "close"], ["r_argmax", "close"],
+        ["r_corr", "close", "vol"], ["r_cov", "close", "vol"],
+        ["r_wmean", "close", "vol"],
+    ]
+    nodes = [minute_expression_from_tokens(value).block_nodes()[0] for value in tokens]
+    actual = NumpyMinuteBlockExecutor(
+        mask, {"close": close, "vol": volume}
+    ).execute(nodes)
+
+    dates = pd.bdate_range("2024-01-02", periods=days)
+    codes = [f"S{index}" for index in range(stocks)]
+    rows = []
+    for day in range(days):
+        for stock in range(stocks):
+            for minute in range(minutes):
+                if mask[day, minute, stock]:
+                    rows.append({
+                        "date": dates[day], "code": codes[stock],
+                        "close": close[day, minute, stock],
+                        "vol": volume[day, minute, stock],
+                    })
+    frame = pd.DataFrame(rows)
+    frame.attrs["minute_features_ready"] = True
+    full_index = pd.MultiIndex.from_product([dates, codes], names=["date", "code"])
+    for node in nodes:
+        expected = MinuteExpression(node).execute_block(node, frame).reindex(full_index)
+        assert np.allclose(
+            actual[node.render()].reshape(-1), expected.to_numpy(),
+            rtol=2e-5, atol=2e-6, equal_nan=True,
+        ), node.render()
 
 
 def test_minute_delay_resets_at_each_trading_day() -> None:

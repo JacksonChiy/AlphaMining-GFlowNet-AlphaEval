@@ -166,7 +166,7 @@ class NumpyMinuteBlockExecutor:
         complete = masks.all(axis=1)
         if periods < groups.shape[1] and complete.any():
             output[complete, periods:] = groups[complete, :-periods]
-        for index in np.flatnonzero(~complete):
+        for index in np.flatnonzero(masks.any(axis=1) & ~complete):
             positions = np.flatnonzero(masks[index])
             if len(positions) > periods:
                 output[index, positions[periods:]] = groups[index, positions[:-periods]]
@@ -183,18 +183,59 @@ class NumpyMinuteBlockExecutor:
         if name == "m_log":
             return np.log(np.abs(values) + EPS)
         groups = self._groups(values)
+        if name == "m_zscore":
+            with warnings.catch_warnings(), np.errstate(all="ignore"):
+                warnings.simplefilter("ignore", RuntimeWarning)
+                mean = np.nanmean(groups, axis=1, keepdims=True)
+                std = np.nanstd(groups, axis=1, ddof=1, keepdims=True)
+            output = np.divide(
+                groups - mean,
+                std,
+                out=np.full_like(groups, np.nan, dtype=np.float64),
+                where=std > EPS,
+            )
+            return self._restore(output)
+        if name != "m_rank":
+            raise UnsupportedNumpyNode(f"Unsupported minute unary: {name}")
         output = np.full_like(groups, np.nan, dtype=np.float64)
-        for index, row in enumerate(groups):
+        finite = np.isfinite(groups)
+        active = finite.any(axis=1)
+        active_index = np.flatnonzero(active)
+        active_groups = groups[active]
+        active_finite = finite[active]
+        count = active_finite.sum(axis=1)
+        order = np.argsort(
+            np.where(active_finite, active_groups, np.inf), axis=1, kind="stable"
+        )
+        sorted_values = np.take_along_axis(active_groups, order, axis=1)
+        sorted_finite = np.take_along_axis(active_finite, order, axis=1)
+        has_ties = np.any(
+            (np.diff(sorted_values, axis=1) == 0)
+            & sorted_finite[:, 1:] & sorted_finite[:, :-1],
+            axis=1,
+        )
+        fast = ~has_ties
+        if fast.any():
+            fast_order = order[fast]
+            ranks = np.empty_like(fast_order, dtype=np.float64)
+            np.put_along_axis(
+                ranks,
+                fast_order,
+                np.broadcast_to(
+                    np.arange(1, groups.shape[1] + 1, dtype=np.float64),
+                    fast_order.shape,
+                ),
+                axis=1,
+            )
+            fast_output = ranks / count[fast, None]
+            fast_output[~active_finite[fast]] = np.nan
+            output[active_index[fast]] = fast_output
+        for active_row in np.flatnonzero(has_ties):
+            index = active_index[active_row]
+            row = active_groups[active_row]
             valid = np.isfinite(row)
             clean = row[valid]
-            if name == "m_rank":
-                output[index, valid] = self._rank(clean, average=True) / len(clean) if len(clean) else np.nan
-            elif name == "m_zscore" and len(clean):
-                std = clean.std(ddof=1) if len(clean) > 1 else np.nan
-                if std > EPS:
-                    output[index, valid] = (clean - clean.mean()) / std
-            elif name not in {"m_rank", "m_zscore"}:
-                raise UnsupportedNumpyNode(f"Unsupported minute unary: {name}")
+            output[index, valid] = self._rank(clean, average=True) / len(clean)
         return self._restore(output)
 
     @staticmethod
@@ -224,7 +265,13 @@ class NumpyMinuteBlockExecutor:
         groups, masks = self._groups(values), self._groups(self.mask)
         output = np.full_like(groups, np.nan, dtype=np.float64)
         minimum = max(2, window // 2)
-        for index, row in enumerate(groups):
+        complete = masks.all(axis=1)
+        if complete.any():
+            output[complete] = self._rolling_dense(
+                groups[complete], window, minimum, standard_deviation=name == "m_std"
+            )
+        for index in np.flatnonzero(masks.any(axis=1) & ~complete):
+            row = groups[index]
             positions = np.flatnonzero(masks[index])
             compact = row[positions]
             finite = np.isfinite(compact)
@@ -250,6 +297,49 @@ class NumpyMinuteBlockExecutor:
         return self._restore(output)
 
     @staticmethod
+    def _rolling_dense(
+        groups: np.ndarray,
+        window: int,
+        minimum: int,
+        standard_deviation: bool,
+    ) -> np.ndarray:
+        """Vectorized Pandas-compatible rolling path for complete minute grids."""
+        finite = np.isfinite(groups)
+        clean = np.where(finite, groups, 0.0)
+        zeros = np.zeros((len(groups), 1), dtype=np.float64)
+        sums = np.concatenate((zeros, np.cumsum(clean, axis=1)), axis=1)
+        counts = np.concatenate(
+            (np.zeros((len(groups), 1), dtype=np.int32), np.cumsum(finite, axis=1)),
+            axis=1,
+        )
+        right = np.arange(1, groups.shape[1] + 1)
+        left = np.maximum(0, right - window)
+        count = counts[:, right] - counts[:, left]
+        total = sums[:, right] - sums[:, left]
+        valid = count >= minimum
+        output = np.full_like(groups, np.nan, dtype=np.float64)
+        if not standard_deviation:
+            np.divide(total, count, out=output, where=valid)
+            return output
+        sums2 = np.concatenate(
+            (zeros, np.cumsum(clean * clean, axis=1)), axis=1
+        )
+        square_total = sums2[:, right] - sums2[:, left]
+        variance = np.divide(
+            square_total - np.divide(
+                total * total,
+                count,
+                out=np.zeros_like(total),
+                where=count > 0,
+            ),
+            count - 1,
+            out=np.full_like(total, np.nan),
+            where=valid,
+        )
+        output[valid] = np.sqrt(np.maximum(variance[valid], 0.0))
+        return output
+
+    @staticmethod
     def _minute_binary(name: str, left: np.ndarray, right: np.ndarray) -> np.ndarray:
         if name == "m_add": return left + right
         if name == "m_sub": return left - right
@@ -265,14 +355,36 @@ class NumpyMinuteBlockExecutor:
 
     def _rank_mask(self, values: np.ndarray, window: int, largest: bool) -> np.ndarray:
         groups = self._groups(values)
+        finite = np.isfinite(groups)
+        active = finite.any(axis=1)
         selected = np.zeros_like(groups, dtype=bool)
-        for index, row in enumerate(groups):
-            valid = np.isfinite(row)
-            clean = row[valid]
-            if len(clean):
-                ranks = self._rank(-clean if largest else clean, average=False)
-                selected[index, np.flatnonzero(valid)] = ranks <= window
+        if not active.any():
+            return self._restore(selected)
+        active_groups = groups[active]
+        active_finite = finite[active]
+        key = -active_groups if largest else active_groups
+        order = np.argsort(
+            np.where(active_finite, key, np.inf), axis=1, kind="stable"
+        )
+        ranks = np.empty_like(order, dtype=np.int32)
+        np.put_along_axis(
+            ranks,
+            order,
+            np.broadcast_to(
+                np.arange(1, groups.shape[1] + 1, dtype=np.int32), order.shape
+            ),
+            axis=1,
+        )
+        selected[active] = active_finite & (ranks <= window)
         return self._restore(selected)
+
+    @staticmethod
+    def _row_quantile(groups: np.ndarray, quantile: float) -> np.ndarray:
+        output = np.full((len(groups), 1), np.nan, dtype=np.float64)
+        active = np.isfinite(groups).any(axis=1)
+        if active.any():
+            output[active, 0] = np.nanquantile(groups[active], quantile, axis=1)
+        return output
 
     def _mask_window(self, name: str, values: np.ndarray, window: int) -> np.ndarray:
         groups, (ordinal, sizes) = self._position_layout()
@@ -284,9 +396,7 @@ class NumpyMinuteBlockExecutor:
         elif name in {"m_top", "m_bot"}:
             return np.where(self._rank_mask(values, window, name == "m_top"), values, np.nan)
         elif name == "m_xtreme":
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                median = np.nanmedian(self._groups(values), axis=1)[:, None]
+            median = self._row_quantile(self._groups(values), 0.5)
             deviation = self._restore(np.abs(self._groups(values) - median))
             return np.where(self._rank_mask(deviation, window, True), values, np.nan)
         else:
@@ -296,15 +406,11 @@ class NumpyMinuteBlockExecutor:
     def _mask_unary(self, name: str, values: np.ndarray) -> np.ndarray:
         groups = self._groups(values)
         if name in {"m_above", "m_below"}:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                median = np.nanmedian(groups, axis=1)[:, None]
+            median = self._row_quantile(groups, 0.5)
             selected = groups > median if name == "m_above" else groups < median
         elif name in {"m_inner", "m_outer"}:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                q1 = np.nanquantile(groups, 0.25, axis=1)[:, None]
-                q3 = np.nanquantile(groups, 0.75, axis=1)[:, None]
+            q1 = self._row_quantile(groups, 0.25)
+            q3 = self._row_quantile(groups, 0.75)
             selected = (groups >= q1) & (groups <= q3)
             if name == "m_outer": selected = (groups < q1) | (groups > q3)
         else:
@@ -321,9 +427,7 @@ class NumpyMinuteBlockExecutor:
             selected = condition > 0
         elif name == "m_when_gt":
             groups = self._groups(condition)
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                median = np.nanmedian(groups, axis=1)[:, None]
+            median = self._row_quantile(groups, 0.5)
             selected = self._restore(groups > median)
         else:
             raise UnsupportedNumpyNode(f"Unsupported binary mask: {name}")
@@ -356,50 +460,98 @@ class NumpyMinuteBlockExecutor:
 
     @staticmethod
     def _complex_reduce(name: str, groups: np.ndarray, source: np.ndarray) -> np.ndarray:
+        finite = np.isfinite(groups)
+        count = finite.sum(axis=1).astype(np.float64)
+        clean = np.where(finite, groups, 0.0)
         output = np.full(len(groups), np.nan)
-        for index, row in enumerate(groups):
-            positions = np.flatnonzero(np.isfinite(row))
-            clean = row[positions]
-            n = len(clean)
-            if not n: continue
-            if name == "r_argmax":
-                source_ordinal = np.cumsum(source[index]) - 1
-                output[index] = source_ordinal[positions[np.argmax(clean)]] / max(1, int(source[index].sum()) - 1)
-            elif name == "r_skew" and n >= 3:
-                centered = clean - clean.mean(); m2 = np.mean(centered ** 2)
-                output[index] = 0.0 if m2 <= EPS else np.sqrt(n * (n - 1)) / (n - 2) * np.mean(centered ** 3) / m2 ** 1.5
-            elif name == "r_kurt" and n >= 4:
-                centered = clean - clean.mean(); m2 = np.mean(centered ** 2)
-                if m2 <= EPS: output[index] = 0.0
-                else:
-                    g2 = np.mean(centered ** 4) / (m2 * m2) - 3.0
-                    output[index] = (n - 1) / ((n - 2) * (n - 3)) * ((n + 1) * g2 + 6.0)
-            elif name in {"r_slope", "r_rsquare"} and n >= 2:
-                x = np.arange(n, dtype=float); xc = x - x.mean(); yc = clean - clean.mean()
-                denominator = float(xc @ xc)
-                slope = float(xc @ yc / denominator) if denominator > EPS else np.nan
-                if name == "r_slope": output[index] = slope
-                else:
-                    total = float(yc @ yc)
-                    residual = float(np.square(clean - (clean.mean() + slope * xc)).sum())
-                    output[index] = 1.0 - residual / total if total > EPS else np.nan
-        return output
+        if name == "r_argmax":
+            position = np.argmax(np.where(finite, groups, -np.inf), axis=1)
+            ordinal = np.cumsum(source, axis=1) - 1
+            numerator = ordinal[np.arange(len(groups)), position]
+            denominator = np.maximum(1, source.sum(axis=1) - 1)
+            output[count > 0] = numerator[count > 0] / denominator[count > 0]
+            return output
+        total = clean.sum(axis=1)
+        mean = np.divide(total, count, out=np.zeros_like(total), where=count > 0)
+        centered = np.where(finite, groups - mean[:, None], 0.0)
+        centered2 = centered * centered
+        second_sum = centered2.sum(axis=1)
+        m2 = np.divide(second_sum, count, out=np.zeros_like(total), where=count > 0)
+        if name == "r_skew":
+            third_sum = (centered2 * centered).sum(axis=1)
+            m3 = np.divide(third_sum, count, out=np.zeros_like(total), where=count > 0)
+            eligible = count >= 3
+            constant = eligible & (m2 <= EPS)
+            output[constant] = 0.0
+            variable = eligible & (m2 > EPS)
+            output[variable] = (
+                np.sqrt(count[variable] * (count[variable] - 1)) /
+                (count[variable] - 2) * m3[variable] / m2[variable] ** 1.5
+            )
+            return output
+        if name == "r_kurt":
+            fourth_sum = (centered2 * centered2).sum(axis=1)
+            m4 = np.divide(fourth_sum, count, out=np.zeros_like(total), where=count > 0)
+            eligible = count >= 4
+            constant = eligible & (m2 <= EPS)
+            output[constant] = 0.0
+            variable = eligible & (m2 > EPS)
+            g2 = m4[variable] / (m2[variable] ** 2) - 3.0
+            n = count[variable]
+            output[variable] = (n - 1) / ((n - 2) * (n - 3)) * ((n + 1) * g2 + 6.0)
+            return output
+        if name in {"r_slope", "r_rsquare"}:
+            x = np.cumsum(finite, axis=1) - 1
+            x = np.where(finite, x, 0.0)
+            x_centered = np.where(finite, x - (count[:, None] - 1) / 2.0, 0.0)
+            cross = (x_centered * centered).sum(axis=1)
+            ssx = (x_centered * x_centered).sum(axis=1)
+            slope = np.divide(cross, ssx, out=np.full_like(cross, np.nan), where=ssx > EPS)
+            eligible = count >= 2
+            if name == "r_slope":
+                output[eligible] = slope[eligible]
+            else:
+                ssy = second_sum
+                valid = eligible & (ssy > EPS) & (ssx > EPS)
+                output[valid] = cross[valid] ** 2 / (ssx[valid] * ssy[valid])
+            return output
+        raise UnsupportedNumpyNode(f"Unsupported complex reduction: {name}")
 
     def _reduce_binary(self, name: str, left: np.ndarray, right: np.ndarray) -> np.ndarray:
         xgroups, ygroups = self._groups(left), self._groups(right)
+        valid = np.isfinite(xgroups) & np.isfinite(ygroups)
+        count = valid.sum(axis=1).astype(np.float64)
+        x = np.where(valid, xgroups, 0.0)
+        y = np.where(valid, ygroups, 0.0)
+        sum_x, sum_y = x.sum(axis=1), y.sum(axis=1)
+        product_sum = (x * y).sum(axis=1)
         output = np.full(len(xgroups), np.nan)
-        for index, (x, y) in enumerate(zip(xgroups, ygroups)):
-            valid = np.isfinite(x) & np.isfinite(y); x, y = x[valid], y[valid]
-            if name == "r_wmean":
-                denominator = float(y.sum())
-                if abs(denominator) > EPS: output[index] = float(x @ y / denominator)
-                continue
-            if len(x) < 2: continue
-            xc, yc = x - x.mean(), y - y.mean(); cross = float(xc @ yc)
-            if name == "r_cov": output[index] = cross / (len(x) - 1)
-            elif name == "r_corr":
-                denominator = float(np.sqrt((xc @ xc) * (yc @ yc)))
-                if denominator > EPS: output[index] = cross / denominator
-            else: raise UnsupportedNumpyNode(f"Unsupported binary reduction: {name}")
+        if name == "r_wmean":
+            np.divide(product_sum, sum_y, out=output, where=np.abs(sum_y) > EPS)
+        elif name in {"r_cov", "r_corr"}:
+            mean_x = np.divide(
+                sum_x, count, out=np.zeros_like(sum_x), where=count > 0
+            )
+            mean_y = np.divide(
+                sum_y, count, out=np.zeros_like(sum_y), where=count > 0
+            )
+            x_centered = np.where(valid, xgroups - mean_x[:, None], 0.0)
+            y_centered = np.where(valid, ygroups - mean_y[:, None], 0.0)
+            cross = (x_centered * y_centered).sum(axis=1)
+            eligible = count >= 2
+            if name == "r_cov":
+                np.divide(cross, count - 1, out=output, where=eligible)
+            else:
+                ssx = (x_centered * x_centered).sum(axis=1)
+                ssy = (y_centered * y_centered).sum(axis=1)
+                denominator = np.sqrt(np.maximum(ssx * ssy, 0.0))
+                np.divide(
+                    cross,
+                    denominator,
+                    out=output,
+                    where=eligible & (denominator > EPS),
+                )
+        else:
+            raise UnsupportedNumpyNode(f"Unsupported binary reduction: {name}")
         days, _, stocks = self.mask.shape
         return output.reshape(days, stocks)
