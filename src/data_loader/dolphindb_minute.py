@@ -6,7 +6,7 @@ import os
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping, Protocol
+from typing import Any, Mapping, Protocol, Sequence
 
 import numpy as np
 import pandas as pd
@@ -608,13 +608,71 @@ class DolphinDBMinuteLoader:
             "group by date, sym order by date, sym"
         )
 
-    def build_data_sql(self, start: pd.Timestamp, end: pd.Timestamp) -> str:
+    def build_data_sql(
+        self,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+        *,
+        columns: Sequence[str] | None = None,
+        time_filter_sql: str | None = None,
+        order_by: bool = True,
+    ) -> str:
         start_literal, end_literal = start.strftime("%Y.%m.%d"), end.strftime("%Y.%m.%d")
-        columns = ", ".join(SOURCE_COLUMNS)
+        selected = tuple(columns or SOURCE_COLUMNS)
+        unsupported = sorted(set(selected).difference(SOURCE_COLUMNS))
+        if unsupported:
+            raise ValueError(f"Unsupported DolphinDB minute columns: {unsupported}")
+        if not selected:
+            raise ValueError("DolphinDB minute query requires at least one column")
+        selected_sql = ", ".join(selected)
+        time_filter = f", ({time_filter_sql})" if time_filter_sql else ""
+        ordering = " order by date, sym, time" if order_by else ""
         return (
-            f"select {columns} from {self.table_expression} "
-            f"where date >= {start_literal}, date <= {end_literal} "
-            "order by date, sym, time"
+            f"select {selected_sql} from {self.table_expression} "
+            f"where date >= {start_literal}, date <= {end_literal}{time_filter}"
+            f"{ordering}"
+        )
+
+    def assert_no_duplicate_minute_keys(
+        self,
+        start_date: str | pd.Timestamp | None = None,
+        end_date: str | pd.Timestamp | None = None,
+        *,
+        time_filter_sql: str | None = None,
+    ) -> None:
+        """Check duplicate keys once in DDB before the fast unsorted load path."""
+        trade_dates = self.load_trade_dates(start_date, end_date)
+        chunks = [
+            trade_dates[index:index + self.config.audit_chunk_days]
+            for index in range(0, len(trade_dates), self.config.audit_chunk_days)
+        ]
+        for index, chunk in enumerate(chunks, start=1):
+            start, end = pd.Timestamp(chunk[0]), pd.Timestamp(chunk[-1])
+            time_filter = f", ({time_filter_sql})" if time_filter_sql else ""
+            script = (
+                "select top 1 date, sym, time, count(*) as duplicateCount from "
+                f"{self.table_expression} where date >= {start:%Y.%m.%d}, "
+                f"date <= {end:%Y.%m.%d}{time_filter} group by date, sym, time "
+                "having count(*) > 1 // ALPHAMINING_QUALITY_DUPLICATES_V1"
+            )
+            duplicates = pd.DataFrame(self.session.run(script))
+            if not duplicates.empty:
+                row = duplicates.iloc[0]
+                raise ValueError(
+                    "DolphinDB contains duplicate minute keys in the configured grid: "
+                    f"date={row.get('date')}, sym={row.get('sym')}, "
+                    f"time={row.get('time')}, count={row.get('duplicateCount')}. "
+                    "Run scripts/audit_ddb_minute_quality.py for the full report."
+                )
+            if index == 1 or index == len(chunks) or index % 25 == 0:
+                print(
+                    f"[DDB] duplicate_audit_progress chunks={index}/{len(chunks)} "
+                    f"dates={start.date()}..{end.date()}",
+                    flush=True,
+                )
+        print(
+            f"[DDB] duplicate_audit_complete dates={len(trade_dates):,} duplicates=0",
+            flush=True,
         )
 
     def build_stats_sql(self, start: pd.Timestamp, end: pd.Timestamp) -> str:

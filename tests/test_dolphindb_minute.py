@@ -22,6 +22,7 @@ from src.data_loader.minute_memmap import (
     MEMMAP_CHANNELS,
     MinuteMemMapConfig,
     MinuteMemMapStore,
+    _build_dense_minute_channels,
 )
 from src.data_loader.minute_quality_audit import (
     DolphinDBMinuteQualityAuditor,
@@ -38,6 +39,7 @@ from src.gflownet.minute_factor_pool import (
     save_minute_alpha_pool_from_dolphindb_stream,
 )
 from src.gflownet.minute_reward import DolphinDBStreamingMinuteRewardEvaluator
+from src.operators.minute import build_minute_features
 
 
 def _source_minutes() -> pd.DataFrame:
@@ -404,6 +406,7 @@ def test_ddb_to_local_memmap_build_read_and_persistent_block_cache(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["complete"] is True
     assert (memmap_config.root / "field_audit.json").exists()
+    assert (memmap_config.root / "duplicate_key_audit.json").exists()
     assert manifest["n_minutes"] == 3
     assert manifest["n_stocks"] == 2
     assert set(manifest["channels"]) == set(MEMMAP_CHANNELS)
@@ -417,10 +420,13 @@ def test_ddb_to_local_memmap_build_read_and_persistent_block_cache(
     assert all("minute(time)" in script for script in daily_scripts)
     assert worker_sessions
     assert all(worker.closed for worker in worker_sessions)
-    assert sum(
-        "select sym, date, time" in script
-        for worker in worker_sessions for script in worker.scripts
-    ) == 2
+    fast_load_scripts = [
+        script for worker in worker_sessions for script in worker.scripts
+        if script.startswith("select sym, time, open")
+    ]
+    assert len(fast_load_scripts) == 2
+    assert all("minute(time)" in script for script in fast_load_scripts)
+    assert all("order by" not in script for script in fast_load_scripts)
 
     manifest["complete"] = False
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -429,6 +435,10 @@ def test_ddb_to_local_memmap_build_read_and_persistent_block_cache(
         loader, memmap_config, loader_factory=loader_factory
     ).build()
     assert not [script for script in session.scripts if "select first(open)" in script]
+    assert not [
+        script for script in session.scripts
+        if "ALPHAMINING_QUALITY_DUPLICATES_V1" in script
+    ]
 
     store = MinuteMemMapStore(memmap_config)
     frames = [frame for _, _, frame in store.iter_frames("2024-01-02", "2024-01-03")]
@@ -514,6 +524,45 @@ def test_ddb_to_local_memmap_build_read_and_persistent_block_cache(
         parallel_cache,
     )
     assert np.allclose(parallel_blocks["r_mean(close)"].sort_index(), expected)
+
+
+def test_dense_numpy_day_loader_matches_pandas_features_with_missing_minutes() -> None:
+    source = _source_minutes()
+    source = source.loc[
+        ~(
+            source["sym"].eq("000001.SZ")
+            & source["date"].eq(pd.Timestamp("2024-01-02"))
+            & source["time"].eq(dt.time(9, 31))
+        )
+    ].copy()
+    source = source.loc[source["date"].eq(pd.Timestamp("2024-01-02"))]
+    minute_lookup = {f"09:{minute:02d}:00": minute - 30 for minute in range(30, 33)}
+    stocks = ["000001.SZ", "000002.SZ"]
+    channels, mask, metrics = _build_dense_minute_channels(
+        source, stocks, minute_lookup
+    )
+    expected = build_minute_features(normalize_dolphindb_minutes(source))
+    for channel in MEMMAP_CHANNELS:
+        actual_values = []
+        expected_values = []
+        for row in expected.itertuples():
+            minute_index = minute_lookup[row.datetime.strftime("%H:%M:%S")]
+            stock_index = stocks.index(row.code)
+            actual_values.append(channels[channel][minute_index, stock_index])
+            expected_values.append(getattr(row, channel))
+        assert np.allclose(actual_values, expected_values, equal_nan=True), channel
+    assert int(mask.sum()) == len(expected)
+    assert metrics["excluded_rows"] == 0
+
+
+def test_fast_load_duplicate_audit_rejects_duplicate_keys(tmp_path) -> None:
+    source = _source_minutes()
+    source = pd.concat([source, source.iloc[[0]]], ignore_index=True)
+    loader = DolphinDBMinuteLoader(_config(tmp_path), FakeDolphinDBSession(source))
+    with pytest.raises(ValueError, match="duplicate minute keys"):
+        loader.assert_no_duplicate_minute_keys(
+            "2024-01-02", "2024-01-03", time_filter_sql="minute(time) >= 09:30m"
+        )
 
 
 def test_ddb_direct_ram_store_shares_arrays_without_raw_minute_files(

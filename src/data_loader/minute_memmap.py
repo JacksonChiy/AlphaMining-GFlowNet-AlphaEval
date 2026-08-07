@@ -13,9 +13,9 @@ from typing import Any, Callable, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
-from src.operators.minute import build_minute_features, validate_minute_data
+from src.operators.minute import EPS, validate_minute_data
 
-from .dolphindb_minute import DolphinDBMinuteLoader, normalize_dolphindb_minutes
+from .dolphindb_minute import DolphinDBMinuteLoader
 from .minute_quality_audit import (
     DEFAULT_MINUTE_EXTRA_TIMES,
     DEFAULT_MINUTE_SESSIONS,
@@ -29,11 +29,14 @@ MEMMAP_CHANNELS = (
     "signed_vol", "signed_amt", "typical", "vwap_cum", "twap", "obv", "pvt",
 )
 MEMMAP_FORMAT_VERSION = 1
+FAST_LOAD_SOURCE_COLUMNS = (
+    "sym", "time", "open", "high", "low", "close", "volume", "amount",
+)
 LOAD_TIMING_KEYS = (
     "ddb_query_s",
-    "normalize_filter_s",
-    "feature_s",
-    "index_validate_s",
+    "decode_index_s",
+    "base_matrix_s",
+    "numpy_feature_s",
     "memory_write_s",
 )
 
@@ -139,6 +142,191 @@ def _time_key(value: Any) -> str:
     return parsed.strftime("%H:%M:%S")
 
 
+def _configured_minute_numbers(minute_lookup: Mapping[str, int]) -> np.ndarray:
+    lookup = np.full(24 * 60, -1, dtype=np.int16)
+    for value, index in minute_lookup.items():
+        parsed = pd.Timestamp(f"2000-01-01 {value}")
+        lookup[parsed.hour * 60 + parsed.minute] = int(index)
+    return lookup
+
+
+def _minute_numbers(values: pd.Series) -> np.ndarray:
+    """Decode common DolphinDB time representations without per-row pandas parsing."""
+    if pd.api.types.is_timedelta64_dtype(values.dtype):
+        raw = values.to_numpy(dtype="timedelta64[m]").astype(np.int64)
+        raw[values.isna().to_numpy()] = -1
+        return raw
+    if pd.api.types.is_datetime64_any_dtype(values.dtype):
+        parsed = values.dt
+        output = (parsed.hour * 60 + parsed.minute).to_numpy(dtype=np.float64)
+        return np.where(np.isfinite(output), output, -1).astype(np.int64)
+    if pd.api.types.is_numeric_dtype(values.dtype):
+        raw = pd.to_numeric(values, errors="coerce").to_numpy(dtype=np.float64)
+        finite = raw[np.isfinite(raw)]
+        maximum = float(np.max(np.abs(finite))) if finite.size else 0.0
+        divisor = 1.0
+        if maximum > 86_400_000:
+            divisor = 60_000_000_000.0
+        elif maximum > 86_400:
+            divisor = 60_000.0
+        elif maximum > 1_440:
+            divisor = 60.0
+        return np.where(np.isfinite(raw), np.floor(raw / divisor), -1).astype(np.int64)
+
+    def decode(value: Any) -> int:
+        if value is None or value is pd.NaT:
+            return -1
+        if hasattr(value, "hour") and hasattr(value, "minute"):
+            return int(value.hour) * 60 + int(value.minute)
+        text = str(value).strip()
+        match = text.rsplit(" ", 1)[-1].split(":")
+        if len(match) >= 2 and match[0][-2:].isdigit() and match[1][:2].isdigit():
+            return int(match[0][-2:]) * 60 + int(match[1][:2])
+        parsed = pd.to_datetime(text, errors="coerce")
+        return -1 if pd.isna(parsed) else int(parsed.hour) * 60 + int(parsed.minute)
+
+    return np.fromiter((decode(value) for value in values.array), dtype=np.int64, count=len(values))
+
+
+def _numeric_values(values: pd.Series) -> np.ndarray:
+    raw = values.to_numpy(copy=False)
+    if np.issubdtype(raw.dtype, np.number):
+        return raw.astype(np.float64, copy=False)
+    return pd.to_numeric(values, errors="coerce").to_numpy(dtype=np.float64)
+
+
+def _safe_divide_array(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    return np.divide(
+        left,
+        right,
+        out=np.full(left.shape, np.nan, dtype=np.float64),
+        where=np.isfinite(left) & np.isfinite(right) & (np.abs(right) > EPS),
+    )
+
+
+def _previous_observed(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    minute_positions = np.arange(values.shape[0], dtype=np.int32)[:, None]
+    last_seen = np.maximum.accumulate(
+        np.where(mask, minute_positions, -1), axis=0
+    )
+    previous = np.empty_like(last_seen)
+    previous[0, :] = -1
+    previous[1:, :] = last_seen[:-1, :]
+    output = np.take_along_axis(values, np.maximum(previous, 0), axis=0)
+    output[previous < 0] = np.nan
+    return output
+
+
+def _skipna_cumsum(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    finite = mask & np.isfinite(values)
+    cumulative = np.cumsum(np.where(finite, values, 0.0), axis=0)
+    return np.where(finite, cumulative, np.nan)
+
+
+def _build_dense_minute_channels(
+    frame: pd.DataFrame,
+    stock_codes: Sequence[str],
+    minute_lookup: Mapping[str, int],
+) -> tuple[dict[str, np.ndarray], np.ndarray, dict[str, float | int]]:
+    """Map one raw DDB day directly to dense arrays and derive all stored leaves."""
+    missing = sorted(set(FAST_LOAD_SOURCE_COLUMNS).difference(frame.columns))
+    if missing:
+        raise ValueError(f"DolphinDB fast minute query is missing columns: {missing}")
+    decode_started = time.perf_counter()
+    minute_numbers = _minute_numbers(frame["time"])
+    minute_number_lookup = _configured_minute_numbers(minute_lookup)
+    minute_index = np.full(len(frame), -1, dtype=np.int64)
+    valid_minute_number = (minute_numbers >= 0) & (minute_numbers < len(minute_number_lookup))
+    minute_index[valid_minute_number] = minute_number_lookup[minute_numbers[valid_minute_number]]
+
+    categories = pd.Index(np.asarray(stock_codes, dtype=str))
+    stock_index = pd.Categorical(frame["sym"], categories=categories).codes.astype(
+        np.int64, copy=False
+    )
+    if np.any(stock_index < 0):
+        cleaned = frame["sym"].astype("string").str.strip()
+        stock_index = pd.Categorical(cleaned, categories=categories).codes.astype(
+            np.int64, copy=False
+        )
+    numeric = {
+        name: _numeric_values(frame[source])
+        for name, source in (
+            ("open", "open"), ("high", "high"), ("low", "low"),
+            ("close", "close"), ("vol", "volume"), ("amount", "amount"),
+        )
+    }
+    valid = (minute_index >= 0) & (stock_index >= 0)
+    valid &= np.isfinite(numeric["open"]) & (numeric["open"] > 0)
+    valid &= np.isfinite(numeric["high"]) & (numeric["high"] > 0)
+    valid &= np.isfinite(numeric["low"]) & (numeric["low"] > 0)
+    valid &= np.isfinite(numeric["close"]) & (numeric["close"] > 0)
+    valid &= numeric["low"] <= numeric["high"]
+    if not valid.any():
+        raise ValueError("DolphinDB fast minute query produced no valid configured rows")
+    numeric["vol"] = np.clip(numeric["vol"], 0.0, None)
+    numeric["amount"] = np.clip(numeric["amount"], 0.0, None)
+    decode_index_s = time.perf_counter() - decode_started
+
+    base_started = time.perf_counter()
+    shape = (len(minute_lookup), len(categories))
+    mask = np.zeros(shape, dtype=bool)
+    flat_index = minute_index[valid] * shape[1] + stock_index[valid]
+    mask.ravel()[flat_index] = True
+    channels: dict[str, np.ndarray] = {}
+    for name in ("open", "high", "low", "close", "vol", "amount"):
+        output = np.full(shape, np.nan, dtype=np.float64)
+        output.ravel()[flat_index] = numeric[name][valid]
+        channels[name] = output
+    base_matrix_s = time.perf_counter() - base_started
+
+    feature_started = time.perf_counter()
+    high, low = channels["high"], channels["low"]
+    close, vol, amount = channels["close"], channels["vol"], channels["amount"]
+    previous_close = _previous_observed(close, mask)
+    ret = _safe_divide_array(close, previous_close) - 1.0
+    vwap = _safe_divide_array(amount, vol)
+    hl_pct = _safe_divide_array(high - low, np.abs(close))
+    bar_pos = _safe_divide_array(close - low, high - low)
+    amihud = _safe_divide_array(np.abs(ret), np.abs(amount))
+    direction = np.where(np.isfinite(ret), np.sign(ret), 0.0)
+    cumulative_amount = _skipna_cumsum(amount, mask)
+    cumulative_vol = _skipna_cumsum(vol, mask)
+    finite_close = mask & np.isfinite(close)
+    close_sum = np.cumsum(np.where(finite_close, close, 0.0), axis=0)
+    close_count = np.cumsum(finite_close, axis=0)
+    twap = np.divide(
+        close_sum,
+        close_count,
+        out=np.full(shape, np.nan, dtype=np.float64),
+        where=finite_close & (close_count > 0),
+    )
+    channels.update({
+        "ret": ret,
+        "vwap": vwap,
+        "hl_pct": hl_pct,
+        "bar_pos": bar_pos,
+        "amihud": amihud,
+        "rv": np.square(ret),
+        "signed_vol": direction * vol,
+        "signed_amt": direction * amount,
+        "typical": (high + low + close) / 3.0,
+        "vwap_cum": _safe_divide_array(cumulative_amount, cumulative_vol),
+        "twap": twap,
+        "obv": _skipna_cumsum(direction * vol, mask),
+        "pvt": _skipna_cumsum(ret * vol, mask),
+    })
+    for name in MEMMAP_CHANNELS:
+        channels[name] = np.where(mask, channels[name], np.nan)
+    numpy_feature_s = time.perf_counter() - feature_started
+    return channels, mask, {
+        "decode_index_s": decode_index_s,
+        "base_matrix_s": base_matrix_s,
+        "numpy_feature_s": numpy_feature_s,
+        "valid_rows": int(valid.sum()),
+        "excluded_rows": int(len(frame) - valid.sum()),
+    }
+
+
 def _source_fingerprint(
     loader: DolphinDBMinuteLoader,
     dates: Sequence[pd.Timestamp],
@@ -192,6 +380,7 @@ class DolphinDBMinuteMemMapBuilder:
         manifest_path = root / "manifest.json"
         configured_grid = self.config.minute_grid
         fingerprint = _source_fingerprint(self.loader, dates, configured_grid)
+        self.ensure_duplicate_audit(dates, fingerprint)
         existing = self._read_json(manifest_path)
         if (
             existing
@@ -291,6 +480,35 @@ class DolphinDBMinuteMemMapBuilder:
             flush=True,
         )
         return manifest_path
+
+    def ensure_duplicate_audit(
+        self,
+        dates: Sequence[pd.Timestamp],
+        fingerprint: str,
+    ) -> None:
+        audit_path = self.config.root / "duplicate_key_audit.json"
+        existing = self._read_json(audit_path)
+        if (
+            existing
+            and existing.get("complete") is True
+            and existing.get("fingerprint") == fingerprint
+        ):
+            print(
+                f"[MemMapBuild] duplicate_audit_reused path={audit_path}",
+                flush=True,
+            )
+            return
+        self.loader.assert_no_duplicate_minute_keys(
+            dates[0], dates[-1], time_filter_sql=self._ddb_time_filter_sql()
+        )
+        self._write_json(audit_path, {
+            "complete": True,
+            "fingerprint": fingerprint,
+            "start_date": str(pd.Timestamp(dates[0]).date()),
+            "end_date": str(pd.Timestamp(dates[-1]).date()),
+            "duplicate_keys": 0,
+            "scope": "configured_minute_grid",
+        })
 
     def _load_minute_grid(self, dates: Sequence[pd.Timestamp]) -> tuple[str, ...]:
         sample_dates = []
@@ -480,74 +698,46 @@ class DolphinDBMinuteMemMapBuilder:
         loader: DolphinDBMinuteLoader,
         day_index: int,
         date: pd.Timestamp,
-        arrays: Mapping[str, np.memmap],
-        mask: np.memmap,
+        arrays: Mapping[str, np.ndarray],
+        mask: np.ndarray,
         stock_lookup: Mapping[str, int],
         minute_lookup: Mapping[str, int],
     ) -> dict[str, Any]:
         total_started = time.perf_counter()
         stage_started = total_started
-        raw = loader.session.run(loader.build_data_sql(date, date))
+        raw = loader.session.run(loader.build_data_sql(
+            date,
+            date,
+            columns=FAST_LOAD_SOURCE_COLUMNS,
+            time_filter_sql=self._ddb_time_filter_sql(),
+            order_by=False,
+        ))
         ddb_query_s = time.perf_counter() - stage_started
 
-        stage_started = time.perf_counter()
-        raw_rows = len(raw)
-        normalized = normalize_dolphindb_minutes(pd.DataFrame(raw))
-        time_keys = normalized["datetime"].map(_time_key)
-        in_grid = time_keys.isin(minute_lookup)
-        excluded_rows = int((~in_grid).sum())
-        normalized = normalized.loc[in_grid].copy()
-        if normalized.empty:
-            raise ValueError(f"No configured minute rows remain on {date.date()}")
-        normalize_filter_s = time.perf_counter() - stage_started
-
-        stage_started = time.perf_counter()
-        frame = build_minute_features(normalized)
-        feature_s = time.perf_counter() - stage_started
-
-        stage_started = time.perf_counter()
-        duplicate_rows = frame.duplicated(["date", "code", "datetime"], keep=False)
-        if duplicate_rows.any():
-            raise ValueError(
-                f"Duplicate date/code/time keys on {date.date()}: "
-                f"rows={int(duplicate_rows.sum())}. Run the quality audit first."
-            )
-        codes = frame["code"].astype(str).map(stock_lookup)
-        minutes = frame["datetime"].map(
-            lambda value: minute_lookup.get(_time_key(value))
+        frame = raw if isinstance(raw, pd.DataFrame) else pd.DataFrame(raw)
+        raw_rows = len(frame)
+        ordered_stocks = np.empty(len(stock_lookup), dtype=object)
+        for code, index in stock_lookup.items():
+            ordered_stocks[int(index)] = str(code)
+        day_channels, day_mask, fast_metrics = _build_dense_minute_channels(
+            frame, ordered_stocks, minute_lookup
         )
-        valid_index = codes.notna() & minutes.notna()
-        if not valid_index.all():
-            raise ValueError(
-                f"MemMap index mismatch on {date.date()}: "
-                f"unmapped_rows={int((~valid_index).sum())}"
-            )
-        stock_index = codes.to_numpy(dtype=np.int64)
-        minute_index = minutes.to_numpy(dtype=np.int64)
-        index_validate_s = time.perf_counter() - stage_started
 
         stage_started = time.perf_counter()
         for channel, array in arrays.items():
-            array[day_index, :, :] = np.nan
-            values = pd.to_numeric(frame[channel], errors="coerce").to_numpy(
-                dtype=np.float32
-            )
-            array[day_index, minute_index, stock_index] = values
-        mask[day_index, :, :] = 0
-        # Each thread writes a disjoint day slice. Channel NaNs remain visible so
-        # reductions preserve the source row-position semantics.
-        mask[day_index, minute_index, stock_index] = 1
+            np.copyto(array[day_index], day_channels[channel], casting="unsafe")
+        np.copyto(mask[day_index], day_mask, casting="unsafe")
         memory_write_s = time.perf_counter() - stage_started
         return {
             "day_index": day_index,
             "date": str(date.date()),
             "raw_rows": raw_rows,
-            "minute_rows": len(frame),
-            "excluded_rows": excluded_rows,
+            "minute_rows": int(fast_metrics["valid_rows"]),
+            "excluded_rows": int(fast_metrics["excluded_rows"]),
             "ddb_query_s": ddb_query_s,
-            "normalize_filter_s": normalize_filter_s,
-            "feature_s": feature_s,
-            "index_validate_s": index_validate_s,
+            "decode_index_s": float(fast_metrics["decode_index_s"]),
+            "base_matrix_s": float(fast_metrics["base_matrix_s"]),
+            "numpy_feature_s": float(fast_metrics["numpy_feature_s"]),
             "memory_write_s": memory_write_s,
             "total_s": time.perf_counter() - total_started,
         }
@@ -585,9 +775,9 @@ class DolphinDBMinuteMemMapBuilder:
                 f"date={result['date']} minute_rows={int(result['minute_rows']):,} "
                 f"excluded_rows={int(result['excluded_rows']):,} "
                 f"timing_s=query:{float(result['ddb_query_s']):.2f},"
-                f"normalize_filter:{float(result['normalize_filter_s']):.2f},"
-                f"feature:{float(result['feature_s']):.2f},"
-                f"index_validate:{float(result['index_validate_s']):.2f},"
+                f"decode_index:{float(result['decode_index_s']):.2f},"
+                f"base_matrix:{float(result['base_matrix_s']):.2f},"
+                f"numpy_feature:{float(result['numpy_feature_s']):.2f},"
                 f"write:{float(result['memory_write_s']):.2f},"
                 f"total:{float(result['total_s']):.2f}",
                 flush=True,
@@ -863,6 +1053,7 @@ class DolphinDBMinuteRAMStore(MinuteMemMapStore):
         self.stocks = np.asarray(sorted(daily["code"].astype(str).unique()), dtype=str)
         self.stock_lookup = {str(code): index for index, code in enumerate(self.stocks)}
         self.fingerprint = _source_fingerprint(loader, dates, config.minute_grid)
+        helper.ensure_duplicate_audit(dates, self.fingerprint)
         self.manifest = {
             "format_version": MEMMAP_FORMAT_VERSION,
             "complete": True,
