@@ -9,6 +9,7 @@ from .dolphindb_minute import (
     prepare_dolphindb_minute_data,
 )
 from .minute_memmap import (
+    DolphinDBMinuteRAMStore,
     DolphinDBMinuteMemMapBuilder,
     MEMMAP_CHANNELS,
     MinuteMemMapConfig,
@@ -25,7 +26,7 @@ __all__ = [
     "DolphinDBFieldAudit", "DolphinDBMinuteLoader", "MinuteDolphinDBConfig",
     "build_daily_from_minute_cache", "load_minute_cache",
     "normalize_dolphindb_minutes", "prepare_dolphindb_minute_data",
-    "DolphinDBMinuteMemMapBuilder", "MEMMAP_CHANNELS",
+    "DolphinDBMinuteMemMapBuilder", "DolphinDBMinuteRAMStore", "MEMMAP_CHANNELS",
     "MinuteMemMapConfig", "MinuteMemMapStore",
     "DolphinDBMinuteQualityAuditor", "MinuteQualityAuditConfig",
     "build_expected_minute_grid",

@@ -96,8 +96,10 @@ class MinuteDolphinDBConfig:
             raise ValueError("DolphinDB TradeDays date column contains unsupported characters")
         if min(self.chunk_days, self.audit_chunk_days, self.daily_aggregate_chunk_days) < 1:
             raise ValueError("DolphinDB chunk day settings must be positive")
-        if self.load_mode not in {"cache", "stream", "memmap"}:
-            raise ValueError("DolphinDB load_mode must be 'cache', 'stream' or 'memmap'")
+        if self.load_mode not in {"cache", "stream", "memmap", "ram"}:
+            raise ValueError(
+                "DolphinDB load_mode must be 'cache', 'stream', 'memmap' or 'ram'"
+            )
         start, end = pd.Timestamp(self.start_date), pd.Timestamp(self.end_date)
         if start > end:
             raise ValueError("DolphinDB start_date must not be later than end_date")

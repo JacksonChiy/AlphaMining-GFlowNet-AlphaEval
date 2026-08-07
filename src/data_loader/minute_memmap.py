@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -767,3 +768,210 @@ class MinuteMemMapStore:
                 self.config.root / relative, mmap_mode="r", allow_pickle=False
             )
         return self._arrays[key]
+
+
+class DolphinDBMinuteRAMStore(MinuteMemMapStore):
+    """Read DDB once into shared process RAM, then expose the MemMap store API.
+
+    Arrays remain split by year so reward chunk specifications and persistent
+    factor caches stay compatible with the proven MemMap execution path.  No
+    raw-minute file is created and training performs zero remote DDB queries.
+    """
+
+    in_memory = True
+
+    def __init__(
+        self,
+        loader: DolphinDBMinuteLoader,
+        config: MinuteMemMapConfig,
+        loader_factory: Callable[[], DolphinDBMinuteLoader] | None = None,
+        *,
+        max_ram_gb: float = 0.0,
+        reserve_ram_gb: float = 64.0,
+    ) -> None:
+        if config.reward_parallel_backend != "threading":
+            raise ValueError(
+                "DDB RAM mode requires reward_parallel_backend=threading so workers "
+                "share arrays instead of copying them"
+            )
+        if config.build_workers > 1 and loader_factory is None:
+            raise ValueError(
+                "DDB RAM build_workers > 1 requires an independent loader per thread"
+            )
+        self.config = config
+        self._loader = loader
+        self._loader_factory = loader_factory
+        self._ram_arrays: dict[tuple[int, str], np.ndarray] = {}
+        self._year_date_values: dict[int, pd.DatetimeIndex] = {}
+        self._max_ram_gb = float(max_ram_gb)
+        self._reserve_ram_gb = float(reserve_ram_gb)
+        self.config.root.mkdir(parents=True, exist_ok=True)
+
+        audit = loader.audit()
+        if not audit.passed:
+            raise ValueError(
+                "DDB RAM loading requires adjusted OHLC; verify the source and set "
+                "prices_are_adjusted=true"
+            )
+        dates = loader.load_trade_dates(loader.config.start_date, loader.config.end_date)
+        self.dates = pd.DatetimeIndex(dates).normalize()
+        self.minute_grid = np.asarray(config.minute_grid, dtype=str)
+        helper = DolphinDBMinuteMemMapBuilder(loader, config, loader_factory)
+        helper._load_minute_grid(dates)
+        daily = loader.build_daily_in_memory(
+            loader.config.start_date,
+            loader.config.end_date,
+            time_filter_sql=helper._ddb_time_filter_sql(),
+        )
+        self.daily_data = daily
+        self.stocks = np.asarray(sorted(daily["code"].astype(str).unique()), dtype=str)
+        self.stock_lookup = {str(code): index for index, code in enumerate(self.stocks)}
+        self.fingerprint = _source_fingerprint(loader, dates, config.minute_grid)
+        self.manifest = {
+            "format_version": MEMMAP_FORMAT_VERSION,
+            "complete": True,
+            "fingerprint": self.fingerprint,
+            "layout": "RAM year/channel -> (n_days, n_minutes, n_stocks)",
+            "dtype": "float32",
+            "channels": list(MEMMAP_CHANNELS),
+            "n_minutes": len(self.minute_grid),
+            "n_stocks": len(self.stocks),
+            "years": {},
+        }
+        self._validate_capacity()
+        self._load_all_years(helper)
+
+    @property
+    def daily_file(self) -> Path:
+        raise RuntimeError("DDB RAM mode keeps daily data in memory")
+
+    def _estimated_bytes(self) -> int:
+        elements = len(self.dates) * len(self.minute_grid) * len(self.stocks)
+        return int(elements * (len(MEMMAP_CHANNELS) * 4 + 1))
+
+    @staticmethod
+    def _available_memory_bytes() -> int | None:
+        try:
+            import psutil
+
+            return int(psutil.virtual_memory().available)
+        except ImportError:
+            try:
+                return int(os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
+            except (AttributeError, OSError, ValueError):
+                return None
+
+    def _validate_capacity(self) -> None:
+        required = self._estimated_bytes()
+        available = self._available_memory_bytes()
+        limit = int(self._max_ram_gb * 1024**3) if self._max_ram_gb > 0 else None
+        print(
+            f"[DDBRAM] capacity_estimate raw_arrays_gb={required / 1024**3:.1f} "
+            f"available_gb={available / 1024**3:.1f}" if available is not None else
+            f"[DDBRAM] capacity_estimate raw_arrays_gb={required / 1024**3:.1f} available_gb=unknown",
+            flush=True,
+        )
+        if limit is not None and required > limit:
+            raise MemoryError(
+                f"DDB RAM arrays require {required / 1024**3:.1f}GB, exceeding "
+                f"memory.max_ram_gb={self._max_ram_gb:.1f}GB"
+            )
+        if available is not None:
+            usable = available - int(self._reserve_ram_gb * 1024**3)
+            if required > usable:
+                raise MemoryError(
+                    f"DDB RAM arrays require {required / 1024**3:.1f}GB but only "
+                    f"{available / 1024**3:.1f}GB is available with "
+                    f"reserve_ram_gb={self._reserve_ram_gb:.1f}"
+                )
+
+    def _load_all_years(self, helper: DolphinDBMinuteMemMapBuilder) -> None:
+        started = time.perf_counter()
+        stock_lookup = self.stock_lookup
+        minute_lookup = {
+            str(value): index for index, value in enumerate(self.minute_grid.tolist())
+        }
+        worker_local = threading.local()
+        worker_loaders: list[DolphinDBMinuteLoader] = []
+        worker_lock = threading.Lock()
+
+        def initialize_worker() -> None:
+            worker_local.loader = (
+                self._loader_factory() if self._loader_factory is not None else self._loader
+            )
+            if worker_local.loader is not self._loader:
+                with worker_lock:
+                    worker_loaders.append(worker_local.loader)
+
+        try:
+            for year in sorted({int(date.year) for date in self.dates}):
+                year_dates = self.dates[self.dates.year == year]
+                self._year_date_values[year] = year_dates
+                shape = (len(year_dates), len(self.minute_grid), len(self.stocks))
+                arrays = {
+                    channel: np.empty(shape, dtype=np.float32)
+                    for channel in MEMMAP_CHANNELS
+                }
+                mask = np.empty(shape, dtype=np.uint8)
+                for channel, array in arrays.items():
+                    self._ram_arrays[(year, channel)] = array
+                self._ram_arrays[(year, "valid_mask")] = mask
+                self.manifest["years"][str(year)] = {
+                    "n_days": len(year_dates), "shape": list(shape)
+                }
+                print(
+                    f"[DDBRAM] year_start year={year} days={len(year_dates)} "
+                    f"shape={shape} workers={self.config.build_workers}",
+                    flush=True,
+                )
+
+                def load_day(day_index: int) -> dict[str, Any]:
+                    return helper._write_day(
+                        worker_local.loader,
+                        day_index,
+                        pd.Timestamp(year_dates[day_index]),
+                        arrays,
+                        mask,
+                        stock_lookup,
+                        minute_lookup,
+                    )
+
+                completed = 0
+                with ThreadPoolExecutor(
+                    max_workers=self.config.build_workers,
+                    thread_name_prefix="ddb-ram",
+                    initializer=initialize_worker,
+                ) as executor:
+                    futures = [executor.submit(load_day, index) for index in range(len(year_dates))]
+                    for future in as_completed(futures):
+                        result = future.result()
+                        completed += 1
+                        if completed == 1 or completed == len(futures) or completed % 10 == 0:
+                            elapsed = max(time.perf_counter() - started, 1e-9)
+                            print(
+                                f"[DDBRAM] load_progress year={year} "
+                                f"days={completed}/{len(futures)} date={result['date']} "
+                                f"minute_rows={int(result['minute_rows']):,} "
+                                f"elapsed_minutes={elapsed / 60:.1f}",
+                                flush=True,
+                            )
+                print(
+                    f"[DDBRAM] year_complete year={year} "
+                    f"resident_gb={sum(a.nbytes for a in self._ram_arrays.values()) / 1024**3:.1f}",
+                    flush=True,
+                )
+        finally:
+            for worker_loader in worker_loaders:
+                worker_loader.session.close()
+        print(
+            f"[DDBRAM] load_complete dates={len(self.dates):,} stocks={len(self.stocks):,} "
+            f"channels={len(MEMMAP_CHANNELS)} seconds={time.perf_counter() - started:.1f} "
+            "remote_ddb_queries_during_training=0",
+            flush=True,
+        )
+
+    def _year_dates(self, year: int) -> pd.DatetimeIndex:
+        return self._year_date_values[int(year)]
+
+    def _array(self, year: int, channel: str) -> np.ndarray:
+        return self._ram_arrays[(int(year), channel)]

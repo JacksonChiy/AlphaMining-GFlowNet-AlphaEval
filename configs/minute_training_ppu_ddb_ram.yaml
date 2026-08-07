@@ -1,0 +1,101 @@
+dataset:
+  source: dolphindb
+  mining_start_date: '2020-01-01'
+  mining_end_date: '2023-12-31'
+  out_of_sample_start_date: '2024-01-01'
+  out_of_sample_end_date: '2026-12-31'
+
+  dolphindb:
+    host_env: DDB_HOST
+    port_env: DDB_PORT
+    user_env: DDB_USER
+    password_env: DDB_PASSWORD
+    database_env: DDB_DATABASE
+    table_env: DDB_TABLE
+    trade_days_database_env: DDB_TRADE_DAYS_DATABASE
+    trade_days_table: TradeDays
+    # 若TradeDays中存在多个DATE字段，请显式配置：
+    # trade_days_date_column: tradeDate
+    load_mode: ram
+    start_date: '2020-01-01'
+    end_date: '2026-12-31'
+    audit_chunk_days: 120
+    daily_aggregate_chunk_days: 120
+    chunk_days: 1
+    prices_are_adjusted: false
+
+  memory:
+    # 这里只保存小型审计文件和因子Block缓存，不保存原始分钟数组。
+    root: results/minute_ppu_ddb_ram/metadata
+    block_cache_dir: results/minute_ppu_ddb_ram/block_cache
+    max_ram_gb: 550
+    reserve_ram_gb: 100
+    expected_minutes: 241
+    minute_sessions:
+      - ['09:31:00', '11:30:00']
+      - ['13:01:00', '15:00:00']
+    minute_extra_times:
+      - '09:25:00'
+    stock_tile_size: 512
+    # 加载线程各自创建一个DDB连接；不要超过DDB服务端允许的连接数量。
+    build_workers: 8
+    # RAM数组必须使用线程共享，严禁改成loky多进程。
+    workers: 12
+    reward_parallel_backend: threading
+    reward_backend: numpy
+    reward_chunk_days: 40
+    reward_blocks_per_task: 4
+    reward_group_by_channels: true
+    reward_cache_commit_tasks: 50
+    numpy_fallback: true
+    flush_every_days: 8
+
+cpu_runtime:
+  torch_threads: 16
+  interop_threads: 2
+  blas_threads: 1
+
+model:
+  name: MinuteGFlowNetPPUDolphinDBRAM
+  hidden_dim: 128
+  num_layers: 2
+  num_heads: 4
+  dropout: 0.1
+  max_sequence_length: 40
+
+training:
+  epochs: 30
+  trajectories_per_epoch: 8
+  learning_rate: 0.0002
+  weight_decay: 0.0001
+  reward_temperature: 1.0
+  mixed_precision: false
+  max_depth: 5
+  max_nodes: 12
+  gradient_clip: 1.0
+  reward_workers: 1
+  seed: 42
+
+reward:
+  horizon: 5
+  top_quantile: 0.10
+  risk_aversion: 1.0
+  min_cross_section: 20
+  min_coverage: 0.80
+  coverage_penalty_power: 2.0
+  reward_floor: 1.0e-8
+  subexpression_cache_enabled: false
+  # 每个日频Block约30MB，256个约8GB，700GB节点可以直接常驻更多Block。
+  block_cache_max_entries: 256
+
+pipeline:
+  pool_size: 50
+  pool_attempts: 600
+
+outputs:
+  log_dir: results/minute_ppu_ddb_ram/logs
+  checkpoint: checkpoints/gflownet_minute_ppu_ddb_ram_best.pt
+  metrics: results/minute_ppu_ddb_ram/gflownet_training_metrics.csv
+  trajectory_metrics: results/minute_ppu_ddb_ram/gflownet_trajectory_metrics.csv
+  alpha_pool: results/minute_ppu_ddb_ram/alpha_pool.csv
+  factor_matrix: results/minute_ppu_ddb_ram/alpha_factor_matrix.csv.gz

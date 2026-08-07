@@ -69,6 +69,22 @@ def _compute_numpy_chunk(
     if store is None:
         store = MinuteMemMapStore(store_config)
         _NUMPY_WORKER_STORES[store_key] = store
+    return _compute_numpy_chunk_from_store(store, nodes, spec, worker_started)
+
+
+def _compute_numpy_chunk_from_store(
+    store: MinuteMemMapStore,
+    nodes: Sequence[MinuteNode],
+    spec: tuple[int, int, int, int, int],
+    worker_started: float | None = None,
+) -> tuple[
+    tuple[int, int, int, int, int],
+    dict[str, np.ndarray],
+    tuple[str, ...],
+    dict[str, float],
+]:
+    """Compute against a supplied store; RAM mode shares it between threads."""
+    worker_started = worker_started or time.perf_counter()
     channels = required_memmap_channels(nodes)
     read_started = time.perf_counter()
     _, mask, arrays = store.read_numpy_chunk(spec, channels)
@@ -619,6 +635,11 @@ def _execute_numpy_blocks(
     if missing_tasks:
         if store.config.workers > 1:
             try:
+                in_memory = bool(getattr(store, "in_memory", False))
+                if in_memory and store.config.reward_parallel_backend != "threading":
+                    raise ValueError(
+                        "In-memory minute arrays require the threading backend"
+                    )
                 results = Parallel(
                     n_jobs=store.config.workers,
                     backend=store.config.reward_parallel_backend,
@@ -628,7 +649,13 @@ def _execute_numpy_blocks(
                     # each completed chunk instead of buffering the full scan.
                     return_as="generator",
                 )(
-                    delayed(_compute_numpy_chunk)(store.config, task_nodes, spec)
+                    delayed(
+                        _compute_numpy_chunk_from_store if in_memory else _compute_numpy_chunk
+                    )(
+                        store if in_memory else store.config,
+                        task_nodes,
+                        spec,
+                    )
                     for spec, task_nodes in missing_tasks
                 )
             except (PermissionError, NotImplementedError, TerminatedWorkerError) as error:
@@ -637,15 +664,27 @@ def _execute_numpy_blocks(
                     f"error={type(error).__name__}: {error}",
                     flush=True,
                 )
+                if getattr(store, "in_memory", False):
+                    results = (
+                        _compute_numpy_chunk_from_store(store, task_nodes, spec)
+                        for spec, task_nodes in missing_tasks
+                    )
+                else:
+                    results = (
+                        _compute_numpy_chunk(store.config, task_nodes, spec)
+                        for spec, task_nodes in missing_tasks
+                    )
+        else:
+            if getattr(store, "in_memory", False):
+                results = (
+                    _compute_numpy_chunk_from_store(store, task_nodes, spec)
+                    for spec, task_nodes in missing_tasks
+                )
+            else:
                 results = (
                     _compute_numpy_chunk(store.config, task_nodes, spec)
                     for spec, task_nodes in missing_tasks
                 )
-        else:
-            results = (
-                _compute_numpy_chunk(store.config, task_nodes, spec)
-                for spec, task_nodes in missing_tasks
-            )
         completed = 0
 
         def persist_result(result) -> None:
@@ -697,7 +736,12 @@ def _execute_numpy_blocks(
                     if partial.load(node.render(), spec) is None
                 ]
                 if remaining:
-                    persist_result(_compute_numpy_chunk(store.config, remaining, spec))
+                    if getattr(store, "in_memory", False):
+                        persist_result(
+                            _compute_numpy_chunk_from_store(store, remaining, spec)
+                        )
+                    else:
+                        persist_result(_compute_numpy_chunk(store.config, remaining, spec))
         final_commit_started = time.perf_counter()
         partial.commit()
         parent_cache_write_seconds += time.perf_counter() - final_commit_started

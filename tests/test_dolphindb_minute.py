@@ -18,6 +18,7 @@ from src.expression.minute import minute_expression_from_tokens
 from src.expression.dolphindb_minute import DolphinDBMinuteCompiler
 from src.data_loader.minute_memmap import (
     DolphinDBMinuteMemMapBuilder,
+    DolphinDBMinuteRAMStore,
     MEMMAP_CHANNELS,
     MinuteMemMapConfig,
     MinuteMemMapStore,
@@ -514,6 +515,52 @@ def test_ddb_to_local_memmap_build_read_and_persistent_block_cache(
     )
     assert np.allclose(parallel_blocks["r_mean(close)"].sort_index(), expected)
 
+
+def test_ddb_direct_ram_store_shares_arrays_without_raw_minute_files(tmp_path) -> None:
+    source = _source_minutes()
+    session = FakeDolphinDBSession(source)
+    loader = DolphinDBMinuteLoader(_config(tmp_path), session)
+    ram_config = MinuteMemMapConfig(
+        root=tmp_path / "ram_metadata",
+        block_cache_dir=tmp_path / "ram_block_cache",
+        expected_minutes=3,
+        minute_sessions=(("09:30:00", "09:32:00"),),
+        minute_extra_times=(),
+        stock_tile_size=1,
+        workers=2,
+        build_workers=2,
+        reward_chunk_days=1,
+        reward_parallel_backend="threading",
+    )
+    worker_sessions: list[FakeDolphinDBSession] = []
+
+    def loader_factory() -> DolphinDBMinuteLoader:
+        worker_session = FakeDolphinDBSession(source.copy())
+        worker_sessions.append(worker_session)
+        return DolphinDBMinuteLoader(_config(tmp_path), worker_session)
+
+    store = DolphinDBMinuteRAMStore(
+        loader,
+        ram_config,
+        loader_factory=loader_factory,
+        reserve_ram_gb=0,
+    )
+    assert store.in_memory is True
+    assert len(store.daily_data) == 4
+    assert store._array(2024, "close").shape == (2, 3, 2)
+    assert isinstance(store._array(2024, "close"), np.ndarray)
+    assert not isinstance(store._array(2024, "close"), np.memmap)
+    assert worker_sessions and all(worker.closed for worker in worker_sessions)
+    assert not list((tmp_path / "ram_metadata").rglob("*.npy"))
+
+    expression = minute_expression_from_tokens(["r_mean", "close"])
+    cache = PersistentMinuteBlockCache(store, ram_config.block_cache_dir)
+    blocks = execute_memmap_blocks(
+        store, list(expression.block_nodes()), "2024-01-02", "2024-01-03", cache
+    )
+    actual = expression.execute_from_blocks(blocks).sort_index()
+    expected = expression.execute(normalize_dolphindb_minutes(source)).sort_index()
+    assert np.allclose(actual, expected)
 
 def test_consolidated_partial_cache_migrates_legacy_and_survives_rechunking(
     tmp_path,
