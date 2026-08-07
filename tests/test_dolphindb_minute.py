@@ -464,6 +464,38 @@ def test_ddb_to_local_memmap_build_read_and_persistent_block_cache(
     assert np.allclose(cached_blocks["r_mean(close)"].sort_index(), expected)
     assert second_cache.disk_hits == 1
 
+    empty_expression = minute_expression_from_tokens(
+        ["r_kurt", "m_head", "W5", "m_ret", "hl_pct"]
+    )
+    empty_cache = PersistentMinuteBlockCache(
+        store, memmap_config.block_cache_dir
+    )
+    empty_blocks = execute_memmap_blocks(
+        store,
+        list(empty_expression.block_nodes()),
+        "2024-01-02",
+        "2024-01-03",
+        empty_cache,
+    )
+    empty_key = "r_kurt(m_head(m_ret(hl_pct),5))"
+    assert empty_blocks[empty_key].empty
+    empty_log = capsys.readouterr().out
+    assert f"empty_block_cached expression={empty_key}" in empty_log
+    assert "action=reward_floor" in empty_log
+
+    reused_empty_cache = PersistentMinuteBlockCache(
+        store, memmap_config.block_cache_dir
+    )
+    reused_empty = execute_memmap_blocks(
+        store,
+        list(empty_expression.block_nodes()),
+        "2024-01-02",
+        "2024-01-03",
+        reused_empty_cache,
+    )
+    assert reused_empty[empty_key].empty
+    assert reused_empty_cache.disk_hits == 1
+
     parallel_config = replace(
         memmap_config,
         workers=2,

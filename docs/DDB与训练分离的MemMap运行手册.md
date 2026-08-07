@@ -291,6 +291,15 @@ python scripts/train_cpu.py `
 `parent_cache_write_seconds`较高通常表示本地缓存落盘受限；`partial_cache_scan`较高则说明
 完成位图扫描或旧缓存迁移是主要开销。
 
+若某个候选表达式在整个训练区间内没有任何有限值，日志会显示：
+
+```text
+[MemMapBlockPipeline] empty_block_cached expression=... coverage=0.00% action=reward_floor
+```
+
+这不是执行错误。系统会把全空Block作为有效的低覆盖结果写入缓存，给该表达式分配
+`reward_floor`并在因子池筛选时淘汰；后续运行可直接命中缓存，不会再次扫描全部分钟数据。
+
 不应再出现：
 
 ```text

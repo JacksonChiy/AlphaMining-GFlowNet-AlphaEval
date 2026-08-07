@@ -825,12 +825,18 @@ def execute_memmap_blocks(
         blocks=len(pending),
     )
     final_cache_write_started = time.perf_counter()
+    empty_blocks: list[str] = []
     for node in pending:
         key = node.render()
-        if key not in computed_blocks or computed_blocks[key].empty:
-            raise ValueError(f"MemMap produced no values for block: {key}")
+        if key not in computed_blocks:
+            raise ValueError(f"MemMap did not return the requested block: {key}")
         values = computed_blocks[key].sort_index()
         values = values[~values.index.duplicated(keep="last")]
+        if values.empty:
+            # An all-NaN result is a valid low-coverage factor outcome, not an
+            # execution failure. Persist it so pool generation assigns the
+            # reward floor and never recomputes the same invalid expression.
+            empty_blocks.append(key)
         cache.save(key, start_date, end_date, values)
         output[key] = values
     final_cache_write_seconds = time.perf_counter() - final_cache_write_started
@@ -840,8 +846,15 @@ def execute_memmap_blocks(
         final_cache_write_seconds,
         pipeline_started,
         blocks=len(pending),
+        empty_blocks=len(empty_blocks),
         writes=cache.writes,
     )
+    for key in empty_blocks:
+        print(
+            f"[MemMapBlockPipeline] empty_block_cached expression={key} "
+            "coverage=0.00% action=reward_floor",
+            flush=True,
+        )
     print(
         f"[MemMapBlockPipeline] stage_summary "
         f"total_seconds={time.perf_counter() - pipeline_started:.3f} "
