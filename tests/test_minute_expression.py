@@ -249,6 +249,62 @@ def test_report_daily_tree_executes_after_intraday_reduction() -> None:
     assert len(result) == 4
 
 
+def test_daily_array_execution_matches_grouped_pandas_for_nested_sparse_blocks() -> None:
+    dates = pd.bdate_range("2024-01-02", periods=8)
+    full_index = pd.MultiIndex.from_product(
+        [dates, ["A", "B", "C"]], names=["date", "code"]
+    )
+    left = pd.Series(np.arange(len(full_index), dtype=float), index=full_index)
+    # Preserve both a genuinely absent row and an observed NaN: they have
+    # different rolling-window semantics.
+    left = left.drop((dates[2], "B"))
+    left.loc[(dates[4], "A")] = np.nan
+    expression = minute_expression_from_tokens(
+        ["cs_zscore", "ts_mean", "W5", "neg", "r_mean", "close"]
+    )
+
+    frame = left.rename("value").reset_index()
+    frame = frame.sort_values(["code", "date"], kind="stable").reset_index(drop=True)
+    rolling = frame["value"].groupby(frame["code"], observed=True, sort=False).rolling(
+        5, min_periods=5
+    ).mean().reset_index(level=0, drop=True)
+    frame["value"] = -rolling
+    frame = frame.sort_values(["date", "code"], kind="stable").reset_index(drop=True)
+    grouped = frame["value"].groupby(frame["date"], observed=True, sort=False)
+    expected = (frame["value"] - grouped.transform("mean")) / grouped.transform("std")
+    expected_index = pd.MultiIndex.from_frame(frame[["date", "code"]])
+    expected = pd.Series(expected.to_numpy(), index=expected_index).sort_index()
+
+    actual = expression.execute_from_blocks({"r_mean(close)": left})
+    pd.testing.assert_series_equal(
+        actual,
+        expected.rename(str(expression)),
+        check_dtype=False,
+        check_names=True,
+    )
+
+
+def test_daily_binary_array_execution_keeps_pandas_union_alignment() -> None:
+    dates = pd.bdate_range("2024-01-02", periods=2)
+    left_index = pd.MultiIndex.from_tuples(
+        [(dates[0], "A"), (dates[1], "A")], names=["date", "code"]
+    )
+    right_index = pd.MultiIndex.from_tuples(
+        [(dates[0], "A"), (dates[0], "B")], names=["date", "code"]
+    )
+    left = pd.Series([1.0, 2.0], index=left_index)
+    right = pd.Series([10.0, 20.0], index=right_index)
+    expression = minute_expression_from_tokens(
+        ["add", "r_mean", "close", "r_sum", "vol"]
+    )
+
+    actual = expression.execute_from_blocks(
+        {"r_mean(close)": left, "r_sum(vol)": right}
+    )
+    expected = (left + right).sort_index().rename(str(expression))
+    pd.testing.assert_series_equal(actual, expected, check_dtype=False)
+
+
 def test_binary_reductions_handle_constant_inputs_without_warnings() -> None:
     data = _minute_prices()
     constant = pd.Series(1.0, index=data.index)

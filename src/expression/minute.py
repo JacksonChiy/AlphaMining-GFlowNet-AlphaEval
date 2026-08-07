@@ -19,10 +19,8 @@ from src.operators.minute import (
     build_minute_features,
 )
 from src.operators.daily import (
-    apply_binary as apply_daily_binary,
     apply_cross_sectional as apply_daily_cross_sectional,
     apply_time_series as apply_daily_time_series,
-    apply_unary as apply_daily_unary,
 )
 from src.expression.tree import BINARY_OPS, CS_OPS, TS_UNARY_OPS, UNARY_OPS
 
@@ -64,6 +62,133 @@ _ARITY = {
     "daily_cs": 1,
 }
 _WINDOW_KINDS = {"minute_window", "mask_window", "mask_binary_window", "daily_ts"}
+
+
+@dataclass(frozen=True)
+class _DailyArray:
+    """A daily expression value aligned to one reusable canonical index."""
+
+    values: np.ndarray
+    present: np.ndarray
+
+
+class _DailyExecutionContext:
+    """Normalize and sort daily block indexes once for a complete expression tree.
+
+    ``present`` is deliberately separate from ``isfinite``.  A source row whose
+    value is NaN is still an observation for Pandas rolling-window semantics,
+    while a row absent from a sparse block must not be inserted into that window.
+    """
+
+    def __init__(self, blocks: dict[str, pd.Series]) -> None:
+        if not blocks:
+            raise ValueError("At least one intraday block is required")
+        self.blocks = {
+            name: self._normalize_block(value) for name, value in blocks.items()
+        }
+        indexes = [value.index for value in self.blocks.values()]
+        combined = indexes[0].append(indexes[1:]) if len(indexes) > 1 else indexes[0]
+        self.index = combined.unique().sort_values()
+        self.index = self.index.set_names(["date", "code"])
+
+        date_values = self.index.get_level_values("date")
+        code_values = self.index.get_level_values("code")
+        self.date_ids = pd.factorize(date_values, sort=True)[0].astype(np.int64)
+        self.code_ids = pd.factorize(code_values, sort=True)[0].astype(np.int64)
+        # These stable orders are calculated once, instead of sorting a frame at
+        # every nested daily operator.
+        row_ids = np.arange(len(self.index), dtype=np.int64)
+        self.ts_order = np.lexsort((row_ids, self.date_ids, self.code_ids))
+        self.cs_order = np.lexsort((row_ids, self.code_ids, self.date_ids))
+        self._aligned_blocks: dict[str, _DailyArray] = {}
+
+    @staticmethod
+    def _normalize_block(value: pd.Series) -> pd.Series:
+        if not isinstance(value, pd.Series):
+            raise TypeError("Daily block output must be a pandas Series")
+        if not isinstance(value.index, pd.MultiIndex) or value.index.nlevels != 2:
+            raise ValueError("Daily block output must use a (date, code) MultiIndex")
+        dates = pd.to_datetime(value.index.get_level_values(0)).normalize()
+        codes = value.index.get_level_values(1).astype(str)
+        index = pd.MultiIndex.from_arrays([dates, codes], names=["date", "code"])
+        if index.has_duplicates:
+            raise ValueError("Daily block output contains duplicate (date, code) rows")
+        return pd.Series(value.to_numpy(dtype=float), index=index, name=value.name)
+
+    def block(self, name: str) -> _DailyArray:
+        cached = self._aligned_blocks.get(name)
+        if cached is not None:
+            return cached
+        source = self.blocks[name]
+        present = self.index.isin(source.index)
+        values = source.reindex(self.index).to_numpy(dtype=float)
+        cached = _DailyArray(values=values, present=np.asarray(present, dtype=bool))
+        self._aligned_blocks[name] = cached
+        return cached
+
+    def unary(self, name: str, child: _DailyArray) -> _DailyArray:
+        value = child.values
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            if name == "log":
+                result = np.log(np.abs(value) + 1e-12)
+            elif name == "abs":
+                result = np.abs(value)
+            elif name == "neg":
+                result = -value
+            elif name == "sqrt":
+                result = np.sqrt(np.abs(value))
+            elif name == "tanh":
+                result = np.tanh(value)
+            else:
+                raise KeyError(f"Unknown unary operator: {name}")
+        result[~np.isfinite(result)] = np.nan
+        return _DailyArray(result, child.present)
+
+    def binary(self, name: str, left: _DailyArray, right: _DailyArray) -> _DailyArray:
+        present = left.present | right.present
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            if name == "add":
+                result = left.values + right.values
+            elif name == "sub":
+                result = left.values - right.values
+            elif name == "mul":
+                result = left.values * right.values
+            elif name == "div":
+                denominator = np.where(np.abs(right.values) > 1e-12, right.values, np.nan)
+                result = left.values / denominator
+            else:
+                raise KeyError(f"Unknown binary operator: {name}")
+        result[~np.isfinite(result)] = np.nan
+        return _DailyArray(result, present)
+
+    def grouped(
+        self, node: "MinuteNode", child: _DailyArray, *, time_series: bool
+    ) -> _DailyArray:
+        order = self.ts_order if time_series else self.cs_order
+        positions = order[child.present[order]]
+        result = np.full(len(self.index), np.nan, dtype=np.float64)
+        if positions.size:
+            values = pd.Series(child.values[positions], copy=False)
+            if time_series:
+                labels = pd.Series(self.code_ids[positions], copy=False)
+                calculated = apply_daily_time_series(
+                    node.name, values, labels, int(node.window)
+                )
+            else:
+                labels = pd.Series(self.date_ids[positions], copy=False)
+                calculated = apply_daily_cross_sectional(node.name, values, labels)
+            result[positions] = calculated.to_numpy(dtype=float)
+        result[~np.isfinite(result)] = np.nan
+        return _DailyArray(result, child.present)
+
+    def series(self, value: _DailyArray, name: str) -> pd.Series:
+        result = pd.Series(
+            value.values[value.present],
+            index=self.index[value.present],
+            name=name,
+            dtype=float,
+        )
+        return result.replace([np.inf, -np.inf], np.nan)
 
 
 @dataclass(frozen=True)
@@ -141,10 +266,12 @@ class MinuteExpression:
 
     def execute(self, data: pd.DataFrame) -> pd.Series:
         prepared = build_minute_features(data)
-        cache: dict[MinuteNode, pd.Series] = {}
-        result = self._execute_daily_node(self.root, prepared, cache, {})
-        result.name = str(self)
-        return result.replace([np.inf, -np.inf], np.nan).astype(float)
+        minute_cache: dict[MinuteNode, pd.Series] = {}
+        blocks = {
+            node.render(): self._execute_node(node, prepared, minute_cache)
+            for node in self.block_nodes()
+        }
+        return self._execute_from_precomputed_blocks(blocks)
 
     def block_nodes(self) -> tuple[MinuteNode, ...]:
         unique: dict[str, MinuteNode] = {}
@@ -177,56 +304,56 @@ class MinuteExpression:
         }
 
     def execute_from_blocks(self, blocks: dict[str, pd.Series]) -> pd.Series:
-        result = self._execute_daily_node(self.root, None, {}, blocks)
-        result.name = str(self)
-        return result.replace([np.inf, -np.inf], np.nan).astype(float)
+        required = {}
+        for node in self.block_nodes():
+            name = node.render()
+            if name not in blocks:
+                raise KeyError(f"Missing computed intraday block: {name}")
+            required[name] = blocks[name]
+        return self._execute_from_precomputed_blocks(required)
 
-    def _execute_daily_node(
+    def _execute_from_precomputed_blocks(self, blocks: dict[str, pd.Series]) -> pd.Series:
+        # A reduction-only expression needs no daily alignment and retains its
+        # original sparse index exactly as before.
+        if self.root.kind in {"reduce_unary", "reduce_binary"}:
+            result = blocks[self.root.render()].copy()
+            result.name = str(self)
+            return result.replace([np.inf, -np.inf], np.nan).astype(float)
+
+        context = _DailyExecutionContext(blocks)
+        cache: dict[MinuteNode, _DailyArray] = {}
+        result = self._execute_daily_array(self.root, context, cache)
+        return context.series(result, str(self))
+
+    def _execute_daily_array(
         self,
         node: MinuteNode,
-        data: pd.DataFrame | None,
-        minute_cache: dict[MinuteNode, pd.Series],
-        blocks: dict[str, pd.Series],
-    ) -> pd.Series:
+        context: _DailyExecutionContext,
+        cache: dict[MinuteNode, _DailyArray],
+    ) -> _DailyArray:
+        cached = cache.get(node)
+        if cached is not None:
+            return cached
         if node.kind in {"reduce_unary", "reduce_binary"}:
-            cached = blocks.get(node.render())
-            if cached is not None:
-                return cached
-            if data is None:
-                raise KeyError(f"Missing computed intraday block: {node.render()}")
-            return self._execute_node(node, data, minute_cache)
+            result = context.block(node.render())
+            cache[node] = result
+            return result
         children = [
-            self._execute_daily_node(child, data, minute_cache, blocks)
+            self._execute_daily_array(child, context, cache)
             for child in node.children
         ]
         if node.kind == "daily_unary":
-            return apply_daily_unary(node.name, children[0])
-        if node.kind == "daily_binary":
-            return apply_daily_binary(node.name, children[0], children[1])
-        if node.kind == "daily_ts":
-            return self._apply_daily_grouped(node, children[0], time_series=True)
-        if node.kind == "daily_cs":
-            return self._apply_daily_grouped(node, children[0], time_series=False)
-        raise AssertionError(node.kind)
-
-    @staticmethod
-    def _apply_daily_grouped(node: MinuteNode, values: pd.Series, time_series: bool) -> pd.Series:
-        if not isinstance(values.index, pd.MultiIndex) or values.index.nlevels != 2:
-            raise ValueError("Daily block output must use a (date, code) MultiIndex")
-        frame = values.rename("value").reset_index()
-        frame.columns = ["date", "code", "value"]
-        frame["date"] = pd.to_datetime(frame["date"]).dt.normalize()
-        frame["code"] = frame["code"].astype(str)
-        order = ["code", "date"] if time_series else ["date", "code"]
-        frame = frame.sort_values(order, kind="stable").reset_index(drop=True)
-        if time_series:
-            result = apply_daily_time_series(
-                node.name, frame["value"], frame["code"], int(node.window)
-            )
+            result = context.unary(node.name, children[0])
+        elif node.kind == "daily_binary":
+            result = context.binary(node.name, children[0], children[1])
+        elif node.kind == "daily_ts":
+            result = context.grouped(node, children[0], time_series=True)
+        elif node.kind == "daily_cs":
+            result = context.grouped(node, children[0], time_series=False)
         else:
-            result = apply_daily_cross_sectional(node.name, frame["value"], frame["date"])
-        index = pd.MultiIndex.from_frame(frame[["date", "code"]], names=["date", "code"])
-        return pd.Series(result.to_numpy(dtype=float), index=index).sort_index()
+            raise AssertionError(node.kind)
+        cache[node] = result
+        return result
 
     def _execute_node(
         self,
