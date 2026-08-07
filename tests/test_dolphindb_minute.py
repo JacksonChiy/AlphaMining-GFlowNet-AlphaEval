@@ -516,7 +516,9 @@ def test_ddb_to_local_memmap_build_read_and_persistent_block_cache(
     assert np.allclose(parallel_blocks["r_mean(close)"].sort_index(), expected)
 
 
-def test_ddb_direct_ram_store_shares_arrays_without_raw_minute_files(tmp_path) -> None:
+def test_ddb_direct_ram_store_shares_arrays_without_raw_minute_files(
+    tmp_path, capsys
+) -> None:
     source = _source_minutes()
     session = FakeDolphinDBSession(source)
     loader = DolphinDBMinuteLoader(_config(tmp_path), session)
@@ -552,6 +554,10 @@ def test_ddb_direct_ram_store_shares_arrays_without_raw_minute_files(tmp_path) -
     assert not isinstance(store._array(2024, "close"), np.memmap)
     assert worker_sessions and all(worker.closed for worker in worker_sessions)
     assert not list((tmp_path / "ram_metadata").rglob("*.npy"))
+    captured = capsys.readouterr().out
+    assert "stage_avg_s=" in captured
+    assert "stage_share=" in captured
+    assert "effective_parallelism=" in captured
 
     expression = minute_expression_from_tokens(["r_mean", "close"])
     cache = PersistentMinuteBlockCache(store, ram_config.block_cache_dir)

@@ -29,6 +29,13 @@ MEMMAP_CHANNELS = (
     "signed_vol", "signed_amt", "typical", "vwap_cum", "twap", "obv", "pvt",
 )
 MEMMAP_FORMAT_VERSION = 1
+LOAD_TIMING_KEYS = (
+    "ddb_query_s",
+    "normalize_filter_s",
+    "feature_s",
+    "index_validate_s",
+    "memory_write_s",
+)
 
 
 @dataclass(frozen=True)
@@ -478,7 +485,13 @@ class DolphinDBMinuteMemMapBuilder:
         stock_lookup: Mapping[str, int],
         minute_lookup: Mapping[str, int],
     ) -> dict[str, Any]:
+        total_started = time.perf_counter()
+        stage_started = total_started
         raw = loader.session.run(loader.build_data_sql(date, date))
+        ddb_query_s = time.perf_counter() - stage_started
+
+        stage_started = time.perf_counter()
+        raw_rows = len(raw)
         normalized = normalize_dolphindb_minutes(pd.DataFrame(raw))
         time_keys = normalized["datetime"].map(_time_key)
         in_grid = time_keys.isin(minute_lookup)
@@ -486,7 +499,13 @@ class DolphinDBMinuteMemMapBuilder:
         normalized = normalized.loc[in_grid].copy()
         if normalized.empty:
             raise ValueError(f"No configured minute rows remain on {date.date()}")
+        normalize_filter_s = time.perf_counter() - stage_started
+
+        stage_started = time.perf_counter()
         frame = build_minute_features(normalized)
+        feature_s = time.perf_counter() - stage_started
+
+        stage_started = time.perf_counter()
         duplicate_rows = frame.duplicated(["date", "code", "datetime"], keep=False)
         if duplicate_rows.any():
             raise ValueError(
@@ -505,6 +524,9 @@ class DolphinDBMinuteMemMapBuilder:
             )
         stock_index = codes.to_numpy(dtype=np.int64)
         minute_index = minutes.to_numpy(dtype=np.int64)
+        index_validate_s = time.perf_counter() - stage_started
+
+        stage_started = time.perf_counter()
         for channel, array in arrays.items():
             array[day_index, :, :] = np.nan
             values = pd.to_numeric(frame[channel], errors="coerce").to_numpy(
@@ -515,11 +537,19 @@ class DolphinDBMinuteMemMapBuilder:
         # Each thread writes a disjoint day slice. Channel NaNs remain visible so
         # reductions preserve the source row-position semantics.
         mask[day_index, minute_index, stock_index] = 1
+        memory_write_s = time.perf_counter() - stage_started
         return {
             "day_index": day_index,
             "date": str(date.date()),
+            "raw_rows": raw_rows,
             "minute_rows": len(frame),
             "excluded_rows": excluded_rows,
+            "ddb_query_s": ddb_query_s,
+            "normalize_filter_s": normalize_filter_s,
+            "feature_s": feature_s,
+            "index_validate_s": index_validate_s,
+            "memory_write_s": memory_write_s,
+            "total_s": time.perf_counter() - total_started,
         }
 
     def _commit_batch(
@@ -553,7 +583,13 @@ class DolphinDBMinuteMemMapBuilder:
                 f"[MemMapBuild] day_complete year={year} "
                 f"day={int(result['day_index']) + 1:03d}/{len(dates):03d} "
                 f"date={result['date']} minute_rows={int(result['minute_rows']):,} "
-                f"excluded_rows={int(result['excluded_rows']):,}",
+                f"excluded_rows={int(result['excluded_rows']):,} "
+                f"timing_s=query:{float(result['ddb_query_s']):.2f},"
+                f"normalize_filter:{float(result['normalize_filter_s']):.2f},"
+                f"feature:{float(result['feature_s']):.2f},"
+                f"index_validate:{float(result['index_validate_s']):.2f},"
+                f"write:{float(result['memory_write_s']):.2f},"
+                f"total:{float(result['total_s']):.2f}",
                 flush=True,
             )
         print(
@@ -924,6 +960,11 @@ class DolphinDBMinuteRAMStore(MinuteMemMapStore):
                     f"shape={shape} workers={self.config.build_workers}",
                     flush=True,
                 )
+                year_started = time.perf_counter()
+                stage_totals = {key: 0.0 for key in LOAD_TIMING_KEYS}
+                task_total_s = 0.0
+                raw_rows_total = 0
+                minute_rows_total = 0
 
                 def load_day(day_index: int) -> dict[str, Any]:
                     return helper._write_day(
@@ -946,17 +987,45 @@ class DolphinDBMinuteRAMStore(MinuteMemMapStore):
                     for future in as_completed(futures):
                         result = future.result()
                         completed += 1
+                        for key in LOAD_TIMING_KEYS:
+                            stage_totals[key] += float(result[key])
+                        task_total_s += float(result["total_s"])
+                        raw_rows_total += int(result["raw_rows"])
+                        minute_rows_total += int(result["minute_rows"])
                         if completed == 1 or completed == len(futures) or completed % 10 == 0:
-                            elapsed = max(time.perf_counter() - started, 1e-9)
+                            year_elapsed = max(time.perf_counter() - year_started, 1e-9)
+                            rate = completed / year_elapsed
+                            eta_minutes = (
+                                (len(futures) - completed) / max(rate, 1e-9) / 60.0
+                            )
+                            stage_sum = max(sum(stage_totals.values()), 1e-9)
+                            stage_avg = ",".join(
+                                f"{key.removesuffix('_s')}:{stage_totals[key] / completed:.2f}"
+                                for key in LOAD_TIMING_KEYS
+                            )
+                            stage_share = ",".join(
+                                f"{key.removesuffix('_s')}:{stage_totals[key] / stage_sum * 100:.0f}%"
+                                for key in LOAD_TIMING_KEYS
+                            )
                             print(
                                 f"[DDBRAM] load_progress year={year} "
                                 f"days={completed}/{len(futures)} date={result['date']} "
+                                f"raw_rows={int(result['raw_rows']):,} "
                                 f"minute_rows={int(result['minute_rows']):,} "
-                                f"elapsed_minutes={elapsed / 60:.1f}",
+                                f"wall_minutes={year_elapsed / 60:.1f} "
+                                f"rate_days_per_min={rate * 60:.2f} "
+                                f"eta_minutes={eta_minutes:.1f} "
+                                f"current_total_s={float(result['total_s']):.2f} "
+                                f"stage_avg_s={stage_avg} stage_share={stage_share}",
                                 flush=True,
                             )
+                year_elapsed = max(time.perf_counter() - year_started, 1e-9)
                 print(
                     f"[DDBRAM] year_complete year={year} "
+                    f"days={completed} raw_rows={raw_rows_total:,} "
+                    f"minute_rows={minute_rows_total:,} wall_seconds={year_elapsed:.1f} "
+                    f"worker_task_seconds={task_total_s:.1f} "
+                    f"effective_parallelism={task_total_s / year_elapsed:.2f} "
                     f"resident_gb={sum(a.nbytes for a in self._ram_arrays.values()) / 1024**3:.1f}",
                     flush=True,
                 )
