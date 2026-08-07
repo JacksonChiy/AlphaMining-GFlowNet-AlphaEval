@@ -65,7 +65,11 @@ dataset:
     # Reward直接在(day, minute, stock)数组上运行；不构造分钟Pandas长表。
     reward_backend: numpy
     # 每个任务最多处理20个交易日。越小进度越细、峰值内存越低，但任务调度更多。
-    reward_chunk_days: 20
+    reward_chunk_days: 10
+    # 单个进程每次最多同时计算2个Reduce Block，限制NumPy float64中间数组峰值。
+    reward_blocks_per_task: 2
+    # Windows默认用多进程；若嵌入式Python仍出现worker退出，可临时改为threading。
+    reward_parallel_backend: loky
     # 若未来Grammar加入尚未迁移的算子，自动回退旧Pandas实现；当前92个动作均已支持。
     numpy_fallback: true
     # 每批至少处理该数量的交易日后统一flush；实际批次不会小于build_workers。

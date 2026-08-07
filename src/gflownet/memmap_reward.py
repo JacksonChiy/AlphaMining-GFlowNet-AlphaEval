@@ -11,6 +11,7 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
+from joblib.externals.loky.process_executor import TerminatedWorkerError
 
 from src.data_loader.minute_memmap import MinuteMemMapStore
 from src.expression.minute import MinuteExpression, MinuteNode
@@ -279,14 +280,32 @@ def _execute_numpy_blocks(
                 missing.append(node)
             else:
                 cached_parts += 1
-        if missing:
-            missing_tasks.append((spec, missing))
+        for offset in range(0, len(missing), store.config.reward_blocks_per_task):
+            task_nodes = missing[offset:offset + store.config.reward_blocks_per_task]
+            if task_nodes:
+                missing_tasks.append((spec, task_nodes))
     channels = required_memmap_channels(nodes)
     total_parts = len(specs) * len(nodes)
+    max_channels = max(
+        (len(required_memmap_channels(task_nodes)) for _, task_nodes in missing_tasks),
+        default=0,
+    )
+    max_complexity = max(
+        (sum(node.complexity() for node in task_nodes) for _, task_nodes in missing_tasks),
+        default=0,
+    )
+    elements = (
+        store.config.reward_chunk_days * len(store.minute_grid) *
+        min(store.config.stock_tile_size, len(store.stocks))
+    )
+    estimated_mb = elements * (max_channels * 4 + max_complexity * 8 + 1) / 1024**2
     print(
         f"[MemMapReward] numpy_start workers={store.config.workers} "
+        f"parallel_backend={store.config.reward_parallel_backend} "
         f"date_chunk_days={store.config.reward_chunk_days} chunks={len(specs)} "
-        f"blocks={len(nodes)} required_channels={len(channels)}/{len(store.manifest['channels'])} "
+        f"blocks={len(nodes)} blocks_per_task={store.config.reward_blocks_per_task} "
+        f"required_channels={len(channels)}/{len(store.manifest['channels'])} "
+        f"estimated_peak_mb_per_worker<={estimated_mb:.0f} "
         f"partial_hits={cached_parts}/{total_parts} pending_tasks={len(missing_tasks)}",
         flush=True,
     )
@@ -296,7 +315,7 @@ def _execute_numpy_blocks(
             try:
                 results = Parallel(
                     n_jobs=store.config.workers,
-                    backend="loky",
+                    backend=store.config.reward_parallel_backend,
                     batch_size=1,
                     # Ordered streaming is supported by both the pinned project
                     # joblib and newer releases, and still lets the parent save
@@ -306,7 +325,7 @@ def _execute_numpy_blocks(
                     delayed(_compute_numpy_chunk)(store.config, task_nodes, spec)
                     for spec, task_nodes in missing_tasks
                 )
-            except (PermissionError, NotImplementedError) as error:
+            except (PermissionError, NotImplementedError, TerminatedWorkerError) as error:
                 print(
                     f"[MemMapReward] loky_unavailable sequential_fallback=true "
                     f"error={type(error).__name__}: {error}",
@@ -322,7 +341,10 @@ def _execute_numpy_blocks(
                 for spec, task_nodes in missing_tasks
             )
         completed = 0
-        for spec, computed, _ in results:
+
+        def persist_result(result) -> None:
+            nonlocal completed
+            spec, computed, _ = result
             completed += 1
             for expression, values in computed.items():
                 partial.save(expression, spec, values)
@@ -335,6 +357,23 @@ def _execute_numpy_blocks(
                     f"rate={rate:.2f}/s eta={eta/60:.1f}m partial_writes={partial.writes}",
                     flush=True,
                 )
+
+        try:
+            for result in results:
+                persist_result(result)
+        except TerminatedWorkerError as error:
+            print(
+                f"[MemMapReward] worker_terminated sequential_resume=true "
+                f"completed={completed}/{len(missing_tasks)} error={error}",
+                flush=True,
+            )
+            for spec, task_nodes in missing_tasks:
+                remaining = [
+                    node for node in task_nodes
+                    if partial.load(node.render(), spec) is None
+                ]
+                if remaining:
+                    persist_result(_compute_numpy_chunk(store.config, remaining, spec))
 
     selected_dates = store.dates[
         (store.dates >= pd.Timestamp(start_date)) & (store.dates <= pd.Timestamp(end_date))

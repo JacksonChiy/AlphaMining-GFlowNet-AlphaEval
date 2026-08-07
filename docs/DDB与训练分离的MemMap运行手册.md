@@ -261,7 +261,7 @@ python scripts/train_cpu.py `
 ```text
 [MinuteGFlowNet] memmap_enabled remote_ddb_queries_during_training=0
 [MemMapReward] execution_plan ... remote_ddb_queries=0 coarse_screen=false
-[MemMapReward] numpy_start ... date_chunk_days=20 ... required_channels=.../19
+[MemMapReward] numpy_start ... date_chunk_days=10 ... blocks_per_task=2 ... estimated_peak_mb_per_worker=...
 [MemMapReward] numpy_progress tasks=... rate=... eta=... partial_writes=...
 [MemMapReward] numpy_complete ... pandas_rows_built=0
 ```
@@ -302,13 +302,38 @@ E:\AlphaMining\block_cache\
 memmap:
   workers: 4
   reward_backend: numpy
-  reward_chunk_days: 20
+  reward_chunk_days: 10
+  reward_blocks_per_task: 2
+  reward_parallel_backend: loky
   numpy_fallback: true
 ```
 
-内存不足时先把`reward_chunk_days`调为10，再减少`stock_tile_size`；机械硬盘任务过碎时
-可把`reward_chunk_days`提高到40。`reward_backend: pandas`只用于结果核验或兼容未来尚未
+内存不足时先把`reward_blocks_per_task`调为1，再把`workers`调为2；仍不足时把
+`reward_chunk_days`调为5。机械硬盘任务过碎且内存充足时可把`reward_chunk_days`提高到20。
+`reward_backend: pandas`只用于结果核验或兼容未来尚未
 迁移的新算子，不建议正式训练使用。
+
+若出现以下警告：
+
+```text
+A worker stopped while some jobs were given to the executor
+```
+
+通常表示Windows终止了内存峰值过高的子进程，而不是DolphinDB或SATA磁盘卡住。新版会
+缩小表达式批次；若worker仍真正退出，会打印`worker_terminated sequential_resume=true`
+并从已落盘的小块单进程续算。稳定性优先时可改为：
+
+```yaml
+memmap:
+  workers: 2
+  reward_chunk_days: 5
+  reward_blocks_per_task: 1
+  reward_parallel_backend: threading
+```
+
+`threading`不会创建`loky`子进程，但包含大量Python分组循环的算子可能更慢。正式训练建议
+使用标准64位Python 3.11或3.12虚拟环境；Windows embeddable发行版更适合程序嵌入，
+不建议作为长时间多进程训练环境。
 
 ## 12. 正式构建与训练
 

@@ -42,7 +42,9 @@ class MinuteMemMapConfig:
     build_workers: int = 1
     flush_every_days: int = 1
     reward_chunk_days: int = 20
+    reward_blocks_per_task: int = 2
     reward_backend: str = "numpy"
+    reward_parallel_backend: str = "loky"
     numpy_fallback: bool = True
     force_rebuild: bool = False
 
@@ -50,6 +52,7 @@ class MinuteMemMapConfig:
         if min(
             self.expected_minutes, self.stock_tile_size, self.workers,
             self.build_workers, self.flush_every_days, self.reward_chunk_days,
+            self.reward_blocks_per_task,
         ) < 1:
             raise ValueError("MemMap size settings must be positive")
         actual = len(build_expected_minute_grid(
@@ -62,6 +65,8 @@ class MinuteMemMapConfig:
             )
         if self.reward_backend not in {"numpy", "pandas"}:
             raise ValueError("reward_backend must be 'numpy' or 'pandas'")
+        if self.reward_parallel_backend not in {"loky", "threading"}:
+            raise ValueError("reward_parallel_backend must be 'loky' or 'threading'")
 
     @property
     def minute_grid(self) -> tuple[str, ...]:
@@ -100,7 +105,11 @@ class MinuteMemMapConfig:
             build_workers=int(values.get("build_workers", 1)),
             flush_every_days=int(values.get("flush_every_days", 1)),
             reward_chunk_days=int(values.get("reward_chunk_days", 20)),
+            reward_blocks_per_task=int(values.get("reward_blocks_per_task", 2)),
             reward_backend=str(values.get("reward_backend", "numpy")).lower(),
+            reward_parallel_backend=str(
+                values.get("reward_parallel_backend", "loky")
+            ).lower(),
             numpy_fallback=bool(values.get("numpy_fallback", True)),
             force_rebuild=bool(values.get("force_rebuild", False)),
         )
