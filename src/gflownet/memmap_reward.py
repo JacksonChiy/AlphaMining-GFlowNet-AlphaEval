@@ -69,6 +69,66 @@ def _compute_numpy_chunk(
     return spec, values, channels
 
 
+def pack_nodes_by_channel_dependency(
+    nodes: Sequence[MinuteNode],
+    max_blocks: int,
+    enabled: bool = True,
+    channel_map: dict[MinuteNode, frozenset[str]] | None = None,
+) -> list[list[MinuteNode]]:
+    """Greedily pack blocks to minimize repeated MemMap channel slices."""
+    if max_blocks < 1:
+        raise ValueError("max_blocks must be positive")
+    ordered = list(nodes)
+    if not enabled:
+        return [
+            ordered[offset:offset + max_blocks]
+            for offset in range(0, len(ordered), max_blocks)
+        ]
+    dependencies = channel_map or {
+        node: frozenset(required_memmap_channels([node])) for node in ordered
+    }
+    remaining = sorted(ordered, key=lambda node: node.render())
+    batches: list[list[MinuteNode]] = []
+    while remaining:
+        def seed_score(node: MinuteNode) -> tuple[int, int, int, str]:
+            channels = dependencies[node]
+            best_overlap = max(
+                (len(channels & dependencies[other]) for other in remaining if other != node),
+                default=0,
+            )
+            return best_overlap, len(channels), node.complexity(), node.render()
+
+        seed = max(remaining, key=seed_score)
+        remaining.remove(seed)
+        batch = [seed]
+        union = set(dependencies[seed])
+        while remaining and len(batch) < max_blocks:
+            candidate = min(
+                remaining,
+                key=lambda node: (
+                    len(dependencies[node] - union),
+                    -len(dependencies[node] & union),
+                    -node.complexity(),
+                    node.render(),
+                ),
+            )
+            remaining.remove(candidate)
+            batch.append(candidate)
+            union.update(dependencies[candidate])
+        batches.append(batch)
+    return batches
+
+
+def _channel_slice_cost(
+    batches: Sequence[Sequence[MinuteNode]],
+    channel_map: dict[MinuteNode, frozenset[str]],
+) -> int:
+    return sum(
+        len(set().union(*(channel_map[node] for node in batch)))
+        for batch in batches if batch
+    )
+
+
 class PersistentMinuteBlockCache:
     """Dense daily float32 block cache keyed by source/date scope/expression."""
 
@@ -404,6 +464,11 @@ def _execute_numpy_blocks(
     )
     missing_tasks: list[tuple[tuple[int, int, int, int, int], list[MinuteNode]]] = []
     cached_parts = 0
+    node_channels = {
+        node: frozenset(required_memmap_channels([node])) for node in nodes
+    }
+    previous_order_channel_slices = 0
+    planned_channel_slices = 0
     for spec_index, spec in enumerate(specs, start=1):
         missing = []
         for node in nodes:
@@ -411,10 +476,25 @@ def _execute_numpy_blocks(
                 missing.append(node)
             else:
                 cached_parts += 1
-        for offset in range(0, len(missing), store.config.reward_blocks_per_task):
-            task_nodes = missing[offset:offset + store.config.reward_blocks_per_task]
-            if task_nodes:
-                missing_tasks.append((spec, task_nodes))
+        previous_batches = pack_nodes_by_channel_dependency(
+            missing,
+            store.config.reward_blocks_per_task,
+            enabled=False,
+            channel_map=node_channels,
+        )
+        task_batches = pack_nodes_by_channel_dependency(
+            missing,
+            store.config.reward_blocks_per_task,
+            enabled=store.config.reward_group_by_channels,
+            channel_map=node_channels,
+        )
+        previous_cost = _channel_slice_cost(previous_batches, node_channels)
+        planned_cost = _channel_slice_cost(task_batches, node_channels)
+        if planned_cost > previous_cost:
+            task_batches, planned_cost = previous_batches, previous_cost
+        previous_order_channel_slices += previous_cost
+        planned_channel_slices += planned_cost
+        missing_tasks.extend((spec, task_nodes) for task_nodes in task_batches)
         if spec_index == 1 or spec_index == len(specs) or spec_index % 100 == 0:
             print(
                 f"[MemMapReward] partial_cache_scan specs={spec_index}/{len(specs)} "
@@ -437,12 +517,19 @@ def _execute_numpy_blocks(
         min(store.config.stock_tile_size, len(store.stocks))
     )
     estimated_mb = elements * (max_channels * 4 + max_complexity * 8 + 1) / 1024**2
+    channel_savings = (
+        1.0 - planned_channel_slices / previous_order_channel_slices
+        if previous_order_channel_slices else 0.0
+    )
     print(
         f"[MemMapReward] numpy_start workers={store.config.workers} "
         f"parallel_backend={store.config.reward_parallel_backend} "
         f"date_chunk_days={store.config.reward_chunk_days} chunks={len(specs)} "
         f"blocks={len(nodes)} blocks_per_task={store.config.reward_blocks_per_task} "
         f"required_channels={len(channels)}/{len(store.manifest['channels'])} "
+        f"channel_grouping={str(store.config.reward_group_by_channels).lower()} "
+        f"channel_slices={planned_channel_slices}/{previous_order_channel_slices} "
+        f"channel_slice_savings={channel_savings:.1%} "
         f"estimated_peak_mb_per_worker<={estimated_mb:.0f} "
         f"partial_cache=consolidated_v2 files_per_block=3 "
         f"legacy_migrated={partial.migrated_legacy_parts} "

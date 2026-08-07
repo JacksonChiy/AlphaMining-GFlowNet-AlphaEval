@@ -317,6 +317,7 @@ memmap:
   reward_backend: numpy
   reward_chunk_days: 10
   reward_blocks_per_task: 2
+  reward_group_by_channels: true
   reward_cache_commit_tasks: 10
   reward_parallel_backend: loky
   numpy_fallback: true
@@ -374,6 +375,27 @@ python scripts/benchmark_minute_numpy.py `
 
 输出中的`million_block_elements_per_second`用于比较同一台机器、相同Python环境和相同
 代码版本，不建议直接与不同CPU或不同任务形状的结果比较。
+
+## 11.2 按通道依赖打包Block
+
+`reward_group_by_channels: true`会在不改变`reward_blocks_per_task`的前提下重新排列
+待计算Block。只依赖`close`的表达式优先进入同一任务，依赖`ret`和`vol`的表达式优先
+进入另一任务，从而共享一次MemMap切片读取和同一执行器中的公共子表达式缓存。
+
+程序同时计算原顺序与依赖分组的计划成本；若依赖分组没有减少通道切片，则自动保留
+原顺序，因此该优化不会增加计划读取次数。训练日志示例：
+
+```text
+channel_grouping=true channel_slices=4200/6800 channel_slice_savings=38.2%
+```
+
+这里的`slices`是“一个任务读取一个通道切片”的次数，不是DolphinDB查询次数。训练期间
+远程查询仍为0。关闭该优化只需设置：
+
+```yaml
+memmap:
+  reward_group_by_channels: false
+```
 
 ## 12. 正式构建与训练
 

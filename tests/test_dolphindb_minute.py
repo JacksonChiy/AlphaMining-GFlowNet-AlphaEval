@@ -30,6 +30,7 @@ from src.gflownet.memmap_reward import (
     PartialMinuteBlockCache,
     PersistentMinuteBlockCache,
     execute_memmap_blocks,
+    pack_nodes_by_channel_dependency,
 )
 from src.gflownet.minute_factor_pool import (
     save_minute_alpha_pool_from_cache,
@@ -519,6 +520,28 @@ def test_consolidated_partial_cache_migrates_legacy_and_survives_rechunking(
     assert len(new_specs) == 2
     assert np.allclose(rechunked_cache.load(expression, new_specs[0]), expected[:1])
     assert np.allclose(rechunked_cache.load(expression, new_specs[1]), expected[1:])
+
+
+def test_channel_dependency_packing_groups_compatible_blocks() -> None:
+    nodes = [
+        minute_expression_from_tokens(tokens).block_nodes()[0]
+        for tokens in (
+            ["r_mean", "close"],
+            ["r_corr", "ret", "vol"],
+            ["r_std", "close"],
+            ["r_wmean", "ret", "vol"],
+            ["r_mean", "amount"],
+        )
+    ]
+    batches = pack_nodes_by_channel_dependency(nodes, max_blocks=2, enabled=True)
+    rendered = [{node.render() for node in batch} for batch in batches]
+    assert {"r_mean(close)", "r_std(close)"} in rendered
+    assert {"r_corr(ret,vol)", "r_wmean(ret,vol)"} in rendered
+    assert {"r_mean(amount)"} in rendered
+    ungrouped = pack_nodes_by_channel_dependency(nodes, max_blocks=2, enabled=False)
+    assert [node.render() for node in ungrouped[0]] == [
+        "r_mean(close)", "r_corr(ret,vol)",
+    ]
 
 
 def test_minute_quality_audit_reports_extra_time_and_duplicate_key(tmp_path) -> None:

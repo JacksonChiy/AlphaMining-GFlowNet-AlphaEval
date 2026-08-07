@@ -68,6 +68,8 @@ dataset:
     reward_chunk_days: 10
     # 单个进程每次最多同时计算2个Reduce Block，限制NumPy float64中间数组峰值。
     reward_blocks_per_task: 2
+    # 按close、ret+vol等依赖签名打包Block，使同一任务共享通道读取和子表达式缓存。
+    reward_group_by_channels: true
     # 主进程每累计10个任务提交一次二维因子MemMap和完成位图；中断最多重算9个任务。
     reward_cache_commit_tasks: 10
     # Windows默认用多进程；若嵌入式Python仍出现worker退出，可临时改为threading。

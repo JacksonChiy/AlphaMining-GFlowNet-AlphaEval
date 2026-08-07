@@ -43,6 +43,7 @@ class MinuteMemMapConfig:
     flush_every_days: int = 1
     reward_chunk_days: int = 20
     reward_blocks_per_task: int = 2
+    reward_group_by_channels: bool = True
     reward_cache_commit_tasks: int = 10
     reward_backend: str = "numpy"
     reward_parallel_backend: str = "loky"
@@ -108,6 +109,7 @@ class MinuteMemMapConfig:
             flush_every_days=int(values.get("flush_every_days", 1)),
             reward_chunk_days=int(values.get("reward_chunk_days", 20)),
             reward_blocks_per_task=int(values.get("reward_blocks_per_task", 2)),
+            reward_group_by_channels=bool(values.get("reward_group_by_channels", True)),
             reward_cache_commit_tasks=int(values.get("reward_cache_commit_tasks", 10)),
             reward_backend=str(values.get("reward_backend", "numpy")).lower(),
             reward_parallel_backend=str(
