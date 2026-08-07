@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import traceback
+from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -46,12 +48,74 @@ def main() -> None:
     parser.add_argument("--config", default=None)
     parser.add_argument("--threads", type=int, default=None)
     parser.add_argument("--pool-size", type=int, default=None)
+    parser.add_argument(
+        "--log-dir",
+        default=None,
+        help="Log directory; defaults to outputs.log_dir or results/logs",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Explicit log file path; overrides --log-dir and outputs.log_dir",
+    )
     args = parser.parse_args()
     config_path = args.config or (
         "configs/minute_training_cpu.yaml"
         if args.mode == "minute"
         else "configs/training_cpu.yaml"
     )
+    with Path(config_path).open("r", encoding="utf-8") as stream:
+        launcher_config = yaml.safe_load(stream) or {}
+    configured_log_dir = (
+        launcher_config.get("outputs", {}).get("log_dir", "results/logs")
+    )
+
+    # This module intentionally has no NumPy/Pandas/PyTorch imports. The CPU
+    # environment must be frozen before those libraries are loaded.
+    from src.runtime_logging import build_training_log_path, tee_console_output
+
+    log_path = build_training_log_path(
+        args.mode,
+        log_dir=args.log_dir or configured_log_dir,
+        log_file=args.log_file,
+    )
+    exit_code: int | None = None
+    with tee_console_output(log_path) as active_log_path:
+        print(
+            f"[CPUTraining] log_start file={active_log_path} "
+            f"started_at={datetime.now().astimezone().isoformat()}",
+            flush=True,
+        )
+        try:
+            _run_training(args, config_path)
+        except KeyboardInterrupt:
+            exit_code = 130
+            print(
+                f"[CPUTraining] log_end status=interrupted file={active_log_path}",
+                file=sys.stderr,
+                flush=True,
+            )
+            traceback.print_exc(file=sys.stderr)
+        except BaseException as error:
+            exit_code = 1
+            print(
+                f"[CPUTraining] log_end status=failed "
+                f"exception={type(error).__name__} file={active_log_path}",
+                file=sys.stderr,
+                flush=True,
+            )
+            traceback.print_exc(file=sys.stderr)
+        else:
+            print(
+                f"[CPUTraining] log_end status=completed file={active_log_path} "
+                f"finished_at={datetime.now().astimezone().isoformat()}",
+                flush=True,
+            )
+    if exit_code is not None:
+        raise SystemExit(exit_code)
+
+
+def _run_training(args: argparse.Namespace, config_path: str) -> None:
     report = configure_environment(config_path, args.threads)
 
     # Imports deliberately happen after the CPU environment is frozen.

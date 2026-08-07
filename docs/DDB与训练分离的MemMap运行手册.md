@@ -256,6 +256,47 @@ python scripts/train_cpu.py `
   --threads 8
 ```
 
+启动后，终端日志会继续实时显示，同时自动写入：
+
+```text
+results/minute_cpu_ddb/logs/
+└── cpu_training_minute_YYYYMMDD_HHMMSS_ffffff_pid进程号.log
+```
+
+文件采用UTF-8和行缓冲写入，标准输出、Python警告、标准错误和完整异常堆栈都会保存；
+即使训练失败，已打印内容也不会丢失。首尾日志分别为：
+
+```text
+[CPUTraining] log_start file=...
+[CPUTraining] log_end status=completed|failed|interrupted file=...
+```
+
+临时指定日志目录：
+
+```powershell
+python scripts/train_cpu.py `
+  --mode minute `
+  --config configs/minute_training_cpu_ddb.yaml `
+  --threads 8 `
+  --log-dir E:\AlphaMining\training_logs
+```
+
+指定单个日志文件（同名文件采用追加模式，不会清空历史内容）：
+
+```powershell
+python scripts/train_cpu.py `
+  --mode minute `
+  --config configs/minute_training_cpu_ddb.yaml `
+  --threads 8 `
+  --log-file E:\AlphaMining\training_logs\minute_run_01.log
+```
+
+PowerShell实时查看最新日志：
+
+```powershell
+Get-Content E:\AlphaMining\training_logs\minute_run_01.log -Wait -Encoding UTF8
+```
+
 正常日志必须包含：
 
 ```text

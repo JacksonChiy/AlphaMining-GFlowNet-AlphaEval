@@ -126,6 +126,7 @@ pipeline:
   pool_attempts: 600
 
 outputs:
+  log_dir: results/minute_cpu_ddb/logs
   checkpoint: checkpoints/gflownet_minute_cpu_ddb_best.pt
   metrics: results/minute_cpu_ddb/gflownet_training_metrics.csv
   trajectory_metrics: results/minute_cpu_ddb/gflownet_trajectory_metrics.csv

@@ -152,6 +152,8 @@ python -m scripts.run_daily_pipeline --pool-size 100
 缓存写入和结果组装；Reward批次区分Block执行、表达式组装和金融指标评价；每个epoch
 区分采样、损失构造、反向传播、参数更新和checkpoint，并直接标出当前`bottleneck`。
 详细字段解释见[《DDB与训练分离的MemMap运行手册》](docs/DDB与训练分离的MemMap运行手册.md)。
+使用`scripts/train_cpu.py`启动时，以上终端输出、警告和异常会同时实时写入
+`outputs.log_dir`，默认分钟DDB路径为`results/minute_cpu_ddb/logs/`。
 
 ## GFlowNet 模型
 

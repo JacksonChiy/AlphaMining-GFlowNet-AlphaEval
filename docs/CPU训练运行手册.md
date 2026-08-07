@@ -126,6 +126,10 @@ python -m src.gflownet.run_minute_training \
 
 直接模块入口会强制训练设备为 CPU；但推荐使用 `scripts/train_cpu.py`，因为它能在导入底层计算库之前设置 BLAS 和 PyTorch 线程。
 
+`scripts/train_cpu.py`还会把终端的标准输出、警告、错误和异常堆栈实时追加到
+`outputs.log_dir`配置的目录。默认文件名包含运行模式、微秒级启动时间和进程号，
+因此多次运行不会互相覆盖。可用`--log-dir`临时改目录，或用`--log-file`指定文件。
+
 ## 6. 如何确认没有使用 GPU
 
 启动日志应包含：

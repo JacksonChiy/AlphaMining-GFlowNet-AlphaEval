@@ -87,6 +87,7 @@ pipeline:
   pool_attempts: 1000
 
 outputs:
+  log_dir: results/daily_cpu/logs
   checkpoint: checkpoints/gflownet_daily_cpu_best.pt
   metrics: results/daily_cpu/gflownet_training_metrics.csv
   trajectory_metrics: results/daily_cpu/gflownet_trajectory_metrics.csv

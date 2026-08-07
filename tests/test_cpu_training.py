@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
+from datetime import datetime
 from pathlib import Path
 
+from src.runtime_logging import build_training_log_path, tee_console_output
 from src.utils import load_config, validate_research_date_split
 
 
@@ -44,6 +47,35 @@ def test_cpu_configs_disable_amp_and_use_separate_outputs() -> None:
     assert validate_research_date_split(daily)["training"] == "2020-01-01..2023-12-31"
     assert daily["training"]["mixed_precision"] is False
     assert minute["training"]["mixed_precision"] is False
+    assert minute["outputs"]["log_dir"] == "results/minute_cpu/logs"
     assert "cpu" in daily["outputs"]["checkpoint"]
     assert "cpu" in minute["outputs"]["checkpoint"]
     assert daily["operators"]["time_series_backend"] == "pandas"
+
+
+def test_tee_logging_keeps_console_and_persists_stdout_stderr(
+    tmp_path, capsys
+) -> None:
+    log_path = tmp_path / "training.log"
+    with tee_console_output(log_path):
+        print("stdout message", flush=True)
+        print("stderr message", file=sys.stderr, flush=True)
+
+    captured = capsys.readouterr()
+    assert "stdout message" in captured.out
+    assert "stderr message" in captured.err
+    persisted = log_path.read_text(encoding="utf-8")
+    assert "stdout message" in persisted
+    assert "stderr message" in persisted
+
+
+def test_training_log_path_is_unique_and_windows_safe(tmp_path) -> None:
+    log_path = build_training_log_path(
+        "minute",
+        tmp_path,
+        now=datetime(2026, 8, 7, 12, 34, 56, 123456),
+    )
+    assert log_path.parent == tmp_path
+    assert log_path.suffix == ".log"
+    assert "cpu_training_minute_20260807_123456_123456_pid" in log_path.name
+    assert ":" not in log_path.name
