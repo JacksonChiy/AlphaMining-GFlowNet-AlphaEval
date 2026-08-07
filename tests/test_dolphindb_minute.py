@@ -26,7 +26,11 @@ from src.data_loader.minute_quality_audit import (
     DolphinDBMinuteQualityAuditor,
     MinuteQualityAuditConfig,
 )
-from src.gflownet.memmap_reward import PersistentMinuteBlockCache, execute_memmap_blocks
+from src.gflownet.memmap_reward import (
+    PartialMinuteBlockCache,
+    PersistentMinuteBlockCache,
+    execute_memmap_blocks,
+)
 from src.gflownet.minute_factor_pool import (
     save_minute_alpha_pool_from_cache,
     save_minute_alpha_pool_from_dolphindb_stream,
@@ -435,6 +439,13 @@ def test_ddb_to_local_memmap_build_read_and_persistent_block_cache(tmp_path) -> 
     expected = expression.execute(normalize_dolphindb_minutes(base_source)).sort_index()
     assert np.allclose(actual, expected)
     assert cache.writes == 1
+    expression_dirs = list(
+        (memmap_config.block_cache_dir / "partials_v2").glob("*/*")
+    )
+    assert len(expression_dirs) == 1
+    assert {path.name for path in expression_dirs[0].iterdir()} == {
+        "values.npy", "completed.npy", "metadata.json",
+    }
 
     second_cache = PersistentMinuteBlockCache(store, memmap_config.block_cache_dir)
     cached_blocks = execute_memmap_blocks(
@@ -460,6 +471,54 @@ def test_ddb_to_local_memmap_build_read_and_persistent_block_cache(tmp_path) -> 
         parallel_cache,
     )
     assert np.allclose(parallel_blocks["r_mean(close)"].sort_index(), expected)
+
+
+def test_consolidated_partial_cache_migrates_legacy_and_survives_rechunking(
+    tmp_path,
+) -> None:
+    source = _source_minutes()
+    loader = DolphinDBMinuteLoader(
+        _config(tmp_path), FakeDolphinDBSession(source)
+    )
+    config = MinuteMemMapConfig(
+        root=tmp_path / "minute_memmap",
+        block_cache_dir=tmp_path / "block_cache",
+        expected_minutes=3,
+        minute_sessions=(("09:30:00", "09:32:00"),),
+        minute_extra_times=(),
+        stock_tile_size=1,
+    )
+    DolphinDBMinuteMemMapBuilder(loader, config).build()
+    store = MinuteMemMapStore(config)
+    expression = "r_mean(close)"
+    cache = PartialMinuteBlockCache(
+        store, config.block_cache_dir, "2024-01-02", "2024-01-03"
+    )
+    old_specs = store.chunk_specs("2024-01-02", "2024-01-03")
+    assert len(old_specs) == 2
+    expected = np.array([[1.0, 3.0], [2.0, 4.0]], dtype=np.float32)
+    for index, spec in enumerate(old_specs):
+        legacy_path = cache.legacy_path(expression, spec)
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(legacy_path, expected[:, index:index + 1], allow_pickle=False)
+        migrated = cache.load(expression, spec)
+        assert np.allclose(migrated, expected[:, index:index + 1])
+    cache.commit()
+    assert cache.migrated_legacy_parts == 2
+    assert len(list(cache.expression_dir(expression).iterdir())) == 3
+
+    rechunked_config = replace(config, stock_tile_size=2, reward_chunk_days=1)
+    rechunked_store = MinuteMemMapStore(rechunked_config)
+    rechunked_cache = PartialMinuteBlockCache(
+        rechunked_store,
+        rechunked_config.block_cache_dir,
+        "2024-01-02",
+        "2024-01-03",
+    )
+    new_specs = rechunked_store.chunk_specs("2024-01-02", "2024-01-03")
+    assert len(new_specs) == 2
+    assert np.allclose(rechunked_cache.load(expression, new_specs[0]), expected[:1])
+    assert np.allclose(rechunked_cache.load(expression, new_specs[1]), expected[1:])
 
 
 def test_minute_quality_audit_reports_extra_time_and_duplicate_key(tmp_path) -> None:

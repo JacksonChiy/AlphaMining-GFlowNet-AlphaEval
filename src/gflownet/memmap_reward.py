@@ -160,7 +160,9 @@ class PersistentMinuteBlockCache:
 
 
 class PartialMinuteBlockCache:
-    """Small daily chunk files make long reward scans resumable after interruption."""
+    """Expression-level dense MemMaps with a crash-safe completion bitmap."""
+
+    FORMAT_VERSION = 2
 
     def __init__(
         self,
@@ -173,27 +175,123 @@ class PartialMinuteBlockCache:
             store.fingerprint, str(pd.Timestamp(start_date).date()),
             str(pd.Timestamp(end_date).date()), str(NUMPY_MINUTE_EXECUTOR_VERSION),
         ))
-        self.root = root / "partials" / hashlib.sha256(scope.encode()).hexdigest()[:20]
+        scope_key = hashlib.sha256(scope.encode()).hexdigest()[:20]
+        self.root = root / "partials_v2" / scope_key
+        self.legacy_root = root / "partials" / scope_key
         self.root.mkdir(parents=True, exist_ok=True)
+        self.store = store
+        self.dates = store.dates[
+            (store.dates >= pd.Timestamp(start_date))
+            & (store.dates <= pd.Timestamp(end_date))
+        ]
+        self.date_lookup = {date: index for index, date in enumerate(self.dates)}
+        self.shape = (len(self.dates), len(store.stocks))
+        self.start_date = str(pd.Timestamp(start_date).date())
+        self.end_date = str(pd.Timestamp(end_date).date())
+        self._arrays: dict[str, tuple[np.memmap, np.memmap]] = {}
+        self._pending: list[tuple[str, tuple[int, int, int, int, int]]] = []
         self.hits = 0
         self.writes = 0
+        self.commits = 0
+        self.migrated_legacy_parts = 0
 
-    def path(self, expression: str, spec: tuple[int, int, int, int, int]) -> Path:
-        expression_key = hashlib.sha256(expression.encode()).hexdigest()[:20]
-        return self.root / expression_key / ("_".join(map(str, spec)) + ".npy")
+    @staticmethod
+    def _expression_key(expression: str) -> str:
+        return hashlib.sha256(expression.encode()).hexdigest()[:20]
+
+    def expression_dir(self, expression: str) -> Path:
+        return self.root / self._expression_key(expression)
+
+    def legacy_path(
+        self, expression: str, spec: tuple[int, int, int, int, int]
+    ) -> Path:
+        return self.legacy_root / self._expression_key(expression) / (
+            "_".join(map(str, spec)) + ".npy"
+        )
+
+    def _slice(
+        self, spec: tuple[int, int, int, int, int]
+    ) -> tuple[slice, slice, tuple[int, int]]:
+        year, day_start, day_end, stock_start, stock_end = spec
+        dates = self.store._year_dates(year)[day_start:day_end]
+        if not len(dates) or dates[0] not in self.date_lookup:
+            raise KeyError(f"Chunk dates are outside the partial cache scope: {spec}")
+        row_start = self.date_lookup[dates[0]]
+        row_slice = slice(row_start, row_start + len(dates))
+        stock_slice = slice(stock_start, stock_end)
+        return row_slice, stock_slice, (len(dates), stock_end - stock_start)
+
+    def _open(self, expression: str) -> tuple[np.memmap, np.memmap]:
+        cached = self._arrays.get(expression)
+        if cached is not None:
+            return cached
+        directory = self.expression_dir(expression)
+        directory.mkdir(parents=True, exist_ok=True)
+        values_path = directory / "values.npy"
+        completed_path = directory / "completed.npy"
+        metadata_path = directory / "metadata.json"
+        expected = {
+            "format_version": self.FORMAT_VERSION,
+            "source_fingerprint": self.store.fingerprint,
+            "expression": expression,
+            "start_date": self.start_date,
+            "end_date": self.end_date,
+            "shape": list(self.shape),
+            "value_dtype": "float32",
+            "completion_dtype": "uint8",
+        }
+        valid_existing = False
+        if values_path.exists() and completed_path.exists() and metadata_path.exists():
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            valid_existing = all(
+                metadata.get(key) == value for key, value in expected.items()
+            )
+            if not valid_existing:
+                raise ValueError(
+                    f"Consolidated partial cache metadata mismatch: {metadata_path}"
+                )
+        if valid_existing:
+            values = np.load(values_path, mmap_mode="r+", allow_pickle=False)
+            completed = np.load(completed_path, mmap_mode="r+", allow_pickle=False)
+            if values.shape != self.shape or completed.shape != self.shape:
+                raise ValueError(f"Consolidated partial cache shape mismatch: {directory}")
+        else:
+            values = np.lib.format.open_memmap(
+                values_path, mode="w+", dtype=np.float32, shape=self.shape
+            )
+            values[:] = np.nan
+            values.flush()
+            completed = np.lib.format.open_memmap(
+                completed_path, mode="w+", dtype=np.uint8, shape=self.shape
+            )
+            completed[:] = 0
+            completed.flush()
+            temporary = metadata_path.with_suffix(".json.tmp")
+            temporary.write_text(
+                json.dumps(expected, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            temporary.replace(metadata_path)
+        self._arrays[expression] = values, completed
+        return values, completed
 
     def load(
         self, expression: str, spec: tuple[int, int, int, int, int]
     ) -> np.ndarray | None:
-        path = self.path(expression, spec)
-        if not path.exists():
-            return None
-        expected = (spec[2] - spec[1], spec[4] - spec[3])
-        values = np.load(path, mmap_mode="r", allow_pickle=False)
-        if values.shape != expected:
-            return None
-        self.hits += 1
-        return values
+        values, completed = self._open(expression)
+        row_slice, stock_slice, expected_shape = self._slice(spec)
+        if np.asarray(completed[row_slice, stock_slice], dtype=bool).all():
+            self.hits += 1
+            return np.asarray(values[row_slice, stock_slice], dtype=np.float32)
+        legacy_path = self.legacy_path(expression, spec)
+        if legacy_path.exists():
+            legacy = np.load(legacy_path, mmap_mode="r", allow_pickle=False)
+            if legacy.shape == expected_shape:
+                migrated = np.asarray(legacy, dtype=np.float32)
+                self.save(expression, spec, migrated)
+                self.migrated_legacy_parts += 1
+                self.hits += 1
+                return migrated
+        return None
 
     def save(
         self,
@@ -201,13 +299,40 @@ class PartialMinuteBlockCache:
         spec: tuple[int, int, int, int, int],
         values: np.ndarray,
     ) -> None:
-        path = self.path(expression, spec)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".npy.tmp")
-        with temporary.open("wb") as handle:
-            np.save(handle, np.asarray(values, dtype=np.float32), allow_pickle=False)
-        temporary.replace(path)
+        dense, _ = self._open(expression)
+        row_slice, stock_slice, expected_shape = self._slice(spec)
+        numeric = np.asarray(values, dtype=np.float32)
+        if numeric.shape != expected_shape:
+            raise ValueError(
+                f"Partial block shape {numeric.shape} does not match {expected_shape}: {spec}"
+            )
+        dense[row_slice, stock_slice] = numeric
+        self._pending.append((expression, spec))
         self.writes += 1
+
+    def commit(self) -> None:
+        if not self._pending:
+            return
+        expressions = {expression for expression, _ in self._pending}
+        # Values reach disk before completion bits. A crash can therefore only
+        # cause safe recomputation, never a false cache hit on a half-written tile.
+        for expression in expressions:
+            self._arrays[expression][0].flush()
+        for expression, spec in self._pending:
+            _, completed = self._arrays[expression]
+            row_slice, stock_slice, _ = self._slice(spec)
+            completed[row_slice, stock_slice] = 1
+        for expression in expressions:
+            self._arrays[expression][1].flush()
+        self._pending.clear()
+        self.commits += 1
+
+    def dense_values(self, expression: str) -> np.memmap:
+        self.commit()
+        values, completed = self._open(expression)
+        if not np.asarray(completed, dtype=bool).all():
+            raise RuntimeError(f"Consolidated partial cache is incomplete: {expression}")
+        return values
 
 
 def _run_pandas_blocks(
@@ -271,9 +396,15 @@ def _execute_numpy_blocks(
     partial = PartialMinuteBlockCache(
         store, store.config.block_cache_dir, start_date, end_date
     )
+    print(
+        f"[MemMapReward] partial_cache_prepare format=consolidated_v2 "
+        f"specs={len(specs)} blocks={len(nodes)} files_per_block=3 "
+        f"mb_per_block={np.prod(partial.shape) * 5 / 1024**2:.1f}",
+        flush=True,
+    )
     missing_tasks: list[tuple[tuple[int, int, int, int, int], list[MinuteNode]]] = []
     cached_parts = 0
-    for spec in specs:
+    for spec_index, spec in enumerate(specs, start=1):
         missing = []
         for node in nodes:
             if partial.load(node.render(), spec) is None:
@@ -284,6 +415,13 @@ def _execute_numpy_blocks(
             task_nodes = missing[offset:offset + store.config.reward_blocks_per_task]
             if task_nodes:
                 missing_tasks.append((spec, task_nodes))
+        if spec_index == 1 or spec_index == len(specs) or spec_index % 100 == 0:
+            print(
+                f"[MemMapReward] partial_cache_scan specs={spec_index}/{len(specs)} "
+                f"hits={cached_parts} legacy_migrated={partial.migrated_legacy_parts}",
+                flush=True,
+            )
+    partial.commit()
     channels = required_memmap_channels(nodes)
     total_parts = len(specs) * len(nodes)
     max_channels = max(
@@ -306,6 +444,8 @@ def _execute_numpy_blocks(
         f"blocks={len(nodes)} blocks_per_task={store.config.reward_blocks_per_task} "
         f"required_channels={len(channels)}/{len(store.manifest['channels'])} "
         f"estimated_peak_mb_per_worker<={estimated_mb:.0f} "
+        f"partial_cache=consolidated_v2 files_per_block=3 "
+        f"legacy_migrated={partial.migrated_legacy_parts} "
         f"partial_hits={cached_parts}/{total_parts} pending_tasks={len(missing_tasks)}",
         flush=True,
     )
@@ -348,6 +488,8 @@ def _execute_numpy_blocks(
             completed += 1
             for expression, values in computed.items():
                 partial.save(expression, spec, values)
+            if completed % store.config.reward_cache_commit_tasks == 0:
+                partial.commit()
             elapsed = max(time.monotonic() - started, 1e-9)
             if completed == 1 or completed == len(missing_tasks) or completed % 10 == 0:
                 rate = completed / elapsed
@@ -362,6 +504,7 @@ def _execute_numpy_blocks(
             for result in results:
                 persist_result(result)
         except TerminatedWorkerError as error:
+            partial.commit()
             print(
                 f"[MemMapReward] worker_terminated sequential_resume=true "
                 f"completed={completed}/{len(missing_tasks)} error={error}",
@@ -374,22 +517,12 @@ def _execute_numpy_blocks(
                 ]
                 if remaining:
                     persist_result(_compute_numpy_chunk(store.config, remaining, spec))
+        partial.commit()
 
-    selected_dates = store.dates[
-        (store.dates >= pd.Timestamp(start_date)) & (store.dates <= pd.Timestamp(end_date))
-    ]
-    date_lookup = {date: index for index, date in enumerate(selected_dates)}
+    selected_dates = partial.dates
     output: dict[str, pd.Series] = {}
     for node in nodes:
-        dense = np.full((len(selected_dates), len(store.stocks)), np.nan, dtype=np.float32)
-        for spec in specs:
-            year, day_start, day_end, stock_start, stock_end = spec
-            dates = store._year_dates(year)[day_start:day_end]
-            row_start = date_lookup[dates[0]]
-            values = partial.load(node.render(), spec)
-            if values is None:
-                raise RuntimeError(f"Missing partial cache after computation: {node.render()} {spec}")
-            dense[row_start:row_start + len(dates), stock_start:stock_end] = values
+        dense = partial.dense_values(node.render())
         row_index, stock_index = np.nonzero(np.isfinite(dense))
         index = pd.MultiIndex.from_arrays(
             [selected_dates[row_index], store.stocks[stock_index].astype(str)],
@@ -400,7 +533,9 @@ def _execute_numpy_blocks(
         )
     print(
         f"[MemMapReward] numpy_complete seconds={time.monotonic()-started:.1f} "
-        f"partial_hits={partial.hits} partial_writes={partial.writes} pandas_rows_built=0",
+        f"partial_hits={partial.hits} partial_writes={partial.writes} "
+        f"partial_commits={partial.commits} legacy_migrated={partial.migrated_legacy_parts} "
+        f"pandas_rows_built=0",
         flush=True,
     )
     return output

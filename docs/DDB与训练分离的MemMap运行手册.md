@@ -279,7 +279,10 @@ python scripts/train_cpu.py `
 
 ```text
 E:\AlphaMining\block_cache\
-├── partials\日期范围哈希\表达式哈希\年份_日起_日止_股起_股止.npy
+├── partials_v2\日期范围哈希\表达式哈希\
+│   ├── values.npy
+│   ├── completed.npy
+│   └── metadata.json
 ├── 表达式哈希.npy
 └── 表达式哈希.json
 ```
@@ -292,9 +295,19 @@ E:\AlphaMining\block_cache\
 
 同一数据源和日期范围下，重新运行训练可直接命中已有Block。源表、复权状态或日期范围发生变化时不会错误复用旧缓存。
 
-训练按`reward_chunk_days × stock_tile_size`切块。每完成一个小块便立即写入
-`partials`，因此关闭进程、Windows重启或训练异常后，重新执行同一命令会跳过已完成
-的小块。只有日内Reduce完成后的二维日频结果才转换为Pandas，远程DDB查询数始终为0。
+训练仍按`reward_chunk_days × stock_tile_size`计算，但不再为每个计算块创建小文件。
+每个表达式只使用一个二维`values.npy`、一个同形状完成位图`completed.npy`和一个
+`metadata.json`。主进程先刷新因子值，再设置完成位图；异常中断最多造成少量安全重算，
+不会把半写结果当成有效缓存。日期块和股票块参数发生变化后，完成位图仍可按新切片命中。
+只有日内Reduce完成后的二维日频结果才转换为Pandas，远程DDB查询数始终为0。
+
+旧版`partials`小文件会在首次访问时自动复制进`partials_v2`，日志显示：
+
+```text
+partial_cache=consolidated_v2 files_per_block=3 legacy_migrated=...
+```
+
+旧目录不会自动删除，避免迁移中断时丢失恢复点。确认完整Block已经生成后，可自行归档旧目录。
 
 默认优化参数：
 
@@ -304,6 +317,7 @@ memmap:
   reward_backend: numpy
   reward_chunk_days: 10
   reward_blocks_per_task: 2
+  reward_cache_commit_tasks: 10
   reward_parallel_backend: loky
   numpy_fallback: true
 ```

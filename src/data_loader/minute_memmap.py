@@ -43,6 +43,7 @@ class MinuteMemMapConfig:
     flush_every_days: int = 1
     reward_chunk_days: int = 20
     reward_blocks_per_task: int = 2
+    reward_cache_commit_tasks: int = 10
     reward_backend: str = "numpy"
     reward_parallel_backend: str = "loky"
     numpy_fallback: bool = True
@@ -53,6 +54,7 @@ class MinuteMemMapConfig:
             self.expected_minutes, self.stock_tile_size, self.workers,
             self.build_workers, self.flush_every_days, self.reward_chunk_days,
             self.reward_blocks_per_task,
+            self.reward_cache_commit_tasks,
         ) < 1:
             raise ValueError("MemMap size settings must be positive")
         actual = len(build_expected_minute_grid(
@@ -106,6 +108,7 @@ class MinuteMemMapConfig:
             flush_every_days=int(values.get("flush_every_days", 1)),
             reward_chunk_days=int(values.get("reward_chunk_days", 20)),
             reward_blocks_per_task=int(values.get("reward_blocks_per_task", 2)),
+            reward_cache_commit_tasks=int(values.get("reward_cache_commit_tasks", 10)),
             reward_backend=str(values.get("reward_backend", "numpy")).lower(),
             reward_parallel_backend=str(
                 values.get("reward_parallel_backend", "loky")

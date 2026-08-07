@@ -76,7 +76,7 @@ RQAlphaPlus 是授权软件，需要通过米筐授权渠道独立安装，详�
 
 ### DolphinDB分钟数据MemMap CPU训练
 
-`cpu-training`分支支持DDB与训练分离部署。远程DolphinDB只在首次构建时按交易日传输数据；构建器使用多线程独立DDB session并行写入不同交易日切片。训练服务器将19个分钟通道保存为按年组织的`float32 (n_days, 241, n_stocks)`本地MemMap；GFlowNet训练阶段不再连接DDB。Reward默认直接在NumPy三维数组上执行，只读取表达式需要的通道，并按日期小块持续打印进度。排名、滚动、掩码、相关性、协方差、加权均值、高阶矩和趋势统计均提供批量向量化路径；全空组直接跳过，缺分钟与并列值保留精确兼容路径。每个小块立即持久化，训练中断后可以续算；只有日内Reduce后的日频结果才转换为Pandas。旧Pandas执行器保留为显式兼容回退，不会创建原始分钟PKL。
+`cpu-training`分支支持DDB与训练分离部署。远程DolphinDB只在首次构建时按交易日传输数据；构建器使用多线程独立DDB session并行写入不同交易日切片。训练服务器将19个分钟通道保存为按年组织的`float32 (n_days, 241, n_stocks)`本地MemMap；GFlowNet训练阶段不再连接DDB。Reward默认直接在NumPy三维数组上执行，只读取表达式需要的通道，并按日期小块持续打印进度。排名、滚动、掩码、相关性、协方差、加权均值、高阶矩和趋势统计均提供批量向量化路径；全空组直接跳过，缺分钟与并列值保留精确兼容路径。每个表达式的中间结果合并保存为二维因子MemMap、完成位图和元数据三个文件，训练中断后可以续算，旧版partial小文件会自动迁移；只有日内Reduce后的日频结果才转换为Pandas。旧Pandas执行器保留为显式兼容回退，不会创建原始分钟PKL。
 
 ```bash
 python scripts/prepare_ddb_minute.py \
