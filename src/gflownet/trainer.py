@@ -278,6 +278,7 @@ class GFlowNetTrainer:
                     expressions, reward_executor, log_progress=True
                 )
                 reward_seconds = time.perf_counter() - reward_started
+                loss_build_started = time.perf_counter()
                 for log_pf, breakdown in zip(log_probabilities, breakdowns):
                     losses.append(self.trajectory_balance_loss(log_pf, breakdown.reward))
                     rewards.append(breakdown.reward)
@@ -287,9 +288,11 @@ class GFlowNetTrainer:
                 step_values = torch.stack(
                     [torch.stack(log_probabilities), torch.stack(losses)]
                 ).detach().float().cpu().numpy()
+                loss_build_seconds = time.perf_counter() - loss_build_started
                 average_step_seconds = (
                     sampling_seconds + reward_seconds
                 ) / self.config.trajectories_per_epoch
+                trajectory_logging_started = time.perf_counter()
                 for trajectory_index, (expression, tokens, breakdown) in enumerate(
                     zip(expressions, token_sequences, breakdowns), start=1
                 ):
@@ -341,15 +344,20 @@ class GFlowNetTrainer:
                         flush=False,
                     )
                 sys.stdout.flush()
+                trajectory_logging_seconds = (
+                    time.perf_counter() - trajectory_logging_started
+                )
+            backward_started = time.perf_counter()
             self.scaler.scale(loss).backward()
+            backward_seconds = time.perf_counter() - backward_started
+            optimizer_started = time.perf_counter()
             self.scaler.unscale_(self.optimizer)
             gradient_norm = torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.config.gradient_clip
             )
             self.scaler.step(self.optimizer)
             self.scaler.update()
-            epoch_seconds = time.perf_counter() - epoch_started
-            elapsed_seconds = time.perf_counter() - training_started
+            optimizer_seconds = time.perf_counter() - optimizer_started
             learning_rate = float(self.optimizer.param_groups[0]["lr"])
             gpu_allocated_gb = 0.0
             gpu_reserved_gb = 0.0
@@ -372,8 +380,13 @@ class GFlowNetTrainer:
                 "gradient_norm": float(gradient_norm.detach().cpu()),
                 "sampling_seconds": float(sampling_seconds),
                 "reward_seconds": float(reward_seconds),
-                "epoch_seconds": float(epoch_seconds),
-                "elapsed_seconds": float(elapsed_seconds),
+                "loss_build_seconds": float(loss_build_seconds),
+                "trajectory_logging_seconds": float(trajectory_logging_seconds),
+                "backward_seconds": float(backward_seconds),
+                "optimizer_seconds": float(optimizer_seconds),
+                "checkpoint_seconds": 0.0,
+                "epoch_seconds": 0.0,
+                "elapsed_seconds": 0.0,
                 "gpu_allocated_gb": float(gpu_allocated_gb),
                 "gpu_reserved_gb": float(gpu_reserved_gb),
                 "gpu_peak_gb": float(gpu_peak_gb),
@@ -399,9 +412,45 @@ class GFlowNetTrainer:
             }
             self.history.append(record)
             is_best = record["loss"] < best_loss
+            checkpoint_started = time.perf_counter()
             if is_best:
                 best_loss = record["loss"]
                 self.save_checkpoint(checkpoint_path, best_loss)
+            checkpoint_seconds = time.perf_counter() - checkpoint_started
+            epoch_seconds = time.perf_counter() - epoch_started
+            elapsed_seconds = time.perf_counter() - training_started
+            record["checkpoint_seconds"] = float(checkpoint_seconds)
+            record["epoch_seconds"] = float(epoch_seconds)
+            record["elapsed_seconds"] = float(elapsed_seconds)
+            measured_stage_seconds = (
+                sampling_seconds + reward_seconds + loss_build_seconds
+                + trajectory_logging_seconds + backward_seconds + optimizer_seconds
+                + checkpoint_seconds
+            )
+            bottleneck_stage = max((
+                ("sampling", sampling_seconds),
+                ("reward", reward_seconds),
+                ("loss_build", loss_build_seconds),
+                ("trajectory_logging", trajectory_logging_seconds),
+                ("backward", backward_seconds),
+                ("optimizer", optimizer_seconds),
+                ("checkpoint", checkpoint_seconds),
+            ), key=lambda item: item[1])[0]
+            print(
+                f"[GFlowNet] stage_summary epoch={epoch:03d}/{self.config.epochs:03d} "
+                f"total_seconds={epoch_seconds:.3f} "
+                f"sampling_seconds={sampling_seconds:.3f} "
+                f"reward_seconds={reward_seconds:.3f} "
+                f"loss_build_seconds={loss_build_seconds:.3f} "
+                f"trajectory_logging_seconds={trajectory_logging_seconds:.3f} "
+                f"backward_seconds={backward_seconds:.3f} "
+                f"optimizer_seconds={optimizer_seconds:.3f} "
+                f"checkpoint_seconds={checkpoint_seconds:.3f} "
+                f"unattributed_seconds="
+                f"{max(epoch_seconds - measured_stage_seconds, 0.0):.3f} "
+                f"bottleneck={bottleneck_stage}",
+                flush=True,
+            )
             gpu_log = ""
             if self.device.type == "cuda":
                 gpu_log = (
@@ -421,6 +470,9 @@ class GFlowNetTrainer:
                 f" lr={learning_rate:.2e}"
                 f" sampling_seconds={sampling_seconds:.2f}"
                 f" reward_seconds={reward_seconds:.2f}"
+                f" backward_seconds={backward_seconds:.2f}"
+                f" optimizer_seconds={optimizer_seconds:.2f}"
+                f" checkpoint_seconds={checkpoint_seconds:.2f}"
                 f" epoch_seconds={epoch_seconds:.2f}"
                 f" elapsed_seconds={elapsed_seconds:.2f}"
                 f" cache_hits={int(record['cache_hits'])}"

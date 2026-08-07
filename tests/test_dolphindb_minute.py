@@ -370,7 +370,9 @@ def test_chunked_extract_daily_aggregation_and_partitioned_factor_pool(tmp_path)
     assert matrix["minute_factor_001"].notna().all()
 
 
-def test_ddb_to_local_memmap_build_read_and_persistent_block_cache(tmp_path) -> None:
+def test_ddb_to_local_memmap_build_read_and_persistent_block_cache(
+    tmp_path, capsys
+) -> None:
     base_source = _source_minutes()
     excluded = base_source.groupby(["date", "sym"], observed=True).head(1).copy()
     excluded["time"] = dt.time(9, 29)
@@ -436,6 +438,13 @@ def test_ddb_to_local_memmap_build_read_and_persistent_block_cache(tmp_path) -> 
     blocks = execute_memmap_blocks(
         store, list(expression.block_nodes()), "2024-01-02", "2024-01-03", cache
     )
+    performance_log = capsys.readouterr().out
+    assert "[MemMapReward] stage_complete stage=partial_cache_scan" in performance_log
+    assert "[MemMapReward] stage_complete stage=task_execution" in performance_log
+    assert "worker_read_sum_seconds=" in performance_log
+    assert "worker_compute_sum_seconds=" in performance_log
+    assert "[MemMapReward] stage_summary" in performance_log
+    assert "[MemMapBlockPipeline] stage_summary" in performance_log
     actual = expression.execute_from_blocks(blocks).sort_index()
     expected = expression.execute(normalize_dolphindb_minutes(base_source)).sort_index()
     assert np.allclose(actual, expected)

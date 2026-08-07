@@ -57,16 +57,52 @@ def _compute_numpy_chunk(
     store_config,
     nodes: Sequence[MinuteNode],
     spec: tuple[int, int, int, int, int],
-) -> tuple[tuple[int, int, int, int, int], dict[str, np.ndarray], tuple[str, ...]]:
+) -> tuple[
+    tuple[int, int, int, int, int],
+    dict[str, np.ndarray],
+    tuple[str, ...],
+    dict[str, float],
+]:
+    worker_started = time.perf_counter()
     store_key = str(store_config.root.resolve())
     store = _NUMPY_WORKER_STORES.get(store_key)
     if store is None:
         store = MinuteMemMapStore(store_config)
         _NUMPY_WORKER_STORES[store_key] = store
     channels = required_memmap_channels(nodes)
+    read_started = time.perf_counter()
     _, mask, arrays = store.read_numpy_chunk(spec, channels)
+    read_seconds = time.perf_counter() - read_started
+    compute_started = time.perf_counter()
     values = NumpyMinuteBlockExecutor(mask, arrays).execute(nodes)
-    return spec, values, channels
+    compute_seconds = time.perf_counter() - compute_started
+    return spec, values, channels, {
+        "read_seconds": read_seconds,
+        "compute_seconds": compute_seconds,
+        "worker_seconds": time.perf_counter() - worker_started,
+        "input_mb": (
+            mask.nbytes + sum(array.nbytes for array in arrays.values())
+        ) / 1024**2,
+        "grid_elements": float(mask.size),
+        "valid_elements": float(np.count_nonzero(mask)),
+        "output_elements": float(sum(value.size for value in values.values())),
+    }
+
+
+def _log_stage_complete(
+    component: str,
+    stage: str,
+    seconds: float,
+    pipeline_started: float,
+    **metrics: object,
+) -> None:
+    details = " ".join(f"{key}={value}" for key, value in metrics.items())
+    suffix = f" {details}" if details else ""
+    print(
+        f"[{component}] stage_complete stage={stage} seconds={seconds:.3f} "
+        f"elapsed_seconds={time.perf_counter() - pipeline_started:.3f}{suffix}",
+        flush=True,
+    )
 
 
 def pack_nodes_by_channel_dependency(
@@ -449,6 +485,9 @@ def _execute_numpy_blocks(
     start_date: str,
     end_date: str,
 ) -> dict[str, pd.Series]:
+    pipeline_started = time.perf_counter()
+    stage_seconds: dict[str, float] = {}
+    validation_started = time.perf_counter()
     validate_numpy_nodes(nodes)
     specs = store.chunk_specs(start_date, end_date)
     if not specs:
@@ -462,6 +501,16 @@ def _execute_numpy_blocks(
         f"mb_per_block={np.prod(partial.shape) * 5 / 1024**2:.1f}",
         flush=True,
     )
+    stage_seconds["validation_and_plan_input"] = time.perf_counter() - validation_started
+    _log_stage_complete(
+        "MemMapReward",
+        "validation_and_plan_input",
+        stage_seconds["validation_and_plan_input"],
+        pipeline_started,
+        specs=len(specs),
+        blocks=len(nodes),
+    )
+    cache_scan_started = time.perf_counter()
     missing_tasks: list[tuple[tuple[int, int, int, int, int], list[MinuteNode]]] = []
     cached_parts = 0
     node_channels = {
@@ -501,7 +550,29 @@ def _execute_numpy_blocks(
                 f"hits={cached_parts} legacy_migrated={partial.migrated_legacy_parts}",
                 flush=True,
             )
+    stage_seconds["partial_cache_scan"] = time.perf_counter() - cache_scan_started
+    _log_stage_complete(
+        "MemMapReward",
+        "partial_cache_scan",
+        stage_seconds["partial_cache_scan"],
+        pipeline_started,
+        hits=cached_parts,
+        total_parts=len(specs) * len(nodes),
+        hit_rate=f"{cached_parts / max(len(specs) * len(nodes), 1):.2%}",
+        pending_tasks=len(missing_tasks),
+        legacy_migrated=partial.migrated_legacy_parts,
+    )
+    initial_commit_started = time.perf_counter()
     partial.commit()
+    stage_seconds["initial_cache_commit"] = time.perf_counter() - initial_commit_started
+    if stage_seconds["initial_cache_commit"] >= 0.01:
+        _log_stage_complete(
+            "MemMapReward",
+            "initial_cache_commit",
+            stage_seconds["initial_cache_commit"],
+            pipeline_started,
+            commits=partial.commits,
+        )
     channels = required_memmap_channels(nodes)
     total_parts = len(specs) * len(nodes)
     max_channels = max(
@@ -536,7 +607,15 @@ def _execute_numpy_blocks(
         f"partial_hits={cached_parts}/{total_parts} pending_tasks={len(missing_tasks)}",
         flush=True,
     )
-    started = time.monotonic()
+    execution_started = time.perf_counter()
+    worker_read_seconds = 0.0
+    worker_compute_seconds = 0.0
+    worker_total_seconds = 0.0
+    parent_cache_write_seconds = 0.0
+    input_mb = 0.0
+    grid_elements = 0.0
+    valid_elements = 0.0
+    output_elements = 0.0
     if missing_tasks:
         if store.config.workers > 1:
             try:
@@ -570,20 +649,35 @@ def _execute_numpy_blocks(
         completed = 0
 
         def persist_result(result) -> None:
-            nonlocal completed
-            spec, computed, _ = result
+            nonlocal completed, worker_read_seconds, worker_compute_seconds
+            nonlocal worker_total_seconds, parent_cache_write_seconds, input_mb
+            nonlocal grid_elements, valid_elements, output_elements
+            spec, computed, _, timing = result
             completed += 1
+            worker_read_seconds += timing["read_seconds"]
+            worker_compute_seconds += timing["compute_seconds"]
+            worker_total_seconds += timing["worker_seconds"]
+            input_mb += timing["input_mb"]
+            grid_elements += timing["grid_elements"]
+            valid_elements += timing["valid_elements"]
+            output_elements += timing["output_elements"]
+            cache_write_started = time.perf_counter()
             for expression, values in computed.items():
                 partial.save(expression, spec, values)
             if completed % store.config.reward_cache_commit_tasks == 0:
                 partial.commit()
-            elapsed = max(time.monotonic() - started, 1e-9)
+            parent_cache_write_seconds += time.perf_counter() - cache_write_started
+            elapsed = max(time.perf_counter() - execution_started, 1e-9)
             if completed == 1 or completed == len(missing_tasks) or completed % 10 == 0:
                 rate = completed / elapsed
                 eta = (len(missing_tasks) - completed) / max(rate, 1e-9)
                 print(
                     f"[MemMapReward] numpy_progress tasks={completed}/{len(missing_tasks)} "
-                    f"rate={rate:.2f}/s eta={eta/60:.1f}m partial_writes={partial.writes}",
+                    f"rate={rate:.2f}/s eta={eta/60:.1f}m "
+                    f"read_sum_seconds={worker_read_seconds:.1f} "
+                    f"compute_sum_seconds={worker_compute_seconds:.1f} "
+                    f"cache_write_seconds={parent_cache_write_seconds:.1f} "
+                    f"input_gb={input_mb / 1024:.2f} partial_writes={partial.writes}",
                     flush=True,
                 )
 
@@ -604,8 +698,29 @@ def _execute_numpy_blocks(
                 ]
                 if remaining:
                     persist_result(_compute_numpy_chunk(store.config, remaining, spec))
+        final_commit_started = time.perf_counter()
         partial.commit()
+        parent_cache_write_seconds += time.perf_counter() - final_commit_started
 
+    stage_seconds["task_execution"] = time.perf_counter() - execution_started
+    _log_stage_complete(
+        "MemMapReward",
+        "task_execution",
+        stage_seconds["task_execution"],
+        pipeline_started,
+        tasks=len(missing_tasks),
+        task_rate=f"{len(missing_tasks) / max(stage_seconds['task_execution'], 1e-9):.2f}/s",
+        worker_read_sum_seconds=f"{worker_read_seconds:.3f}",
+        worker_compute_sum_seconds=f"{worker_compute_seconds:.3f}",
+        worker_other_sum_seconds=f"{max(worker_total_seconds - worker_read_seconds - worker_compute_seconds, 0.0):.3f}",
+        parent_cache_write_seconds=f"{parent_cache_write_seconds:.3f}",
+        input_gb=f"{input_mb / 1024:.3f}",
+        grid_melements=f"{grid_elements / 1e6:.1f}",
+        valid_rate=f"{valid_elements / max(grid_elements, 1.0):.2%}",
+        output_melements=f"{output_elements / 1e6:.1f}",
+    )
+
+    materialize_started = time.perf_counter()
     selected_dates = partial.dates
     output: dict[str, pd.Series] = {}
     for node in nodes:
@@ -618,8 +733,30 @@ def _execute_numpy_blocks(
         output[node.render()] = pd.Series(
             dense[row_index, stock_index].astype(float), index=index, name=node.render()
         )
+    stage_seconds["result_materialization"] = time.perf_counter() - materialize_started
+    output_rows = sum(len(values) for values in output.values())
+    _log_stage_complete(
+        "MemMapReward",
+        "result_materialization",
+        stage_seconds["result_materialization"],
+        pipeline_started,
+        blocks=len(output),
+        output_rows=output_rows,
+        row_rate=f"{output_rows / max(stage_seconds['result_materialization'], 1e-9):.0f}/s",
+    )
+    total_seconds = time.perf_counter() - pipeline_started
+    measured = sum(stage_seconds.values())
+    summary = " ".join(
+        f"{stage}_seconds={seconds:.3f}"
+        for stage, seconds in stage_seconds.items()
+    )
     print(
-        f"[MemMapReward] numpy_complete seconds={time.monotonic()-started:.1f} "
+        f"[MemMapReward] stage_summary total_seconds={total_seconds:.3f} "
+        f"unattributed_seconds={max(total_seconds - measured, 0.0):.3f} {summary}",
+        flush=True,
+    )
+    print(
+        f"[MemMapReward] numpy_complete seconds={total_seconds:.1f} "
         f"partial_hits={partial.hits} partial_writes={partial.writes} "
         f"partial_commits={partial.commits} legacy_migrated={partial.migrated_legacy_parts} "
         f"pandas_rows_built=0",
@@ -635,6 +772,8 @@ def execute_memmap_blocks(
     end_date: str,
     cache: PersistentMinuteBlockCache,
 ) -> dict[str, pd.Series]:
+    pipeline_started = time.perf_counter()
+    cache_lookup_started = time.perf_counter()
     output: dict[str, pd.Series] = {}
     pending: list[MinuteNode] = []
     for node in nodes:
@@ -643,8 +782,26 @@ def execute_memmap_blocks(
             pending.append(node)
         else:
             output[node.render()] = cached
+    cache_lookup_seconds = time.perf_counter() - cache_lookup_started
+    _log_stage_complete(
+        "MemMapBlockPipeline",
+        "persistent_cache_lookup",
+        cache_lookup_seconds,
+        pipeline_started,
+        hits=len(output),
+        misses=len(pending),
+        hit_rate=f"{len(output) / max(len(nodes), 1):.2%}",
+    )
     if not pending:
+        print(
+            f"[MemMapBlockPipeline] stage_summary "
+            f"total_seconds={time.perf_counter() - pipeline_started:.3f} "
+            f"persistent_cache_lookup_seconds={cache_lookup_seconds:.3f} "
+            "backend_compute_seconds=0.000 final_cache_write_seconds=0.000",
+            flush=True,
+        )
         return output
+    backend_started = time.perf_counter()
     if store.config.reward_backend == "pandas":
         computed_blocks = _run_pandas_blocks(store, pending, start_date, end_date)
     else:
@@ -658,6 +815,16 @@ def execute_memmap_blocks(
                 flush=True,
             )
             computed_blocks = _run_pandas_blocks(store, pending, start_date, end_date)
+    backend_seconds = time.perf_counter() - backend_started
+    _log_stage_complete(
+        "MemMapBlockPipeline",
+        "backend_compute",
+        backend_seconds,
+        pipeline_started,
+        backend=store.config.reward_backend,
+        blocks=len(pending),
+    )
+    final_cache_write_started = time.perf_counter()
     for node in pending:
         key = node.render()
         if key not in computed_blocks or computed_blocks[key].empty:
@@ -666,6 +833,23 @@ def execute_memmap_blocks(
         values = values[~values.index.duplicated(keep="last")]
         cache.save(key, start_date, end_date, values)
         output[key] = values
+    final_cache_write_seconds = time.perf_counter() - final_cache_write_started
+    _log_stage_complete(
+        "MemMapBlockPipeline",
+        "final_cache_write",
+        final_cache_write_seconds,
+        pipeline_started,
+        blocks=len(pending),
+        writes=cache.writes,
+    )
+    print(
+        f"[MemMapBlockPipeline] stage_summary "
+        f"total_seconds={time.perf_counter() - pipeline_started:.3f} "
+        f"persistent_cache_lookup_seconds={cache_lookup_seconds:.3f} "
+        f"backend_compute_seconds={backend_seconds:.3f} "
+        f"final_cache_write_seconds={final_cache_write_seconds:.3f}",
+        flush=True,
+    )
     return output
 
 
@@ -705,6 +889,8 @@ class MemMapMinuteRewardEvaluator:
     def evaluate_many(
         self, expressions: Sequence[MinuteExpression]
     ) -> list[RewardBreakdown]:
+        pipeline_started = time.perf_counter()
+        planning_started = time.perf_counter()
         unique = {str(expression): expression for expression in expressions}
         pending_expressions = [
             expression for key, expression in unique.items() if key not in self.cache
@@ -719,6 +905,18 @@ class MemMapMinuteRewardEvaluator:
                 else:
                     required.setdefault(key, node)
         self._block_misses += len(required)
+        planning_seconds = time.perf_counter() - planning_started
+        _log_stage_complete(
+            "MinuteRewardBatch",
+            "expression_and_block_planning",
+            planning_seconds,
+            pipeline_started,
+            requested=len(expressions),
+            unique=len(unique),
+            pending_expressions=len(pending_expressions),
+            required_blocks=len(required),
+        )
+        block_execution_started = time.perf_counter()
         if required:
             print(
                 f"[MemMapReward] execution_plan new_blocks={len(required):03d} "
@@ -734,17 +932,60 @@ class MemMapMinuteRewardEvaluator:
             )
             for key, values in computed.items():
                 self._put_block(key, values)
+        block_execution_seconds = time.perf_counter() - block_execution_started
+        _log_stage_complete(
+            "MinuteRewardBatch",
+            "block_execution",
+            block_execution_seconds,
+            pipeline_started,
+            required_blocks=len(required),
+            memory_cache_entries=len(self.block_cache),
+        )
+        expression_assembly_seconds = 0.0
+        factor_evaluation_seconds = 0.0
         for expression in pending_expressions:
             try:
+                assembly_started = time.perf_counter()
                 blocks = {
                     node.render(): self.block_cache[node.render()]
                     for node in expression.block_nodes()
                 }
                 factor = expression.execute_from_blocks(blocks)
+                expression_assembly_seconds += time.perf_counter() - assembly_started
+                evaluation_started = time.perf_counter()
                 result = self._evaluate_factor(factor)
+                factor_evaluation_seconds += time.perf_counter() - evaluation_started
             except (FloatingPointError, ValueError, KeyError, OverflowError, TypeError):
                 result = self.daily_evaluator._empty_breakdown()
             self.cache[str(expression)] = result
+        _log_stage_complete(
+            "MinuteRewardBatch",
+            "expression_assembly",
+            expression_assembly_seconds,
+            pipeline_started,
+            expressions=len(pending_expressions),
+        )
+        _log_stage_complete(
+            "MinuteRewardBatch",
+            "factor_evaluation",
+            factor_evaluation_seconds,
+            pipeline_started,
+            expressions=len(pending_expressions),
+        )
+        total_seconds = time.perf_counter() - pipeline_started
+        measured_seconds = (
+            planning_seconds + block_execution_seconds + expression_assembly_seconds
+            + factor_evaluation_seconds
+        )
+        print(
+            f"[MinuteRewardBatch] stage_summary total_seconds={total_seconds:.3f} "
+            f"planning_seconds={planning_seconds:.3f} "
+            f"block_execution_seconds={block_execution_seconds:.3f} "
+            f"expression_assembly_seconds={expression_assembly_seconds:.3f} "
+            f"factor_evaluation_seconds={factor_evaluation_seconds:.3f} "
+            f"unattributed_seconds={max(total_seconds - measured_seconds, 0.0):.3f}",
+            flush=True,
+        )
         return [self.cache[str(expression)] for expression in expressions]
 
     def _evaluate_factor(self, factor: pd.Series) -> RewardBreakdown:

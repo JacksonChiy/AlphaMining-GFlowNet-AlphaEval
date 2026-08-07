@@ -93,6 +93,8 @@ def test_training_prints_epoch_metrics(
     assert "[GFlowNet] batch_sampling_start epoch=001" in output
     assert "[GFlowNet] batch_sampling_complete epoch=001" in output
     assert "[GFlowNet] reward_progress completed=001/001" in output
+    assert "[GFlowNet] stage_summary epoch=001/001" in output
+    assert "bottleneck=" in output
     assert "cache_hit_rate=" in output
     assert "[GFlowNet] trajectory epoch=001/001 step=001/001" in output
     assert "global_step=00001/00001" in output
@@ -129,6 +131,11 @@ def test_training_prints_epoch_metrics(
         "gradient_norm",
         "sampling_seconds",
         "reward_seconds",
+        "loss_build_seconds",
+        "trajectory_logging_seconds",
+        "backward_seconds",
+        "optimizer_seconds",
+        "checkpoint_seconds",
         "epoch_seconds",
         "elapsed_seconds",
         "gpu_allocated_gb",

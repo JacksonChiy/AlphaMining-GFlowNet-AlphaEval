@@ -148,6 +148,11 @@ python -m scripts.run_daily_pipeline --pool-size 100
 
 为提高 A100 利用率，同一 epoch 的轨迹按批次进行 Transformer 推理，而不是逐轨迹执行 batch size 1；Reward 对批内唯一表达式使用多线程并行，RankIC、Top 10% LongIR、行业与市值暴露均使用向量化计算。九个日频时序算子会把数据组织成“股票 × 时间”张量，在 PyTorch CUDA 上分块执行；没有 CUDA 时自动回退到 Pandas。表达式执行器还会跨表达式复用结构相同的子树，例如多个因子共同包含的 `ts_mean(close,20)` 只计算一次。缓存支持并发 single-flight、有界 LRU 和内存上限，不会因表达式池增长而无限占用 RAM。默认 `reward_workers: 4`，可根据 Colab CPU 核数调整。逐步日志保留，但每个 epoch 只进行一次批量 GPU→CPU 指标同步。
 
+分钟MemMap训练会额外输出分阶段性能日志：底层区分缓存扫描、数据读取、NumPy算子、
+缓存写入和结果组装；Reward批次区分Block执行、表达式组装和金融指标评价；每个epoch
+区分采样、损失构造、反向传播、参数更新和checkpoint，并直接标出当前`bottleneck`。
+详细字段解释见[《DDB与训练分离的MemMap运行手册》](docs/DDB与训练分离的MemMap运行手册.md)。
+
 ## GFlowNet 模型
 
 状态包含动作 Token、部分表达式、当前与最大深度、算子数量、特征数量及归一化节点统计。Transformer Encoder 预测下一个合法的特征、算子或窗口动作，非法文法动作会被屏蔽。训练目标为：

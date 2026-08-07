@@ -262,9 +262,34 @@ python scripts/train_cpu.py `
 [MinuteGFlowNet] memmap_enabled remote_ddb_queries_during_training=0
 [MemMapReward] execution_plan ... remote_ddb_queries=0 coarse_screen=false
 [MemMapReward] numpy_start ... date_chunk_days=10 ... blocks_per_task=2 ... estimated_peak_mb_per_worker=...
-[MemMapReward] numpy_progress tasks=... rate=... eta=... partial_writes=...
+[MemMapReward] numpy_progress tasks=... rate=... eta=... read_sum_seconds=... compute_sum_seconds=... cache_write_seconds=...
+[MemMapReward] stage_complete stage=partial_cache_scan ...
+[MemMapReward] stage_complete stage=task_execution ...
+[MemMapReward] stage_complete stage=result_materialization ...
+[MemMapReward] stage_summary total_seconds=... partial_cache_scan_seconds=... task_execution_seconds=...
+[MinuteRewardBatch] stage_summary ... block_execution_seconds=... expression_assembly_seconds=... factor_evaluation_seconds=...
+[GFlowNet] stage_summary epoch=... sampling_seconds=... reward_seconds=... backward_seconds=... optimizer_seconds=... bottleneck=...
 [MemMapReward] numpy_complete ... pandas_rows_built=0
 ```
+
+### 10.1 分阶段性能日志怎么读
+
+日志按三层输出，不需要开启额外配置：
+
+1. `MemMapReward`：分钟块内部耗时。`partial_cache_scan`是完成位图扫描，
+   `task_execution`是并行读取和NumPy算子计算，`result_materialization`是把二维日频结果
+   整理为因子序列。
+2. `MinuteRewardBatch`：一批表达式的耗时。重点区分`block_execution`、
+   `expression_assembly`和`factor_evaluation`（IC、IR、覆盖率及风险惩罚）。
+3. `GFlowNet`：每个epoch的耗时。日志直接给出`bottleneck`，候选值包括
+   `sampling`、`reward`、`loss_build`、`trajectory_logging`、`backward`、
+   `optimizer`和`checkpoint`。
+
+`worker_read_sum_seconds`与`worker_compute_sum_seconds`是所有并行Worker耗时之和，
+用于判断I/O和算子计算的相对占比；它们不是墙钟时间，多Worker并行时可能大于
+`task_execution seconds`。`input_gb / task_execution seconds`可近似观察实际读取吞吐。
+`parent_cache_write_seconds`较高通常表示本地缓存落盘受限；`partial_cache_scan`较高则说明
+完成位图扫描或旧缓存迁移是主要开销。
 
 不应再出现：
 
