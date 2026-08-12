@@ -11,7 +11,7 @@
 - `src/gflownet/minute_grammar.py`：分钟 GFlowNet 前缀语法与 71 维动作空间；
 - `src/gflownet/minute_reward.py`：分钟表达式输出与日频 Reward 对齐；
 - `src/gflownet/run_minute_training.py`：A100 混合精度训练入口；
-- `configs/minute_training_config.yaml`：分钟训练配置。
+- `configs/minute/training.yaml`：分钟训练配置。
 
 ## 2. 输入数据约定
 
@@ -131,11 +131,11 @@ data/minute_price.pkl
 data/daily_price.pkl
 ```
 
-其中分钟表用于执行表达式，日频表用于构造 `t+1 → t+5` 收益标签和计算截面 RankIC、Top 10% 组合收益、风险惩罚与覆盖率惩罚。修改 `configs/minute_training_config.yaml` 后运行：
+其中分钟表用于执行表达式，日频表用于构造 `t+1 → t+5` 收益标签和计算截面 RankIC、Top 10% 组合收益、风险惩罚与覆盖率惩罚。修改 `configs/minute/training.yaml` 后运行：
 
 ```bash
 python -m src.gflownet.run_minute_training \
-  --config configs/minute_training_config.yaml
+  --config configs/minute/training.yaml
 ```
 
 仅做 CPU 小样本冒烟测试时可添加 `--allow-non-a100`；正式训练默认强制检测 NVIDIA A100，并使用 PyTorch mixed precision。

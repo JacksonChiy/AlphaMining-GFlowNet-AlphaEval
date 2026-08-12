@@ -26,7 +26,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Build report-style local minute MemMaps from a remote DolphinDB source"
     )
-    parser.add_argument("--config", default="configs/minute_training_cpu_ddb.yaml")
+    parser.add_argument("--config", default="configs/minute/cpu_ddb_memmap.yaml")
     args = parser.parse_args()
     with Path(args.config).open("r", encoding="utf-8") as stream:
         root = yaml.safe_load(stream) or {}

@@ -112,7 +112,7 @@ def build_all_index_inputs(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="从本地成分股文件生成三套指数增强预测输入")
-    parser.add_argument("--config", default="configs/index_enhancement.yaml")
+    parser.add_argument("--config", default="configs/index_enhancement/default.yaml")
     parser.add_argument("--predictions", default=None)
     parser.add_argument("--components", default=None)
     parser.add_argument("--output-root", default=None)

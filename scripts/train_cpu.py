@@ -60,9 +60,9 @@ def main() -> None:
     )
     args = parser.parse_args()
     config_path = args.config or (
-        "configs/minute_training_cpu.yaml"
+        "configs/minute/cpu.yaml"
         if args.mode == "minute"
-        else "configs/training_cpu.yaml"
+        else "configs/daily/cpu.yaml"
     )
     with Path(config_path).open("r", encoding="utf-8") as stream:
         launcher_config = yaml.safe_load(stream) or {}

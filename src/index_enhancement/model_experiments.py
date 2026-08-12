@@ -55,8 +55,8 @@ def run_experiments(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="运行三指数P2 LightGBM实验矩阵")
-    parser.add_argument("--training-config", default="configs/training_config.yaml")
-    parser.add_argument("--experiment-config", default="configs/index_model_experiments.yaml")
+    parser.add_argument("--training-config", default="configs/daily/training.yaml")
+    parser.add_argument("--experiment-config", default="configs/index_enhancement/model_experiments.yaml")
     parser.add_argument("--price", default="data/daily_price.pkl")
     parser.add_argument("--factors", default="results/alpha_factor_matrix.pkl")
     parser.add_argument("--evaluation", default="results/alpha_eval_result.csv")

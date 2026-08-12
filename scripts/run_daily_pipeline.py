@@ -17,7 +17,7 @@ from src.utils import load_config, slice_date_range, validate_research_date_spli
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the daily research pipeline")
-    parser.add_argument("--config", default="configs/training_config.yaml")
+    parser.add_argument("--config", default="configs/daily/training.yaml")
     parser.add_argument("--pool-size", type=int, default=None)
     parser.add_argument(
         "--allow-non-a100",

@@ -172,7 +172,7 @@ def freeze_fee_baseline(config_path: str | Path) -> Path:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="冻结统一万8手续费实验基线")
-    parser.add_argument("--config", default="configs/fee_0008_baseline.yaml")
+    parser.add_argument("--config", default="configs/baselines/fee_0008.yaml")
     args = parser.parse_args()
     freeze_fee_baseline(args.config)
 

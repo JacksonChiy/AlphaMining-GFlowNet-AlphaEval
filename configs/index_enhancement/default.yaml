@@ -54,7 +54,7 @@ indexes:
     prediction_dir: results_lambdarank/index_enhancement/csi1000
 
 backtest:
-  base_config: configs/training_config.yaml
+  base_config: configs/daily/training.yaml
   bundle: ~/.rqalpha-plus/bundle
   output_root: results/index_enhancement_optimizer_backtest
   portfolio_mode: benchmark_optimized

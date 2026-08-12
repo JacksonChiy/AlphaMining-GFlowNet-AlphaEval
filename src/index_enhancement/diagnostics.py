@@ -413,7 +413,7 @@ def run_diagnostics(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="冻结并诊断三指数增强基线")
-    parser.add_argument("--config", default="configs/index_enhancement.yaml")
+    parser.add_argument("--config", default="configs/index_enhancement/default.yaml")
     parser.add_argument("--price", default=None)
     parser.add_argument("--output-dir", default=None)
     args = parser.parse_args()

@@ -361,7 +361,7 @@ def _run_loaded_pipeline(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train the report chart-27~30 minute grammar")
-    parser.add_argument("--config", default="configs/minute_training_config.yaml")
+    parser.add_argument("--config", default="configs/minute/training.yaml")
     parser.add_argument("--allow-non-a100", action="store_true")
     parser.add_argument("--cpu", action="store_true", help="Force CPU-only training")
     parser.add_argument("--pool-size", type=int, default=None)

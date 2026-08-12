@@ -22,7 +22,7 @@ from src.data_loader.dolphindb_minute import (
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Audit and cache DolphinDB minute bars")
-    parser.add_argument("--config", default="configs/minute_training_cpu_ddb.yaml")
+    parser.add_argument("--config", default="configs/minute/cpu_ddb_memmap.yaml")
     parser.add_argument("--audit-only", action="store_true")
     parser.add_argument("--force-refresh", action="store_true")
     parser.add_argument(

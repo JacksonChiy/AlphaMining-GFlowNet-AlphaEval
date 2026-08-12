@@ -127,7 +127,7 @@ Windows PowerShell 永久保存到当前用户时使用：
 打开：
 
 ```text
-configs/minute_training_cpu_ddb.yaml
+configs/minute/cpu_ddb_memmap.yaml
 ```
 
 默认值为：
@@ -150,7 +150,7 @@ prices_are_adjusted: true
 source .venv/bin/activate
 
 python scripts/prepare_ddb_minute.py \
-  --config configs/minute_training_cpu_ddb.yaml \
+  --config configs/minute/cpu_ddb_memmap.yaml \
   --audit-only
 ```
 
@@ -189,7 +189,7 @@ pushdown_fallback: true
 
 ```bash
 python scripts/prepare_ddb_minute.py \
-  --config configs/minute_training_cpu_ddb.yaml
+  --config configs/minute/cpu_ddb_memmap.yaml
 ```
 
 该命令在流模式下只检查字段和日期，不下载分钟文件。训练时优先执行服务端分钟算子和Reduce，SQL结构为：
@@ -228,14 +228,14 @@ from vectors group by date, sym
 ```bash
 python scripts/train_cpu.py \
   --mode minute \
-  --config configs/minute_training_cpu_ddb.yaml
+  --config configs/minute/cpu_ddb_memmap.yaml
 ```
 
 Windows PowerShell：
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
-python scripts/train_cpu.py --mode minute --config configs/minute_training_cpu_ddb.yaml
+python scripts/train_cpu.py --mode minute --config configs/minute/cpu_ddb_memmap.yaml
 ```
 
 该命令会自动执行：

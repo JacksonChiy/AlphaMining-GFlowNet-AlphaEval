@@ -178,7 +178,7 @@ def _load_config(path: str | Path) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="一次性下载并保存三类指数历史成分股")
-    parser.add_argument("--config", default="configs/index_enhancement.yaml")
+    parser.add_argument("--config", default="configs/index_enhancement/default.yaml")
     parser.add_argument("--start-date", default=None)
     parser.add_argument("--end-date", default=None)
     parser.add_argument("--output", default=None)

@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 def test_ppu_training_notebook_is_valid_and_self_contained() -> None:
-    path = Path("notebooks/07_train_minute_ppu_jupyterlab.ipynb")
+    path = Path("notebooks/deployment/minute_ppu_memmap.ipynb")
     notebook = json.loads(path.read_text(encoding="utf-8"))
     assert notebook["nbformat"] == 4
     assert notebook["metadata"]["kernelspec"]["name"] == "python3"
@@ -30,7 +30,7 @@ def test_ppu_training_notebook_is_valid_and_self_contained() -> None:
 
 
 def test_ppu_ddb_ram_notebook_configures_eager_disk_cache() -> None:
-    path = Path("notebooks/08_train_minute_ppu_ddb_ram.ipynb")
+    path = Path("notebooks/deployment/minute_ppu_ram.ipynb")
     notebook = json.loads(path.read_text(encoding="utf-8"))
     code = "\n".join(
         "".join(cell["source"])

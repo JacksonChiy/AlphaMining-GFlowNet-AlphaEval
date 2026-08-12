@@ -367,7 +367,7 @@ def build_all_index_labels(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="从本地行情、成分和权重生成指数增强标签")
-    parser.add_argument("--config", default="configs/index_enhancement.yaml")
+    parser.add_argument("--config", default="configs/index_enhancement/default.yaml")
     args = parser.parse_args()
     with Path(args.config).open(encoding="utf-8") as handle:
         config = yaml.safe_load(handle) or {}

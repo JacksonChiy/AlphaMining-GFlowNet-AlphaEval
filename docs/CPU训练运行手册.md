@@ -16,8 +16,8 @@ CPU 版本适合本地功能验证、算子调试、小规模 Universe、短周�
 | 文件 | 作用 |
 |---|---|
 | `scripts/train_cpu.py` | 推荐的 CPU 启动入口，在导入计算库前固定线程和隐藏 CUDA |
-| `configs/training_cpu.yaml` | 日频 CPU 配置 |
-| `configs/minute_training_cpu.yaml` | 分钟频 CPU 配置 |
+| `configs/daily/cpu.yaml` | 日频 CPU 配置 |
+| `configs/minute/cpu.yaml` | 分钟频 CPU 配置 |
 | `src/gflownet/run_training.py` | 日频训练，支持显式 `device=cpu` / `--cpu` |
 | `src/gflownet/run_minute_training.py` | 分钟训练，支持显式 `device=cpu` / `--cpu` |
 
@@ -84,7 +84,7 @@ source .venv/bin/activate
 
 python scripts/train_cpu.py \
   --mode daily \
-  --config configs/training_cpu.yaml
+  --config configs/daily/cpu.yaml
 ```
 
 ### 5.2 分钟频 CPU 训练
@@ -94,7 +94,7 @@ source .venv/bin/activate
 
 python scripts/train_cpu.py \
   --mode minute \
-  --config configs/minute_training_cpu.yaml
+  --config configs/minute/cpu.yaml
 ```
 
 临时覆盖 PyTorch 计算线程数：
@@ -102,7 +102,7 @@ python scripts/train_cpu.py \
 ```bash
 python scripts/train_cpu.py \
   --mode minute \
-  --config configs/minute_training_cpu.yaml \
+  --config configs/minute/cpu.yaml \
   --threads 12
 ```
 
@@ -118,10 +118,10 @@ python scripts/train_cpu.py \
 
 ```bash
 python -m src.gflownet.run_training \
-  --cpu --config configs/training_cpu.yaml
+  --cpu --config configs/daily/cpu.yaml
 
 python -m src.gflownet.run_minute_training \
-  --cpu --config configs/minute_training_cpu.yaml
+  --cpu --config configs/minute/cpu.yaml
 ```
 
 直接模块入口会强制训练设备为 CPU；但推荐使用 `scripts/train_cpu.py`，因为它能在导入底层计算库之前设置 BLAS 和 PyTorch 线程。

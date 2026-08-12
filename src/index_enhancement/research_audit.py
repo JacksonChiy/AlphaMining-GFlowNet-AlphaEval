@@ -96,7 +96,7 @@ def run_audit(config_path: str | Path, baseline_id: str) -> Path:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="冻结P0基线并生成P1研究诊断")
-    parser.add_argument("--config", default="configs/index_enhancement.yaml")
+    parser.add_argument("--config", default="configs/index_enhancement/default.yaml")
     parser.add_argument("--baseline-id", default="baseline_v2_index_excess_l2_equal_weight")
     args = parser.parse_args()
     run_audit(args.config, args.baseline_id)

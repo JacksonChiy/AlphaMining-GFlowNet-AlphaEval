@@ -103,7 +103,7 @@ def run_all(
             spec=specs[index_key],
             prediction_path=prediction_path,
             output_dir=output_dir,
-            base_config=backtest.get("base_config", "configs/training_config.yaml"),
+            base_config=backtest.get("base_config", "configs/daily/training.yaml"),
             bundle=backtest.get("bundle", "~/.rqalpha-plus/bundle"),
             portfolio_mode=backtest.get("portfolio_mode"),
             index_weights=backtest.get("index_weights"),
@@ -118,7 +118,7 @@ def run_all(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="分别运行沪深300、中证500和中证1000增强回测")
-    parser.add_argument("--config", default="configs/index_enhancement.yaml")
+    parser.add_argument("--config", default="configs/index_enhancement/default.yaml")
     parser.add_argument(
         "--indexes",
         default="csi300,csi500,csi1000",

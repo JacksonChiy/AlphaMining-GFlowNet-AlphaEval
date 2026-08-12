@@ -428,7 +428,7 @@ def run(args: argparse.Namespace) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/training_config.yaml")
+    parser.add_argument("--config", default="configs/daily/training.yaml")
     parser.add_argument("--predictions", default="results/lightgbm/prediction_score.csv")
     parser.add_argument("--bundle", default="~/.rqalpha-plus/bundle")
     parser.add_argument("--output-dir", default="results/backtest_report")

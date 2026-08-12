@@ -17,7 +17,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Execute an existing alpha pool on complete price history"
     )
-    parser.add_argument("--config", default="configs/quick_training_config.yaml")
+    parser.add_argument("--config", default="configs/daily/quick.yaml")
     parser.add_argument("--metadata", default="results/alpha_pool.csv")
     parser.add_argument("--matrix", default="results/alpha_factor_matrix.pkl")
     parser.add_argument("--oos-matrix", default="results/alpha_factor_matrix_oos.pkl")

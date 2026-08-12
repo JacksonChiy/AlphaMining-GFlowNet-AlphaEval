@@ -42,8 +42,8 @@ def test_cpu_launcher_freezes_cpu_environment(tmp_path, monkeypatch) -> None:
 
 
 def test_cpu_configs_disable_amp_and_use_separate_outputs() -> None:
-    daily = load_config("configs/training_cpu.yaml")
-    minute = load_config("configs/minute_training_cpu.yaml")
+    daily = load_config("configs/daily/cpu.yaml")
+    minute = load_config("configs/minute/cpu.yaml")
     assert validate_research_date_split(daily)["training"] == "2020-01-01..2023-12-31"
     assert daily["training"]["mixed_precision"] is False
     assert minute["training"]["mixed_precision"] is False

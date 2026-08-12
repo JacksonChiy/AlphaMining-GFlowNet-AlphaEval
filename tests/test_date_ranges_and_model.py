@@ -36,8 +36,8 @@ def test_slice_date_range_rejects_empty_period() -> None:
 
 def test_training_configs_use_2020_2023_and_2024_2026_split() -> None:
     for path in (
-        "configs/quick_training_config.yaml",
-        "configs/training_config.yaml",
+        "configs/daily/quick.yaml",
+        "configs/daily/training.yaml",
     ):
         config = load_config(path)
         assert validate_research_date_split(config) == {
@@ -49,7 +49,7 @@ def test_training_configs_use_2020_2023_and_2024_2026_split() -> None:
 
 
 def test_date_split_rejects_training_oos_overlap() -> None:
-    config = load_config("configs/quick_training_config.yaml")
+    config = load_config("configs/daily/quick.yaml")
     config["dataset"]["mining_end_date"] = "2024-01-02"
     with pytest.raises(ValueError, match="must not overlap"):
         validate_research_date_split(config)

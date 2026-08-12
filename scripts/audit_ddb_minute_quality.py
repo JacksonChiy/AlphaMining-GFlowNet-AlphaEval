@@ -26,7 +26,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Audit DolphinDB minute grids, duplicates and invalid market values"
     )
-    parser.add_argument("--config", default="configs/minute_training_cpu_ddb.yaml")
+    parser.add_argument("--config", default="configs/minute/cpu_ddb_memmap.yaml")
     parser.add_argument("--scope", choices=("grid", "full"), default=None)
     parser.add_argument("--output-dir", default=None)
     args = parser.parse_args()

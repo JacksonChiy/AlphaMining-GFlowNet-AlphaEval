@@ -73,7 +73,7 @@ $env:DDB_TRADE_DAYS_DATABASE = "dfs://交易日数据库"
 
 ## 5. 检查配置
 
-打开`configs/minute_training_cpu_ddb.yaml`，确认：
+打开`configs/minute/cpu_ddb_memmap.yaml`，确认：
 
 ```yaml
 dataset:
@@ -128,7 +128,7 @@ pip install -r requirements-ddb.txt
 
 ```powershell
 python scripts/audit_ddb_minute_quality.py `
-  --config configs/minute_training_cpu_ddb.yaml `
+  --config configs/minute/cpu_ddb_memmap.yaml `
   --scope grid
 ```
 
@@ -144,7 +144,7 @@ python scripts/audit_ddb_minute_quality.py `
 
 ```powershell
 python scripts/audit_ddb_minute_quality.py `
-  --config configs/minute_training_cpu_ddb.yaml `
+  --config configs/minute/cpu_ddb_memmap.yaml `
   --scope full
 ```
 
@@ -252,7 +252,7 @@ echo $env:ALPHAMINING_BLOCK_CACHE_DIR
 ```powershell
 python scripts/train_cpu.py `
   --mode minute `
-  --config configs/minute_training_cpu_ddb.yaml `
+  --config configs/minute/cpu_ddb_memmap.yaml `
   --threads 8
 ```
 
@@ -276,7 +276,7 @@ results/minute_cpu_ddb/logs/
 ```powershell
 python scripts/train_cpu.py `
   --mode minute `
-  --config configs/minute_training_cpu_ddb.yaml `
+  --config configs/minute/cpu_ddb_memmap.yaml `
   --threads 8 `
   --log-dir E:\AlphaMining\training_logs
 ```
@@ -286,7 +286,7 @@ python scripts/train_cpu.py `
 ```powershell
 python scripts/train_cpu.py `
   --mode minute `
-  --config configs/minute_training_cpu_ddb.yaml `
+  --config configs/minute/cpu_ddb_memmap.yaml `
   --threads 8 `
   --log-file E:\AlphaMining\training_logs\minute_run_01.log
 ```
@@ -481,11 +481,11 @@ $env:ALPHAMINING_MEMMAP_DIR = "E:\AlphaMining\minute_memmap"
 $env:ALPHAMINING_BLOCK_CACHE_DIR = "E:\AlphaMining\block_cache"
 
 python scripts/build_ddb_memmap.py `
-  --config configs/minute_training_cpu_ddb.yaml
+  --config configs/minute/cpu_ddb_memmap.yaml
 
 python scripts/train_cpu.py `
   --mode minute `
-  --config configs/minute_training_cpu_ddb.yaml `
+  --config configs/minute/cpu_ddb_memmap.yaml `
   --threads 8
 ```
 

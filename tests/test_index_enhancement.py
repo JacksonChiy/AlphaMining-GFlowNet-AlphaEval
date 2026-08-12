@@ -145,7 +145,7 @@ def test_index_backtest_command_passes_benchmark_and_universe_parameters(tmp_pat
         },
         tmp_path / "predictions.csv.gz",
         tmp_path / "report",
-        "configs/training_config.yaml",
+        "configs/daily/training.yaml",
         "~/.rqalpha-plus/bundle",
     )
 
@@ -165,7 +165,7 @@ def test_index_backtest_command_passes_optimizer_parameters(tmp_path) -> None:
         },
         tmp_path / "predictions.csv",
         tmp_path / "report",
-        "configs/training_config.yaml",
+        "configs/daily/training.yaml",
         "~/.rqalpha-plus/bundle",
         portfolio_mode="benchmark_optimized",
         index_weights=tmp_path / "weights.csv.gz",

@@ -75,7 +75,7 @@ def run_index_alpha_eval(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="三指数独立AlphaEval与DPP筛选")
-    parser.add_argument("--config", default="configs/training_config.yaml")
+    parser.add_argument("--config", default="configs/daily/training.yaml")
     parser.add_argument("--price", default="data/daily_price.pkl")
     parser.add_argument("--factors", default="results/alpha_factor_matrix.pkl")
     parser.add_argument("--metadata", default="results/alpha_pool.csv")
