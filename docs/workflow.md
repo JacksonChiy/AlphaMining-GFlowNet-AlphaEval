@@ -2,6 +2,11 @@
 
 ## 日频流水线
 
+日频流水线有两个等价编排环境：Colab A100 使用
+`notebooks/pipelines/daily_colab_a100.ipynb`；本地 CPU 使用
+`scripts/train_daily_local.py` 或 `notebooks/pipelines/daily_local_cpu.ipynb`。
+二者共享表达式、Reward、AlphaEval、LightGBM 和标签实现，但使用独立配置与输出目录。
+
 | 阶段 | 输入 | 主要工作 | 输出 |
 |---|---|---|---|
 | 1. 数据准备 | `data/price.csv` | 字段映射、排序、缺失/异常处理、可选复权、截面标准化 | `data/daily_price.pkl`、数据质量报告 |

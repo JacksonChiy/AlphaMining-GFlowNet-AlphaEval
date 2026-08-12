@@ -58,6 +58,7 @@ AlphaEval 计算 IC、ICIR、滚动稳定性、扰动鲁棒性、表达式逻辑
 | 环境 | 主要任务 | 不执行 |
 |---|---|---|
 | Colab A100 | 日频 GFlowNet、AlphaEval、LightGBM、产物导出 | RQAlphaPlus 回测 |
+| 本地 CPU | 日频预处理、GFlowNet、AlphaEval、LightGBM；支持阶段续跑 | A100 混合精度 |
 | CPU 训练机 | 快速验证、分钟 MemMap GFlowNet | 外部行情下载 |
 | 阿里 PPU | DDB 全量加载、磁盘快照、全量 RAM 训练 | CUDA 训练 |
 | 本地 RQAlphaPlus | 指数数据下载、策略回测、报告 | GFlowNet 正式训练 |

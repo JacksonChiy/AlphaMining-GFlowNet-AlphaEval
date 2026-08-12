@@ -1,0 +1,114 @@
+dataset:
+  file: data/price.csv
+  output: data/daily_price.pkl
+  horizon: 5
+  required_columns: [date, code, open, high, low, close, volume]
+  start_date: '2020-01-01'
+  end_date: '2026-12-31'
+  mining_start_date: '2020-01-01'
+  mining_end_date: '2023-12-31'
+  out_of_sample_start_date: '2024-01-01'
+  out_of_sample_end_date: '2026-12-31'
+  chunksize: 500000
+
+cpu_runtime:
+  # 12–16 核机器的保守默认值；命令行 --threads 可临时覆盖 torch_threads。
+  torch_threads: 8
+  interop_threads: 2
+  blas_threads: 1
+
+operators:
+  # 日频因子的大头是滚动窗口；CPU 本地默认使用 Pandas。
+  time_series_backend: pandas
+  time_series_device: cpu
+  time_series_chunk_size: 64
+  time_series_dtype: float32
+
+model:
+  name: GFlowNetDailyLocalCPU
+  hidden_dim: 128
+  num_layers: 2
+  num_heads: 4
+  dropout: 0.1
+  max_sequence_length: 32
+
+training:
+  epochs: 30
+  trajectories_per_epoch: 16
+  learning_rate: 0.0002
+  weight_decay: 0.0001
+  reward_temperature: 1.0
+  mixed_precision: false
+  max_depth: 5
+  max_nodes: 15
+  gradient_clip: 1.0
+  reward_workers: 4
+  seed: 42
+
+reward:
+  top_quantile: 0.10
+  horizon: 5
+  risk_aversion: 1.0
+  min_cross_section: 20
+  min_coverage: 0.80
+  coverage_penalty_power: 2.0
+  subexpression_cache_enabled: true
+  subexpression_cache_max_entries: 128
+  subexpression_cache_max_mb: 512
+
+alpha_eval:
+  rolling_window: 60
+  perturbation_std: 0.05
+  dpp_k: 30
+  dpp_max_rows: 300000
+  verbose: true
+  seed: 42
+
+lightgbm:
+  horizon: 5
+  train_window_days: 1008
+  min_train_days: 756
+  refit_interval_days: 20
+  num_leaves: 31
+  learning_rate: 0.03
+  n_estimators: 500
+  seed: 42
+  prediction_start_date: '2024-01-01'
+  prediction_end_date: '2026-12-31'
+
+backtest:
+  initial_cash: 10000000
+  benchmark: 000852.XSHG
+  top_n: 20
+  rebalance_days: 5
+  slippage: 0.001
+  cash_buffer: 0.98
+  rank_smoothing_weights: [0.5, 0.3, 0.2]
+  hold_buffer_rank: 100
+  max_replacement_ratio: 0.25
+  min_holding_days: 10
+  capital_gain_tax_rate: 0.0
+  stock_min_commission: 5.0
+  stock_commission_multiplier: 1.0
+  tax_multiplier: 1.0
+  pit_tax: true
+  volume_percent: 0.25
+  portfolio_mode: equal_weight
+
+pipeline:
+  pool_size: 100
+  pool_attempts: 1000
+
+outputs:
+  log_dir: results/daily_local/logs
+  data_quality_report: results/daily_local/data_quality_report.json
+  checkpoint: checkpoints/gflownet_daily_local_best.pt
+  metrics: results/daily_local/gflownet_training_metrics.csv
+  trajectory_metrics: results/daily_local/gflownet_trajectory_metrics.csv
+  alpha_pool: results/daily_local/alpha_pool.csv
+  factor_matrix: results/daily_local/alpha_factor_matrix.pkl
+  oos_factor_matrix: results/daily_local/alpha_factor_matrix_oos.pkl
+  alpha_eval: results/daily_local/alpha_eval_result.csv
+  lightgbm_dir: results/daily_local/lightgbm
+  backtest_dir: results/daily_local/backtest_report
+  pipeline_manifest: results/daily_local/pipeline_manifest.json

@@ -10,7 +10,7 @@
 
 ## 运行手册
 
-- 日频：[完整运行](guides/daily/runbook.md) · [CPU 训练](guides/daily/cpu_training.md)
+- 日频：[Colab/完整运行](guides/daily/runbook.md) · [本地完整训练](guides/daily/local_training.md) · [CPU 单阶段训练](guides/daily/cpu_training.md)
 - 分钟频：[表达式与 GFlowNet](guides/minute/expression_gflownet.md) · [DDB CPU](guides/minute/ddb_cpu.md) · [DDB/MemMap 分离](guides/minute/ddb_memmap.md)
 - 指数增强：[运行手册](guides/index_enhancement/runbook.md) · [P0–P3 优化](guides/index_enhancement/p0_p3.md) · [万 8 基线与组合优化](guides/index_enhancement/fee_0008_portfolio.md)
 - 回测：[RQAlphaPlus 环境](guides/backtest/rqalpha_plus_setup.md)

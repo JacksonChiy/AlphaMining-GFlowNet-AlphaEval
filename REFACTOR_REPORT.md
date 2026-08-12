@@ -133,6 +133,7 @@ fd76b74 refactor: extract minute storage utilities
 | `configs/minute/cpu_ddb_memmap.yaml` | DDB/MemMap 分离训练配置 |
 | `configs/minute/ppu_ddb_ram.yaml` | PPU 全量 RAM 与磁盘快照配置 |
 | `notebooks/pipelines/daily_colab_a100.ipynb` | Colab A100 日频一体化入口 |
+| `notebooks/pipelines/daily_local_cpu.ipynb` | 日频本地 CPU 一体化入口 |
 | `notebooks/deployment/minute_ppu_ram.ipynb` | PPU 分钟频训练入口 |
 | `scripts/train_cpu.py` | CPU/PPU 统一训练启动器与日志入口 |
 | `src/gflownet/trainer.py` | GFlowNet 采样与 TB loss |

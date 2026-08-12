@@ -26,7 +26,7 @@ AlphaMining-GFlowNet-AlphaEval/
 │   └── troubleshooting.md      # 常见故障处理
 ├── experiments/                # 已冻结实验清单；大型产物默认忽略
 ├── notebooks/
-│   ├── pipelines/              # 一体化正式流水线
+│   ├── pipelines/              # Colab A100 与本地 CPU 一体化流水线
 │   ├── stages/                 # 分阶段调试入口
 │   ├── deployment/             # PPU 等特定环境入口
 │   └── archived/               # 只用于追溯的旧 Notebook
@@ -104,6 +104,18 @@ python -m scripts.run_daily_pipeline \
 ```
 
 ### 日频或分钟频 CPU
+
+本地 CPU 完整日频流水线（预处理、GFlowNet、AlphaEval、LightGBM）：
+
+```bash
+python scripts/train_daily_local.py \
+  --config configs/daily/local.yaml \
+  --to-stage lightgbm
+```
+
+中断后可用 `--from-stage alpha_eval` 或 `--from-stage lightgbm` 续跑；已有相同口径的因子池时可用 `--reuse-alpha-pool` 重算完整区间因子而不再训练 GFlowNet。Notebook 入口为 `notebooks/pipelines/daily_local_cpu.ipynb`，详细说明见[日频本地完整训练手册](docs/guides/daily/local_training.md)。
+
+只运行 GFlowNet 因子挖掘阶段：
 
 ```bash
 python scripts/train_cpu.py \
@@ -187,6 +199,7 @@ experiments/<experiment_id>/config.yaml
 - `configs/daily/training.yaml`：日频正式配置；
 - `configs/daily/quick.yaml`：小规模冒烟测试；
 - `configs/daily/cpu.yaml`：日频 CPU；
+- `configs/daily/local.yaml`：日频本地 CPU 完整流水线；
 - `configs/minute/training.yaml`：分钟频基础训练；
 - `configs/minute/cpu_ddb_memmap.yaml`：DDB/MemMap CPU；
 - `configs/minute/ppu_ddb_ram.yaml`：PPU 全量 RAM 与磁盘快照；
