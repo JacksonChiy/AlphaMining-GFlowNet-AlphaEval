@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .coverage
+htmlcov/
 
 # Jupyter
 .ipynb_checkpoints/
@@ -14,9 +15,15 @@ checkpoints/*.pth
 checkpoints/*.ckpt
 results/
 results_*/
+outputs/*
+!outputs/README.md
 experiments/*/
 !experiments/README.md
+offline_packages/
 *.zip
+*.log
+*.inspect.ndjson
+~$*.pptx
 
 # Local market data
 data/*.csv
@@ -26,11 +33,19 @@ data/*.parquet
 data/*.metadata.json
 data/rqdata/
 data/minute_ddb_cache/
+data/raw/*
+!data/raw/README.md
+data/processed/*
+!data/processed/README.md
+data/external/*
+!data/external/README.md
+**/ram_snapshot/
 !data/README.md
 
 # Environment and IDE
 .env
 .venv/
+venv/
 .idea/
 .vscode/
 .DS_Store

@@ -1,2 +1,1 @@
--r requirements.txt
-dolphindb
+-r requirements/ddb.txt

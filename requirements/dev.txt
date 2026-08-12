@@ -1,0 +1,4 @@
+-r training.txt
+
+pytest>=8,<10
+jupyter>=1,<2
