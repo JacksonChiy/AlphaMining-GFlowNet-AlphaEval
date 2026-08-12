@@ -163,7 +163,77 @@ python -m rqalpha_strategy.run_index_enhancement --dry-run
 
 输出 SHA256 基线清单、日度/年度 RankIC、五分组收益、Universe 覆盖率、年度/月度表现、换手成本和现金拖累。该命令只读本地文件，不启动回测、不调用 RQData。
 
-## 7. 默认参数
+## 7. P0–P3 研究优化流程
+
+### P0–P1：冻结基线并诊断信号
+
+三套指数标签已经生成时执行：
+
+```bash
+python -m src.index_enhancement.research_audit \
+  --config configs/index_enhancement/default.yaml \
+  --baseline-id baseline_v2_index_excess_l2_equal_weight
+```
+
+结果保存在 `experiments/<baseline_id>/`，包含输入文件 SHA256、年度/月度表现、换手成本、现金拖累、成熟标签覆盖率、日度/年度 RankIC、Q5-Q1、分组单调性、Top-N 目标收益和排名稳定性。本地缺少 Colab 生成的 `labels.pkl` 时，程序仍会冻结模型与回测，但跳过信号诊断。
+
+### P2：对比 LightGBM 训练目标
+
+实验矩阵位于 `configs/index_enhancement/model_experiments.yaml`：
+
+| 实验标签 | 训练目标 |
+|---|---|
+| `cross_sectional_rank` | 截面 Rank 回归 |
+| `excess_huber` | Huber 超额收益回归 |
+| `excess_top_weighted` | 最高 20% 样本三倍权重 |
+| `lambdarank` | 每日股票作为一个排序组 |
+| `excess_l2` | 旧 L2 基线 |
+
+例如，只运行 Rank 和 LambdaRank：
+
+```bash
+python -m src.index_enhancement.model_experiments \
+  --experiments cross_sectional_rank,lambdarank
+```
+
+每组结果写入 `results/index_model_experiments/<experiment>/<index>/`。每个滚动窗口保存一个 `lgbm_window_NNN.joblib`，同时保存最后模型、预测、指标和特征重要性。不同实验必须使用独立输出目录，禁止覆盖结果后再比较。
+
+### P3：三指数独立 AlphaEval
+
+```bash
+python -m src.alpha_eval.run_index_evaluation \
+  --config configs/daily/training.yaml \
+  --target-column target_excess_return
+```
+
+主要输出：
+
+```text
+results/index_alpha_eval/
+├── manifest.json
+├── csi300/alpha_eval_result.csv
+├── csi300/selected_factors.csv
+├── csi500/...
+└── csi1000/...
+```
+
+每个指数仅使用训练期历史成分、可交易的指数超额标签和该 Universe 内的因子值。LightGBM 实验优先读取对应指数的筛选结果；不存在时才降级使用全市场 AlphaEval 结果。
+
+Colab 一体化 Notebook `notebooks/pipelines/daily_colab_a100.ipynb` 按以下顺序执行：
+
+```text
+全市场 GFlowNet
+→ 全市场初筛
+→ 三指数标签
+→ 三指数独立 AlphaEval/DPP
+→ 指定实验的三指数 LightGBM
+→ 保存全部滚动模型
+→ 打包下载
+```
+
+Notebook 中的 `INDEX_MODEL_EXPERIMENT` 可设为 `cross_sectional_rank`、`excess_huber`、`excess_top_weighted` 或 `lambdarank`。
+
+## 8. 默认参数
 
 参数位于 `configs/index_enhancement/default.yaml`：
 
@@ -175,7 +245,7 @@ python -m rqalpha_strategy.run_index_enhancement --dry-run
 
 其余参数继承 `configs/daily/training.yaml`，包括初始资金、调仓周期、滑点、排名平滑、单次替换上限和最短持有期。
 
-## 8. 结果比较
+## 9. 结果比较
 
 三类指数增强应分别比较：
 

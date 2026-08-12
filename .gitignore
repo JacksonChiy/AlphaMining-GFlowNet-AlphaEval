@@ -52,3 +52,6 @@ venv/
 
 # Temporary files
 tmp/
+
+# Local private documentation archives
+docs/archive/private/
