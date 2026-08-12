@@ -395,6 +395,8 @@ results/lightgbm/prediction_score.csv
 
 ## 11. 一条命令运行前五阶段
 
+### 11.1 Colab/A100 命令行编排
+
 在 A100 环境、数据和依赖均准备完毕后，可执行：
 
 ```bash
@@ -408,6 +410,70 @@ python -m scripts.run_daily_pipeline --pool-size 5 --allow-non-a100
 ```
 
 该选项不适用于正式训练或研究结果发布。
+
+### 11.2 日频本地 CPU 完整训练
+
+本地不使用 Colab 时，推荐运行独立的完整流水线入口：
+
+```bash
+python scripts/train_daily_local.py \
+  --config configs/daily/local.yaml \
+  --from-stage prepare \
+  --to-stage lightgbm
+```
+
+该入口依次完成：
+
+```text
+price.csv
+→ data/daily_price.pkl
+→ GFlowNet 因子挖掘
+→ Alpha Pool 和完整区间因子矩阵
+→ AlphaEval + DPP
+→ LightGBM 滚动预测
+→ results/daily_local/lightgbm/prediction_score.csv
+```
+
+本地配置固定使用 CPU、关闭混合精度并采用 Pandas 日频时序后端。训练期仍为
+2020–2023，2024–2026 为样本外预测区间，标签仍为
+`close(t+5) / close(t+1) - 1`。本地结果写入 `results/daily_local/`，不会覆盖
+Colab A100 的 `results/` 产物。
+
+如果预处理数据已经由同一份行情和相同配置生成，可以复用：
+
+```bash
+python scripts/train_daily_local.py \
+  --config configs/daily/local.yaml \
+  --to-stage lightgbm \
+  --reuse-prepared-data
+```
+
+如果训练中断在 GFlowNet 之后，从 AlphaEval 继续：
+
+```bash
+python scripts/train_daily_local.py \
+  --config configs/daily/local.yaml \
+  --from-stage alpha_eval \
+  --to-stage lightgbm
+```
+
+如果已有相同训练口径生成的 `results/daily_local/alpha_pool.csv`，可以跳过
+GFlowNet 参数训练，在完整 2020–2026 行情上恢复表达式并重新计算因子：
+
+```bash
+python scripts/train_daily_local.py \
+  --config configs/daily/local.yaml \
+  --from-stage gflownet \
+  --to-stage lightgbm \
+  --reuse-alpha-pool
+```
+
+每个阶段的状态、耗时、输入输出和异常都会写入
+`results/daily_local/pipeline_manifest.json`；全部终端输出同步保存到
+`results/daily_local/logs/`。也可以打开
+`notebooks/pipelines/daily_local_cpu.ipynb` 交互运行。
+
+完整参数、冒烟测试和续跑说明见[日频本地完整训练手册](local_training.md)。
 
 ## 12. 阶段六：本地 RQAlphaPlus 回测
 
@@ -434,6 +500,20 @@ python -m rqalpha_strategy.run_backtest \
   --predictions results/lightgbm/prediction_score.csv \
   --output-dir results/backtest_report
 ```
+
+如果预测分数由日频本地流水线生成，也可以直接续跑回测阶段：
+
+```bash
+python scripts/train_daily_local.py \
+  --config configs/daily/local.yaml \
+  --from-stage backtest \
+  --to-stage backtest \
+  --rqalpha-bundle ~/.rqalpha-plus/bundle
+```
+
+此时读取 `results/daily_local/lightgbm/prediction_score.csv`，并将报告保存到
+`results/daily_local/backtest_report/`。RQAlphaPlus 仍只在本地授权环境运行，且不会
+继承 Git/Colab 代理环境变量。
 
 程序默认从配置文件的 `backtest` 段读取全部回测参数。除资金、基准、Top N、调仓周期和滑点外，还包括排名平滑权重、持仓缓冲排名、单次替换比例上限、最短持有期和现金缓冲。只有需要临时覆盖单个参数时才额外传入对应命令行选项。运行前会打印最终生效值，并写入 `results/backtest_report/backtest_effective_config.json`；本地 Notebook 会自动检查这些值与 YAML 配置完全一致。
 

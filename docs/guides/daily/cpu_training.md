@@ -16,7 +16,9 @@ CPU 版本适合本地功能验证、算子调试、小规模 Universe、短周�
 | 文件 | 作用 |
 |---|---|
 | `scripts/train_cpu.py` | 推荐的 CPU 启动入口，在导入计算库前固定线程和隐藏 CUDA |
+| `scripts/train_daily_local.py` | 日频本地完整流水线，包含预处理、GFlowNet、AlphaEval、LightGBM 和可选回测 |
 | `configs/daily/cpu.yaml` | 日频 CPU 配置 |
+| `configs/daily/local.yaml` | 日频本地完整训练配置，使用独立的 `results/daily_local/` 输出 |
 | `configs/minute/cpu.yaml` | 分钟频 CPU 配置 |
 | `src/gflownet/run_training.py` | 日频训练，支持显式 `device=cpu` / `--cpu` |
 | `src/gflownet/run_minute_training.py` | 分钟训练，支持显式 `device=cpu` / `--cpu` |
@@ -77,7 +79,25 @@ date, datetime, code, open, high, low, close, vol, amount
 
 ## 5. 推荐运行方式
 
-### 5.1 日频 CPU 训练
+### 5.1 日频本地完整训练（推荐）
+
+从原始 CSV 一直运行到 LightGBM 预测分数：
+
+```bash
+source .venv/bin/activate
+
+python scripts/train_daily_local.py \
+  --config configs/daily/local.yaml \
+  --to-stage lightgbm
+```
+
+该命令的输出目录为 `results/daily_local/`。它支持 `--from-stage` 续跑、
+`--reuse-prepared-data` 复用预处理行情，以及 `--reuse-alpha-pool` 复用表达式池。
+运行状态记录在 `results/daily_local/pipeline_manifest.json`。
+
+详细说明见[日频本地完整训练手册](local_training.md)。
+
+### 5.2 仅运行日频 GFlowNet
 
 ```bash
 source .venv/bin/activate
@@ -87,7 +107,10 @@ python scripts/train_cpu.py \
   --config configs/daily/cpu.yaml
 ```
 
-### 5.2 分钟频 CPU 训练
+此入口只完成 GFlowNet、Alpha Pool 和因子矩阵，不自动继续 AlphaEval 与
+LightGBM。适合调试表达式、Reward 和训练速度。
+
+### 5.3 分钟频 CPU 训练
 
 ```bash
 source .venv/bin/activate
@@ -227,7 +250,24 @@ pipeline:
 
 ## 10. 输出位置
 
-日频 CPU：
+日频本地完整流水线：
+
+```text
+data/daily_price.pkl
+checkpoints/gflownet_daily_local_best.pt
+results/daily_local/data_quality_report.json
+results/daily_local/pipeline_manifest.json
+results/daily_local/gflownet_training_metrics.csv
+results/daily_local/gflownet_trajectory_metrics.csv
+results/daily_local/alpha_pool.csv
+results/daily_local/alpha_factor_matrix.pkl
+results/daily_local/alpha_factor_matrix_oos.pkl
+results/daily_local/alpha_eval_result.csv
+results/daily_local/lightgbm/prediction_score.csv
+results/daily_local/lightgbm/lgbm_model.joblib
+```
+
+仅日频 GFlowNet CPU：
 
 ```text
 checkpoints/gflownet_daily_cpu_best.pt
@@ -272,3 +312,9 @@ blas_threads: 1
 ### CPU 训练是否会比 GPU 更快
 
 Transformer 采样一般是 GPU 更快；Pandas Reward 计算主要依赖 CPU。小模型、小样本下 GPU 数据调度开销可能不明显，但全量分钟训练通常仍应使用 A100。CPU 版的核心价值是可运行、可调试和不依赖 GPU 资源。
+
+### 本地完整训练中断后是否需要从头运行
+
+不需要。查看 `results/daily_local/pipeline_manifest.json` 确认最后完成阶段，然后使用
+`--from-stage alpha_eval`、`--from-stage lightgbm` 或 `--from-stage backtest` 继续。
+入口会先检查上游文件，缺少产物时明确报错，不会从 Colab 结果目录静默读取。
