@@ -14,33 +14,36 @@ from typing import Any, Callable, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
-from src.operators.minute import EPS, validate_minute_data
+from src.operators.minute import validate_minute_data
 
 from .dolphindb_minute import DolphinDBMinuteLoader, MinuteDolphinDBConfig
+from .minute_dense import (
+    FAST_LOAD_SOURCE_COLUMNS,
+    LOAD_TIMING_KEYS,
+    MINUTE_CHANNELS,
+    build_dense_minute_channels,
+)
 from .minute_quality_audit import (
     DEFAULT_MINUTE_EXTRA_TIMES,
     DEFAULT_MINUTE_SESSIONS,
     build_expected_minute_grid,
 )
-
-
-MEMMAP_CHANNELS = (
-    "open", "high", "low", "close", "vol", "amount",
-    "ret", "vwap", "hl_pct", "bar_pos", "amihud", "rv",
-    "signed_vol", "signed_amt", "typical", "vwap_cum", "twap", "obv", "pvt",
+from .minute_ram_cache import (
+    RAM_CACHE_FORMAT_VERSION,
+    atomic_json,
+    atomic_numpy,
+    load_json,
+    manifest_miss_reason,
+    ram_cache_fingerprint,
+    validate_eager_array,
 )
+
+
+MEMMAP_CHANNELS = MINUTE_CHANNELS
 MEMMAP_FORMAT_VERSION = 1
-RAM_CACHE_FORMAT_VERSION = 1
-FAST_LOAD_SOURCE_COLUMNS = (
-    "sym", "time", "open", "high", "low", "close", "volume", "amount",
-)
-LOAD_TIMING_KEYS = (
-    "ddb_query_s",
-    "decode_index_s",
-    "base_matrix_s",
-    "numpy_feature_s",
-    "memory_write_s",
-)
+
+# Backward-compatible private alias used by existing callers and older notebooks.
+_build_dense_minute_channels = build_dense_minute_channels
 
 
 @dataclass(frozen=True)
@@ -144,191 +147,6 @@ def _time_key(value: Any) -> str:
     return parsed.strftime("%H:%M:%S")
 
 
-def _configured_minute_numbers(minute_lookup: Mapping[str, int]) -> np.ndarray:
-    lookup = np.full(24 * 60, -1, dtype=np.int16)
-    for value, index in minute_lookup.items():
-        parsed = pd.Timestamp(f"2000-01-01 {value}")
-        lookup[parsed.hour * 60 + parsed.minute] = int(index)
-    return lookup
-
-
-def _minute_numbers(values: pd.Series) -> np.ndarray:
-    """Decode common DolphinDB time representations without per-row pandas parsing."""
-    if pd.api.types.is_timedelta64_dtype(values.dtype):
-        raw = values.to_numpy(dtype="timedelta64[m]").astype(np.int64)
-        raw[values.isna().to_numpy()] = -1
-        return raw
-    if pd.api.types.is_datetime64_any_dtype(values.dtype):
-        parsed = values.dt
-        output = (parsed.hour * 60 + parsed.minute).to_numpy(dtype=np.float64)
-        return np.where(np.isfinite(output), output, -1).astype(np.int64)
-    if pd.api.types.is_numeric_dtype(values.dtype):
-        raw = pd.to_numeric(values, errors="coerce").to_numpy(dtype=np.float64)
-        finite = raw[np.isfinite(raw)]
-        maximum = float(np.max(np.abs(finite))) if finite.size else 0.0
-        divisor = 1.0
-        if maximum > 86_400_000:
-            divisor = 60_000_000_000.0
-        elif maximum > 86_400:
-            divisor = 60_000.0
-        elif maximum > 1_440:
-            divisor = 60.0
-        return np.where(np.isfinite(raw), np.floor(raw / divisor), -1).astype(np.int64)
-
-    def decode(value: Any) -> int:
-        if value is None or value is pd.NaT:
-            return -1
-        if hasattr(value, "hour") and hasattr(value, "minute"):
-            return int(value.hour) * 60 + int(value.minute)
-        text = str(value).strip()
-        match = text.rsplit(" ", 1)[-1].split(":")
-        if len(match) >= 2 and match[0][-2:].isdigit() and match[1][:2].isdigit():
-            return int(match[0][-2:]) * 60 + int(match[1][:2])
-        parsed = pd.to_datetime(text, errors="coerce")
-        return -1 if pd.isna(parsed) else int(parsed.hour) * 60 + int(parsed.minute)
-
-    return np.fromiter((decode(value) for value in values.array), dtype=np.int64, count=len(values))
-
-
-def _numeric_values(values: pd.Series) -> np.ndarray:
-    raw = values.to_numpy(copy=False)
-    if np.issubdtype(raw.dtype, np.number):
-        return raw.astype(np.float64, copy=False)
-    return pd.to_numeric(values, errors="coerce").to_numpy(dtype=np.float64)
-
-
-def _safe_divide_array(left: np.ndarray, right: np.ndarray) -> np.ndarray:
-    return np.divide(
-        left,
-        right,
-        out=np.full(left.shape, np.nan, dtype=np.float64),
-        where=np.isfinite(left) & np.isfinite(right) & (np.abs(right) > EPS),
-    )
-
-
-def _previous_observed(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    minute_positions = np.arange(values.shape[0], dtype=np.int32)[:, None]
-    last_seen = np.maximum.accumulate(
-        np.where(mask, minute_positions, -1), axis=0
-    )
-    previous = np.empty_like(last_seen)
-    previous[0, :] = -1
-    previous[1:, :] = last_seen[:-1, :]
-    output = np.take_along_axis(values, np.maximum(previous, 0), axis=0)
-    output[previous < 0] = np.nan
-    return output
-
-
-def _skipna_cumsum(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    finite = mask & np.isfinite(values)
-    cumulative = np.cumsum(np.where(finite, values, 0.0), axis=0)
-    return np.where(finite, cumulative, np.nan)
-
-
-def _build_dense_minute_channels(
-    frame: pd.DataFrame,
-    stock_codes: Sequence[str],
-    minute_lookup: Mapping[str, int],
-) -> tuple[dict[str, np.ndarray], np.ndarray, dict[str, float | int]]:
-    """Map one raw DDB day directly to dense arrays and derive all stored leaves."""
-    missing = sorted(set(FAST_LOAD_SOURCE_COLUMNS).difference(frame.columns))
-    if missing:
-        raise ValueError(f"DolphinDB fast minute query is missing columns: {missing}")
-    decode_started = time.perf_counter()
-    minute_numbers = _minute_numbers(frame["time"])
-    minute_number_lookup = _configured_minute_numbers(minute_lookup)
-    minute_index = np.full(len(frame), -1, dtype=np.int64)
-    valid_minute_number = (minute_numbers >= 0) & (minute_numbers < len(minute_number_lookup))
-    minute_index[valid_minute_number] = minute_number_lookup[minute_numbers[valid_minute_number]]
-
-    categories = pd.Index(np.asarray(stock_codes, dtype=str))
-    stock_index = pd.Categorical(frame["sym"], categories=categories).codes.astype(
-        np.int64, copy=False
-    )
-    if np.any(stock_index < 0):
-        cleaned = frame["sym"].astype("string").str.strip()
-        stock_index = pd.Categorical(cleaned, categories=categories).codes.astype(
-            np.int64, copy=False
-        )
-    numeric = {
-        name: _numeric_values(frame[source])
-        for name, source in (
-            ("open", "open"), ("high", "high"), ("low", "low"),
-            ("close", "close"), ("vol", "volume"), ("amount", "amount"),
-        )
-    }
-    valid = (minute_index >= 0) & (stock_index >= 0)
-    valid &= np.isfinite(numeric["open"]) & (numeric["open"] > 0)
-    valid &= np.isfinite(numeric["high"]) & (numeric["high"] > 0)
-    valid &= np.isfinite(numeric["low"]) & (numeric["low"] > 0)
-    valid &= np.isfinite(numeric["close"]) & (numeric["close"] > 0)
-    valid &= numeric["low"] <= numeric["high"]
-    if not valid.any():
-        raise ValueError("DolphinDB fast minute query produced no valid configured rows")
-    numeric["vol"] = np.clip(numeric["vol"], 0.0, None)
-    numeric["amount"] = np.clip(numeric["amount"], 0.0, None)
-    decode_index_s = time.perf_counter() - decode_started
-
-    base_started = time.perf_counter()
-    shape = (len(minute_lookup), len(categories))
-    mask = np.zeros(shape, dtype=bool)
-    flat_index = minute_index[valid] * shape[1] + stock_index[valid]
-    mask.ravel()[flat_index] = True
-    channels: dict[str, np.ndarray] = {}
-    for name in ("open", "high", "low", "close", "vol", "amount"):
-        output = np.full(shape, np.nan, dtype=np.float64)
-        output.ravel()[flat_index] = numeric[name][valid]
-        channels[name] = output
-    base_matrix_s = time.perf_counter() - base_started
-
-    feature_started = time.perf_counter()
-    high, low = channels["high"], channels["low"]
-    close, vol, amount = channels["close"], channels["vol"], channels["amount"]
-    previous_close = _previous_observed(close, mask)
-    ret = _safe_divide_array(close, previous_close) - 1.0
-    vwap = _safe_divide_array(amount, vol)
-    hl_pct = _safe_divide_array(high - low, np.abs(close))
-    bar_pos = _safe_divide_array(close - low, high - low)
-    amihud = _safe_divide_array(np.abs(ret), np.abs(amount))
-    direction = np.where(np.isfinite(ret), np.sign(ret), 0.0)
-    cumulative_amount = _skipna_cumsum(amount, mask)
-    cumulative_vol = _skipna_cumsum(vol, mask)
-    finite_close = mask & np.isfinite(close)
-    close_sum = np.cumsum(np.where(finite_close, close, 0.0), axis=0)
-    close_count = np.cumsum(finite_close, axis=0)
-    twap = np.divide(
-        close_sum,
-        close_count,
-        out=np.full(shape, np.nan, dtype=np.float64),
-        where=finite_close & (close_count > 0),
-    )
-    channels.update({
-        "ret": ret,
-        "vwap": vwap,
-        "hl_pct": hl_pct,
-        "bar_pos": bar_pos,
-        "amihud": amihud,
-        "rv": np.square(ret),
-        "signed_vol": direction * vol,
-        "signed_amt": direction * amount,
-        "typical": (high + low + close) / 3.0,
-        "vwap_cum": _safe_divide_array(cumulative_amount, cumulative_vol),
-        "twap": twap,
-        "obv": _skipna_cumsum(direction * vol, mask),
-        "pvt": _skipna_cumsum(ret * vol, mask),
-    })
-    for name in MEMMAP_CHANNELS:
-        channels[name] = np.where(mask, channels[name], np.nan)
-    numpy_feature_s = time.perf_counter() - feature_started
-    return channels, mask, {
-        "decode_index_s": decode_index_s,
-        "base_matrix_s": base_matrix_s,
-        "numpy_feature_s": numpy_feature_s,
-        "valid_rows": int(valid.sum()),
-        "excluded_rows": int(len(frame) - valid.sum()),
-    }
-
-
 def _source_fingerprint(
     loader: DolphinDBMinuteLoader,
     dates: Sequence[pd.Timestamp],
@@ -343,24 +161,6 @@ def _source_fingerprint(
         "prices_are_adjusted": loader.config.prices_are_adjusted,
         "channels": MEMMAP_CHANNELS,
         "minute_grid": list(minute_grid),
-    }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
-
-
-def _ram_cache_fingerprint(
-    source: MinuteDolphinDBConfig,
-    config: MinuteMemMapConfig,
-) -> str:
-    payload = {
-        "cache_format_version": RAM_CACHE_FORMAT_VERSION,
-        "database": source.database,
-        "table": source.table,
-        "start_date": str(pd.Timestamp(source.start_date).date()),
-        "end_date": str(pd.Timestamp(source.end_date).date()),
-        "prices_are_adjusted": source.prices_are_adjusted,
-        "channels": list(MEMMAP_CHANNELS),
-        "minute_grid": list(config.minute_grid),
-        "dtype": "float32",
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -1150,38 +950,14 @@ class DolphinDBMinuteRAMStore(MinuteMemMapStore):
     def _ram_cache_manifest_path(self) -> Path:
         return self._ram_cache_dir / "ram_cache_manifest.json"
 
-    @staticmethod
-    def _load_json(path: Path) -> dict[str, Any] | None:
-        if not path.exists():
-            return None
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return None
-
-    @staticmethod
-    def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(
-            json.dumps(dict(value), ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        temporary.replace(path)
-
-    @staticmethod
-    def _atomic_numpy(path: Path, values: np.ndarray) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        with temporary.open("wb") as handle:
-            np.save(handle, np.asarray(values), allow_pickle=False)
-        temporary.replace(path)
-
     def _restore_ram_cache(self, source: MinuteDolphinDBConfig) -> bool:
         if not self._ram_cache_enabled:
             print("[DDBRAMCache] disabled", flush=True)
             return False
-        expected_fingerprint = _ram_cache_fingerprint(source, self.config)
-        manifest = self._load_json(self._ram_cache_manifest_path)
+        expected_fingerprint = ram_cache_fingerprint(
+            source, self.config.minute_grid, MEMMAP_CHANNELS
+        )
+        manifest = load_json(self._ram_cache_manifest_path)
         if not manifest:
             print(
                 f"[DDBRAMCache] miss reason=manifest_missing "
@@ -1189,14 +965,9 @@ class DolphinDBMinuteRAMStore(MinuteMemMapStore):
                 flush=True,
             )
             return False
-        if not manifest.get("complete"):
-            print("[DDBRAMCache] miss reason=incomplete_snapshot", flush=True)
-            return False
-        if int(manifest.get("cache_format_version", -1)) != RAM_CACHE_FORMAT_VERSION:
-            print("[DDBRAMCache] miss reason=format_version_mismatch", flush=True)
-            return False
-        if manifest.get("fingerprint") != expected_fingerprint:
-            print("[DDBRAMCache] miss reason=fingerprint_mismatch", flush=True)
+        miss_reason = manifest_miss_reason(manifest, expected_fingerprint)
+        if miss_reason:
+            print(f"[DDBRAMCache] miss reason={miss_reason}", flush=True)
             return False
         started = time.perf_counter()
         try:
@@ -1254,24 +1025,15 @@ class DolphinDBMinuteRAMStore(MinuteMemMapStore):
                         self._ram_cache_dir / str(metadata["channels"][channel]),
                         allow_pickle=False,
                     )
-                    if isinstance(values, np.memmap):
-                        raise TypeError("RAM cache must be eagerly loaded, not memory-mapped")
-                    if values.shape != expected_shape or values.dtype != np.float32:
-                        raise ValueError(
-                            f"invalid cached array {year}/{channel}: "
-                            f"shape={values.shape} dtype={values.dtype}"
-                        )
+                    validate_eager_array(
+                        values, expected_shape, np.float32, f"array {year}/{channel}"
+                    )
                     self._ram_arrays[(year, channel)] = values
                 mask = np.load(
                     self._ram_cache_dir / str(metadata["valid_mask"]),
                     allow_pickle=False,
                 )
-                if isinstance(mask, np.memmap):
-                    raise TypeError("RAM cache mask must be eagerly loaded")
-                if mask.shape != expected_shape or mask.dtype != np.uint8:
-                    raise ValueError(
-                        f"invalid cached mask {year}: shape={mask.shape} dtype={mask.dtype}"
-                    )
+                validate_eager_array(mask, expected_shape, np.uint8, f"mask {year}")
                 self._ram_arrays[(year, "valid_mask")] = mask
                 self.manifest["years"][year_text] = {
                     "n_days": len(year_dates), "shape": list(mask.shape)
@@ -1319,7 +1081,9 @@ class DolphinDBMinuteRAMStore(MinuteMemMapStore):
         manifest: dict[str, Any] = {
             "cache_format_version": RAM_CACHE_FORMAT_VERSION,
             "complete": False,
-            "fingerprint": _ram_cache_fingerprint(source, self.config),
+            "fingerprint": ram_cache_fingerprint(
+                source, self.config.minute_grid, MEMMAP_CHANNELS
+            ),
             "source_fingerprint": self.fingerprint,
             "storage": "npy",
             "load_mode": "eager_ram",
@@ -1331,11 +1095,11 @@ class DolphinDBMinuteRAMStore(MinuteMemMapStore):
             "channels": list(MEMMAP_CHANNELS),
             "years": {},
         }
-        self._atomic_json(self._ram_cache_manifest_path, manifest)
+        atomic_json(self._ram_cache_manifest_path, manifest)
         try:
-            self._atomic_numpy(self._ram_cache_dir / "stocks.npy", self.stocks)
-            self._atomic_numpy(self._ram_cache_dir / "minute_grid.npy", self.minute_grid)
-            self._atomic_numpy(
+            atomic_numpy(self._ram_cache_dir / "stocks.npy", self.stocks)
+            atomic_numpy(self._ram_cache_dir / "minute_grid.npy", self.minute_grid)
+            atomic_numpy(
                 self._ram_cache_dir / "dates.npy",
                 np.asarray([str(date.date()) for date in self.dates], dtype=str),
             )
@@ -1347,7 +1111,7 @@ class DolphinDBMinuteRAMStore(MinuteMemMapStore):
                 year_started = time.perf_counter()
                 year_dir = self._ram_cache_dir / str(year)
                 dates_file = f"{year}/dates.npy"
-                self._atomic_numpy(
+                atomic_numpy(
                     self._ram_cache_dir / dates_file,
                     np.asarray([
                         str(date.date()) for date in self._year_date_values[year]
@@ -1356,13 +1120,13 @@ class DolphinDBMinuteRAMStore(MinuteMemMapStore):
                 channel_files: dict[str, str] = {}
                 for channel in MEMMAP_CHANNELS:
                     relative = f"{year}/{channel}.npy"
-                    self._atomic_numpy(
+                    atomic_numpy(
                         self._ram_cache_dir / relative,
                         self._ram_arrays[(year, channel)],
                     )
                     channel_files[channel] = relative
                 mask_relative = f"{year}/valid_mask.npy"
-                self._atomic_numpy(
+                atomic_numpy(
                     self._ram_cache_dir / mask_relative,
                     self._ram_arrays[(year, "valid_mask")],
                 )
@@ -1378,7 +1142,7 @@ class DolphinDBMinuteRAMStore(MinuteMemMapStore):
                     flush=True,
                 )
             manifest["complete"] = True
-            self._atomic_json(self._ram_cache_manifest_path, manifest)
+            atomic_json(self._ram_cache_manifest_path, manifest)
         except (OSError, ValueError) as exc:
             print(
                 f"[DDBRAMCache] save_failed error={type(exc).__name__}:{exc} "

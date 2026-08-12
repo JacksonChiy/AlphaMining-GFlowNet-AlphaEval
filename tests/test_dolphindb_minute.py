@@ -22,8 +22,8 @@ from src.data_loader.minute_memmap import (
     MEMMAP_CHANNELS,
     MinuteMemMapConfig,
     MinuteMemMapStore,
-    _build_dense_minute_channels,
 )
+from src.data_loader.minute_dense import build_dense_minute_channels
 from src.data_loader.minute_quality_audit import (
     DolphinDBMinuteQualityAuditor,
     MinuteQualityAuditConfig,
@@ -538,7 +538,7 @@ def test_dense_numpy_day_loader_matches_pandas_features_with_missing_minutes() -
     source = source.loc[source["date"].eq(pd.Timestamp("2024-01-02"))]
     minute_lookup = {f"09:{minute:02d}:00": minute - 30 for minute in range(30, 33)}
     stocks = ["000001.SZ", "000002.SZ"]
-    channels, mask, metrics = _build_dense_minute_channels(
+    channels, mask, metrics = build_dense_minute_channels(
         source, stocks, minute_lookup
     )
     expected = build_minute_features(normalize_dolphindb_minutes(source))
