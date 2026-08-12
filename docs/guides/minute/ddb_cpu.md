@@ -1,6 +1,6 @@
 # DolphinDB 分钟数据 CPU 训练手册
 
-> 当前默认配置已切换为DDB与训练分离的MemMap模式。本文件后半部分保留`load_mode: stream`兼容路径；正式两机部署请优先使用[《DDB与训练分离的MemMap运行手册》](DDB与训练分离的MemMap运行手册.md)。
+> 当前默认配置已切换为DDB与训练分离的MemMap模式。本文件后半部分保留`load_mode: stream`兼容路径；正式两机部署请优先使用[《DDB与训练分离的MemMap运行手册》](ddb_memmap.md)。
 
 ## 1. 数据源字段审计
 
