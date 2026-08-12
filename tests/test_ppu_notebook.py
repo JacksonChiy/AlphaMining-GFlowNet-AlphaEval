@@ -27,3 +27,22 @@ def test_ppu_training_notebook_is_valid_and_self_contained() -> None:
     assert "training_state.json" in code
     assert "manifest.get('complete') is not True" in code
     assert "PRESERVE_PLATFORM_TORCH = True" in code
+
+
+def test_ppu_ddb_ram_notebook_configures_eager_disk_cache() -> None:
+    path = Path("notebooks/08_train_minute_ppu_ddb_ram.ipynb")
+    notebook = json.loads(path.read_text(encoding="utf-8"))
+    code = "\n".join(
+        "".join(cell["source"])
+        for cell in notebook["cells"]
+        if cell["cell_type"] == "code"
+    )
+    for index, cell in enumerate(notebook["cells"], start=1):
+        if cell["cell_type"] == "code":
+            source = "".join(cell["source"])
+            if source.lstrip().startswith("%"):
+                continue
+            ast.parse(source, filename=f"ddb-ram-notebook-cell-{index}")
+    assert "ALPHAMINING_RAM_CACHE_DIR" in code
+    assert "ram_cache_manifest.json" in code
+    assert "cache_ready" in code

@@ -28,6 +28,11 @@ dataset:
     # 这里只保存小型审计文件和因子Block缓存，不保存原始分钟数组。
     root: results/minute_ppu_ddb_ram/metadata
     block_cache_dir: results/minute_ppu_ddb_ram/block_cache
+    # 首次从DDB加载后保存普通.npy快照；后续完整读入RAM，不使用MemMap。
+    ram_cache_enabled: true
+    ram_cache_dir_env: ALPHAMINING_RAM_CACHE_DIR
+    # 也可以直接指定PPU持久化数据盘，例如：
+    # ram_cache_dir: /mnt/data/alphamining/minute_ram_cache
     max_ram_gb: 550
     reserve_ram_gb: 100
     expected_minutes: 241

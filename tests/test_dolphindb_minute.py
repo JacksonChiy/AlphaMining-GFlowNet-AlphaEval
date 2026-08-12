@@ -595,6 +595,7 @@ def test_ddb_direct_ram_store_shares_arrays_without_raw_minute_files(
         ram_config,
         loader_factory=loader_factory,
         reserve_ram_gb=0,
+        ram_cache_enabled=False,
     )
     assert store.in_memory is True
     assert len(store.daily_data) == 4
@@ -616,6 +617,64 @@ def test_ddb_direct_ram_store_shares_arrays_without_raw_minute_files(
     actual = expression.execute_from_blocks(blocks).sort_index()
     expected = expression.execute(normalize_dolphindb_minutes(source)).sort_index()
     assert np.allclose(actual, expected)
+
+
+def test_ddb_ram_disk_snapshot_is_eagerly_loaded_without_ddb(tmp_path) -> None:
+    source = _source_minutes()
+    loader = DolphinDBMinuteLoader(
+        _config(tmp_path), FakeDolphinDBSession(source)
+    )
+    config = MinuteMemMapConfig(
+        root=tmp_path / "metadata",
+        block_cache_dir=tmp_path / "block_cache",
+        expected_minutes=3,
+        minute_sessions=(("09:30:00", "09:32:00"),),
+        minute_extra_times=(),
+        stock_tile_size=1,
+        workers=2,
+        build_workers=1,
+        reward_chunk_days=1,
+        reward_parallel_backend="threading",
+    )
+    cache_dir = tmp_path / "ram_cache"
+    original = DolphinDBMinuteRAMStore(
+        loader,
+        config,
+        reserve_ram_gb=0,
+        ram_cache_dir=cache_dir,
+    )
+    manifest = json.loads(
+        (cache_dir / "ram_cache_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["complete"] is True
+    assert manifest["load_mode"] == "eager_ram"
+    assert manifest["mmap"] is False
+
+    cached = DolphinDBMinuteRAMStore.from_disk_cache(
+        loader.config,
+        config,
+        reserve_ram_gb=0,
+        ram_cache_dir=cache_dir,
+    )
+    assert cached is not None
+    assert np.array_equal(cached.stocks, original.stocks)
+    assert cached.daily_data.equals(original.daily_data)
+    for year in (2024,):
+        for channel in (*MEMMAP_CHANNELS, "valid_mask"):
+            values = cached._array(year, channel)
+            assert isinstance(values, np.ndarray)
+            assert not isinstance(values, np.memmap)
+            assert np.allclose(
+                values, original._array(year, channel), equal_nan=True
+            )
+
+    mismatched = replace(config, minute_sessions=(("09:31:00", "09:33:00"),))
+    assert DolphinDBMinuteRAMStore.from_disk_cache(
+        loader.config,
+        mismatched,
+        reserve_ram_gb=0,
+        ram_cache_dir=cache_dir,
+    ) is None
 
 def test_consolidated_partial_cache_migrates_legacy_and_survives_rechunking(
     tmp_path,

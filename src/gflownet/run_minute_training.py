@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -99,8 +100,6 @@ def run(
                 )
             elif load_mode == "ram":
                 ddb_config = MinuteDolphinDBConfig.from_mapping(dataset, values)
-                ddb_session = create_dolphindb_session(values)
-                ddb_loader = DolphinDBMinuteLoader(ddb_config, ddb_session)
                 memory_values = dict(dataset.get("memory", {}))
                 memory_values.setdefault("root", "results/minute_ram_metadata")
                 memory_values.setdefault(
@@ -108,31 +107,65 @@ def run(
                 )
                 memory_values.setdefault("reward_parallel_backend", "threading")
                 memory_config = MinuteMemMapConfig.from_mapping(memory_values)
-
-                def ram_loader_factory() -> DolphinDBMinuteLoader:
-                    return DolphinDBMinuteLoader(
-                        ddb_config, create_dolphindb_session(values)
-                    )
-
-                memmap_store = DolphinDBMinuteRAMStore(
-                    ddb_loader,
-                    memory_config,
-                    loader_factory=(
-                        ram_loader_factory if memory_config.build_workers > 1 else None
-                    ),
-                    max_ram_gb=float(memory_values.get("max_ram_gb", 0.0)),
-                    reserve_ram_gb=float(memory_values.get("reserve_ram_gb", 64.0)),
+                ram_cache_enabled = bool(memory_values.get("ram_cache_enabled", True))
+                cache_env = str(
+                    memory_values.get("ram_cache_dir_env", "ALPHAMINING_RAM_CACHE_DIR")
                 )
+                ram_cache_dir = (
+                    memory_values.get("ram_cache_dir")
+                    or os.environ.get(cache_env)
+                    or (memory_config.root / "ram_snapshot")
+                )
+                max_ram_gb = float(memory_values.get("max_ram_gb", 0.0))
+                reserve_ram_gb = float(memory_values.get("reserve_ram_gb", 64.0))
+
+                memmap_store = DolphinDBMinuteRAMStore.from_disk_cache(
+                    ddb_config,
+                    memory_config,
+                    max_ram_gb=max_ram_gb,
+                    reserve_ram_gb=reserve_ram_gb,
+                    ram_cache_enabled=ram_cache_enabled,
+                    ram_cache_dir=ram_cache_dir,
+                )
+                if memmap_store is not None:
+                    print(
+                        "[MinuteGFlowNet] ddb_ram_cache_hit "
+                        "ddb_connection_skipped=true mmap=false",
+                        flush=True,
+                    )
+                else:
+                    ddb_session = create_dolphindb_session(values)
+                    ddb_loader = DolphinDBMinuteLoader(ddb_config, ddb_session)
+
+                    def ram_loader_factory() -> DolphinDBMinuteLoader:
+                        return DolphinDBMinuteLoader(
+                            ddb_config, create_dolphindb_session(values)
+                        )
+
+                    memmap_store = DolphinDBMinuteRAMStore(
+                        ddb_loader,
+                        memory_config,
+                        loader_factory=(
+                            ram_loader_factory if memory_config.build_workers > 1 else None
+                        ),
+                        max_ram_gb=max_ram_gb,
+                        reserve_ram_gb=reserve_ram_gb,
+                        ram_cache_enabled=ram_cache_enabled,
+                        ram_cache_dir=ram_cache_dir,
+                        restore_cache=False,
+                    )
                 daily_data = memmap_store.daily_data
                 minute_data = None
-                ddb_session.close()
-                ddb_session = None
-                ddb_loader = None
+                if ddb_session is not None:
+                    ddb_session.close()
+                    ddb_session = None
+                    ddb_loader = None
                 print(
                     f"[MinuteGFlowNet] ddb_ram_enabled raw_minute_files=false "
                     f"root={memory_config.root} dates={len(memmap_store.dates):,} "
                     f"stocks={len(memmap_store.stocks):,} "
-                    "remote_ddb_queries_during_training=0",
+                    f"ram_cache_dir={ram_cache_dir} "
+                    "remote_ddb_queries_during_training=0 mmap=false",
                     flush=True,
                 )
             else:

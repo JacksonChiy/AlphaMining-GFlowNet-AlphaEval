@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,7 +16,7 @@ import pandas as pd
 
 from src.operators.minute import EPS, validate_minute_data
 
-from .dolphindb_minute import DolphinDBMinuteLoader
+from .dolphindb_minute import DolphinDBMinuteLoader, MinuteDolphinDBConfig
 from .minute_quality_audit import (
     DEFAULT_MINUTE_EXTRA_TIMES,
     DEFAULT_MINUTE_SESSIONS,
@@ -29,6 +30,7 @@ MEMMAP_CHANNELS = (
     "signed_vol", "signed_amt", "typical", "vwap_cum", "twap", "obv", "pvt",
 )
 MEMMAP_FORMAT_VERSION = 1
+RAM_CACHE_FORMAT_VERSION = 1
 FAST_LOAD_SOURCE_COLUMNS = (
     "sym", "time", "open", "high", "low", "close", "volume", "amount",
 )
@@ -341,6 +343,24 @@ def _source_fingerprint(
         "prices_are_adjusted": loader.config.prices_are_adjusted,
         "channels": MEMMAP_CHANNELS,
         "minute_grid": list(minute_grid),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _ram_cache_fingerprint(
+    source: MinuteDolphinDBConfig,
+    config: MinuteMemMapConfig,
+) -> str:
+    payload = {
+        "cache_format_version": RAM_CACHE_FORMAT_VERSION,
+        "database": source.database,
+        "table": source.table,
+        "start_date": str(pd.Timestamp(source.start_date).date()),
+        "end_date": str(pd.Timestamp(source.end_date).date()),
+        "prices_are_adjusted": source.prices_are_adjusted,
+        "channels": list(MEMMAP_CHANNELS),
+        "minute_grid": list(config.minute_grid),
+        "dtype": "float32",
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -997,11 +1017,11 @@ class MinuteMemMapStore:
 
 
 class DolphinDBMinuteRAMStore(MinuteMemMapStore):
-    """Read DDB once into shared process RAM, then expose the MemMap store API.
+    """Keep minute arrays in RAM and optionally persist an eager-load disk snapshot.
 
     Arrays remain split by year so reward chunk specifications and persistent
-    factor caches stay compatible with the proven MemMap execution path.  No
-    raw-minute file is created and training performs zero remote DDB queries.
+    factor caches stay compatible with the proven execution path. Cached ``.npy``
+    files are always loaded eagerly with ``np.load``; ``mmap_mode`` is never used.
     """
 
     in_memory = True
@@ -1014,24 +1034,30 @@ class DolphinDBMinuteRAMStore(MinuteMemMapStore):
         *,
         max_ram_gb: float = 0.0,
         reserve_ram_gb: float = 64.0,
+        ram_cache_enabled: bool = True,
+        ram_cache_dir: str | Path | None = None,
+        restore_cache: bool = True,
     ) -> None:
-        if config.reward_parallel_backend != "threading":
-            raise ValueError(
-                "DDB RAM mode requires reward_parallel_backend=threading so workers "
-                "share arrays instead of copying them"
-            )
+        self._initialize_ram_state(
+            config,
+            max_ram_gb=max_ram_gb,
+            reserve_ram_gb=reserve_ram_gb,
+            ram_cache_enabled=ram_cache_enabled,
+            ram_cache_dir=ram_cache_dir,
+        )
         if config.build_workers > 1 and loader_factory is None:
             raise ValueError(
                 "DDB RAM build_workers > 1 requires an independent loader per thread"
             )
-        self.config = config
         self._loader = loader
         self._loader_factory = loader_factory
-        self._ram_arrays: dict[tuple[int, str], np.ndarray] = {}
-        self._year_date_values: dict[int, pd.DatetimeIndex] = {}
-        self._max_ram_gb = float(max_ram_gb)
-        self._reserve_ram_gb = float(reserve_ram_gb)
-        self.config.root.mkdir(parents=True, exist_ok=True)
+
+        if (
+            restore_cache
+            and not config.force_rebuild
+            and self._restore_ram_cache(loader.config)
+        ):
+            return
 
         audit = loader.audit()
         if not audit.passed:
@@ -1067,6 +1093,305 @@ class DolphinDBMinuteRAMStore(MinuteMemMapStore):
         }
         self._validate_capacity()
         self._load_all_years(helper)
+        self._save_ram_cache(loader.config)
+
+    @classmethod
+    def from_disk_cache(
+        cls,
+        source: MinuteDolphinDBConfig,
+        config: MinuteMemMapConfig,
+        *,
+        max_ram_gb: float = 0.0,
+        reserve_ram_gb: float = 64.0,
+        ram_cache_enabled: bool = True,
+        ram_cache_dir: str | Path | None = None,
+    ) -> "DolphinDBMinuteRAMStore | None":
+        """Return an eager in-RAM store on cache hit without connecting to DDB."""
+        store = cls.__new__(cls)
+        store._initialize_ram_state(
+            config,
+            max_ram_gb=max_ram_gb,
+            reserve_ram_gb=reserve_ram_gb,
+            ram_cache_enabled=ram_cache_enabled,
+            ram_cache_dir=ram_cache_dir,
+        )
+        if config.force_rebuild or not store._restore_ram_cache(source):
+            return None
+        return store
+
+    def _initialize_ram_state(
+        self,
+        config: MinuteMemMapConfig,
+        *,
+        max_ram_gb: float,
+        reserve_ram_gb: float,
+        ram_cache_enabled: bool,
+        ram_cache_dir: str | Path | None,
+    ) -> None:
+        if config.reward_parallel_backend != "threading":
+            raise ValueError(
+                "DDB RAM mode requires reward_parallel_backend=threading so workers "
+                "share arrays instead of copying them"
+            )
+        self.config = config
+        self._loader: DolphinDBMinuteLoader | None = None
+        self._loader_factory: Callable[[], DolphinDBMinuteLoader] | None = None
+        self._ram_arrays: dict[tuple[int, str], np.ndarray] = {}
+        self._year_date_values: dict[int, pd.DatetimeIndex] = {}
+        self._max_ram_gb = float(max_ram_gb)
+        self._reserve_ram_gb = float(reserve_ram_gb)
+        self._ram_cache_enabled = bool(ram_cache_enabled)
+        self._ram_cache_dir = Path(
+            ram_cache_dir or (config.root / "ram_snapshot")
+        )
+        self.config.root.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def _ram_cache_manifest_path(self) -> Path:
+        return self._ram_cache_dir / "ram_cache_manifest.json"
+
+    @staticmethod
+    def _load_json(path: Path) -> dict[str, Any] | None:
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(dict(value), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        temporary.replace(path)
+
+    @staticmethod
+    def _atomic_numpy(path: Path, values: np.ndarray) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        with temporary.open("wb") as handle:
+            np.save(handle, np.asarray(values), allow_pickle=False)
+        temporary.replace(path)
+
+    def _restore_ram_cache(self, source: MinuteDolphinDBConfig) -> bool:
+        if not self._ram_cache_enabled:
+            print("[DDBRAMCache] disabled", flush=True)
+            return False
+        expected_fingerprint = _ram_cache_fingerprint(source, self.config)
+        manifest = self._load_json(self._ram_cache_manifest_path)
+        if not manifest:
+            print(
+                f"[DDBRAMCache] miss reason=manifest_missing "
+                f"path={self._ram_cache_manifest_path}",
+                flush=True,
+            )
+            return False
+        if not manifest.get("complete"):
+            print("[DDBRAMCache] miss reason=incomplete_snapshot", flush=True)
+            return False
+        if int(manifest.get("cache_format_version", -1)) != RAM_CACHE_FORMAT_VERSION:
+            print("[DDBRAMCache] miss reason=format_version_mismatch", flush=True)
+            return False
+        if manifest.get("fingerprint") != expected_fingerprint:
+            print("[DDBRAMCache] miss reason=fingerprint_mismatch", flush=True)
+            return False
+        started = time.perf_counter()
+        try:
+            self.stocks = np.load(
+                self._ram_cache_dir / str(manifest["stocks_file"]), allow_pickle=False
+            )
+            self.minute_grid = np.load(
+                self._ram_cache_dir / str(manifest["minute_grid_file"]),
+                allow_pickle=False,
+            )
+            dates_array = np.load(
+                self._ram_cache_dir / str(manifest["dates_file"]), allow_pickle=False
+            )
+            self.dates = pd.DatetimeIndex(pd.to_datetime(dates_array)).normalize()
+            if tuple(self.minute_grid.astype(str)) != tuple(self.config.minute_grid):
+                raise ValueError("cached minute grid does not match configuration")
+            if (
+                not len(self.dates)
+                or self.dates[0] < pd.Timestamp(source.start_date).normalize()
+                or self.dates[-1] > pd.Timestamp(source.end_date).normalize()
+            ):
+                raise ValueError("cached trading-date range does not match source range")
+            if tuple(manifest.get("channels", ())) != MEMMAP_CHANNELS:
+                raise ValueError("cached channel inventory is incompatible")
+            self.stock_lookup = {
+                str(code): index for index, code in enumerate(self.stocks)
+            }
+            self.fingerprint = str(manifest["source_fingerprint"])
+            self.manifest = {
+                "format_version": MEMMAP_FORMAT_VERSION,
+                "complete": True,
+                "fingerprint": self.fingerprint,
+                "layout": "eager RAM year/channel -> (n_days, n_minutes, n_stocks)",
+                "dtype": "float32",
+                "channels": list(MEMMAP_CHANNELS),
+                "n_minutes": len(self.minute_grid),
+                "n_stocks": len(self.stocks),
+                "years": {},
+            }
+            self._validate_capacity()
+            self.daily_data = pd.read_pickle(
+                self._ram_cache_dir / str(manifest["daily_file"])
+            )
+            for year_text, metadata in sorted(manifest["years"].items()):
+                year = int(year_text)
+                year_started = time.perf_counter()
+                year_dates = pd.DatetimeIndex(pd.to_datetime(np.load(
+                    self._ram_cache_dir / str(metadata["dates_file"]),
+                    allow_pickle=False,
+                ))).normalize()
+                self._year_date_values[year] = year_dates
+                expected_shape = tuple(int(value) for value in metadata["shape"])
+                for channel in MEMMAP_CHANNELS:
+                    values = np.load(
+                        self._ram_cache_dir / str(metadata["channels"][channel]),
+                        allow_pickle=False,
+                    )
+                    if isinstance(values, np.memmap):
+                        raise TypeError("RAM cache must be eagerly loaded, not memory-mapped")
+                    if values.shape != expected_shape or values.dtype != np.float32:
+                        raise ValueError(
+                            f"invalid cached array {year}/{channel}: "
+                            f"shape={values.shape} dtype={values.dtype}"
+                        )
+                    self._ram_arrays[(year, channel)] = values
+                mask = np.load(
+                    self._ram_cache_dir / str(metadata["valid_mask"]),
+                    allow_pickle=False,
+                )
+                if isinstance(mask, np.memmap):
+                    raise TypeError("RAM cache mask must be eagerly loaded")
+                if mask.shape != expected_shape or mask.dtype != np.uint8:
+                    raise ValueError(
+                        f"invalid cached mask {year}: shape={mask.shape} dtype={mask.dtype}"
+                    )
+                self._ram_arrays[(year, "valid_mask")] = mask
+                self.manifest["years"][year_text] = {
+                    "n_days": len(year_dates), "shape": list(mask.shape)
+                }
+                print(
+                    f"[DDBRAMCache] load_progress year={year} "
+                    f"seconds={time.perf_counter() - year_started:.1f} "
+                    f"resident_gb={sum(a.nbytes for a in self._ram_arrays.values()) / 1024**3:.1f}",
+                    flush=True,
+                )
+        except (OSError, ValueError, KeyError, EOFError, TypeError) as exc:
+            self._ram_arrays.clear()
+            self._year_date_values.clear()
+            print(
+                f"[DDBRAMCache] miss reason=invalid_snapshot "
+                f"error={type(exc).__name__}:{exc}",
+                flush=True,
+            )
+            return False
+        print(
+            f"[DDBRAMCache] hit path={self._ram_cache_dir} "
+            f"dates={len(self.dates):,} stocks={len(self.stocks):,} "
+            f"resident_gb={sum(a.nbytes for a in self._ram_arrays.values()) / 1024**3:.1f} "
+            f"seconds={time.perf_counter() - started:.1f} "
+            "storage=npy load_mode=eager_ram mmap=false ddb_queries=0",
+            flush=True,
+        )
+        return True
+
+    def _save_ram_cache(self, source: MinuteDolphinDBConfig) -> None:
+        if not self._ram_cache_enabled:
+            return
+        required = sum(array.nbytes for array in self._ram_arrays.values())
+        self._ram_cache_dir.mkdir(parents=True, exist_ok=True)
+        free = shutil.disk_usage(self._ram_cache_dir).free
+        if free < int(required * 1.05):
+            print(
+                f"[DDBRAMCache] save_skipped reason=insufficient_disk "
+                f"required_gb={required * 1.05 / 1024**3:.1f} "
+                f"free_gb={free / 1024**3:.1f}",
+                flush=True,
+            )
+            return
+        started = time.perf_counter()
+        manifest: dict[str, Any] = {
+            "cache_format_version": RAM_CACHE_FORMAT_VERSION,
+            "complete": False,
+            "fingerprint": _ram_cache_fingerprint(source, self.config),
+            "source_fingerprint": self.fingerprint,
+            "storage": "npy",
+            "load_mode": "eager_ram",
+            "mmap": False,
+            "stocks_file": "stocks.npy",
+            "minute_grid_file": "minute_grid.npy",
+            "dates_file": "dates.npy",
+            "daily_file": "daily_price.pkl",
+            "channels": list(MEMMAP_CHANNELS),
+            "years": {},
+        }
+        self._atomic_json(self._ram_cache_manifest_path, manifest)
+        try:
+            self._atomic_numpy(self._ram_cache_dir / "stocks.npy", self.stocks)
+            self._atomic_numpy(self._ram_cache_dir / "minute_grid.npy", self.minute_grid)
+            self._atomic_numpy(
+                self._ram_cache_dir / "dates.npy",
+                np.asarray([str(date.date()) for date in self.dates], dtype=str),
+            )
+            daily_path = self._ram_cache_dir / "daily_price.pkl"
+            daily_temporary = daily_path.with_suffix(daily_path.suffix + ".tmp")
+            self.daily_data.to_pickle(daily_temporary)
+            daily_temporary.replace(daily_path)
+            for year in sorted(self._year_date_values):
+                year_started = time.perf_counter()
+                year_dir = self._ram_cache_dir / str(year)
+                dates_file = f"{year}/dates.npy"
+                self._atomic_numpy(
+                    self._ram_cache_dir / dates_file,
+                    np.asarray([
+                        str(date.date()) for date in self._year_date_values[year]
+                    ], dtype=str),
+                )
+                channel_files: dict[str, str] = {}
+                for channel in MEMMAP_CHANNELS:
+                    relative = f"{year}/{channel}.npy"
+                    self._atomic_numpy(
+                        self._ram_cache_dir / relative,
+                        self._ram_arrays[(year, channel)],
+                    )
+                    channel_files[channel] = relative
+                mask_relative = f"{year}/valid_mask.npy"
+                self._atomic_numpy(
+                    self._ram_cache_dir / mask_relative,
+                    self._ram_arrays[(year, "valid_mask")],
+                )
+                manifest["years"][str(year)] = {
+                    "dates_file": dates_file,
+                    "channels": channel_files,
+                    "valid_mask": mask_relative,
+                    "shape": list(self._ram_arrays[(year, "valid_mask")].shape),
+                }
+                print(
+                    f"[DDBRAMCache] save_progress year={year} "
+                    f"seconds={time.perf_counter() - year_started:.1f}",
+                    flush=True,
+                )
+            manifest["complete"] = True
+            self._atomic_json(self._ram_cache_manifest_path, manifest)
+        except (OSError, ValueError) as exc:
+            print(
+                f"[DDBRAMCache] save_failed error={type(exc).__name__}:{exc} "
+                "training_continues=true",
+                flush=True,
+            )
+            return
+        print(
+            f"[DDBRAMCache] save_complete path={self._ram_cache_dir} "
+            f"size_gb={required / 1024**3:.1f} "
+            f"seconds={time.perf_counter() - started:.1f} mmap=false",
+            flush=True,
+        )
 
     @property
     def daily_file(self) -> Path:
