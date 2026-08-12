@@ -152,6 +152,171 @@ python -m src.gflownet.run_minute_training \
 
 需要在 2024–2026 年回测时，应把 2020–2026 分钟数据传给因子池执行；GFlowNet 的 Reward 仍只切片使用 2020–2023 年，输出矩阵则覆盖完整历史，避免重新训练表达式。
 
-## 10. 当前边界
+## 10. PPU 训练结束后的完整处理
+
+阿里 PPU 全量内存入口为：
+
+```text
+notebooks/deployment/minute_ppu_ram.ipynb
+```
+
+Notebook 已包含训练结束后的完整流程，不需要再手工拼接命令：
+
+```text
+PPU GFlowNet 训练
+→ 加载最佳 checkpoint
+→ 生成分钟 Alpha Pool
+→ 在 2020–2026 分钟数据上执行表达式
+→ 日内聚合为日频因子矩阵
+→ 产物与覆盖率验收
+→ AlphaEval + DPP
+→ LightGBM 滚动融合
+→ 打包本地回测产物
+```
+
+### 10.1 首次完整运行
+
+在 Notebook 的“选择运行阶段”单元格保持：
+
+```python
+RUN_GFLOWNET_TRAINING = True
+RUN_ALPHA_EVAL = True
+RUN_LIGHTGBM = True
+PACKAGE_RESULTS = True
+```
+
+然后从上到下执行。分钟训练结束不是只保存模型：
+`src/gflownet/run_minute_training.py` 会重新加载最佳 checkpoint，生成 Alpha Pool，并把
+分钟表达式按日内 `r_*` 算子聚合为覆盖 2020–2026 的日频因子矩阵。
+
+### 10.2 训练已经完成时继续后处理
+
+如果以下文件已经存在：
+
+```text
+checkpoints/gflownet_minute_ppu_ddb_ram_best.pt
+results/minute_ppu_ddb_ram/alpha_pool.csv
+results/minute_ppu_ddb_ram/alpha_factor_matrix.csv.gz
+```
+
+将：
+
+```python
+RUN_GFLOWNET_TRAINING = False
+```
+
+然后从“验收分钟训练产物并转换格式”单元格继续执行。这样不会重新读取 DDB、恢复
+700GB RAM 数据或重新训练 GFlowNet。
+
+如果 AlphaEval 已经完成，只重新训练 LightGBM：
+
+```python
+RUN_GFLOWNET_TRAINING = False
+RUN_ALPHA_EVAL = False
+RUN_LIGHTGBM = True
+PACKAGE_RESULTS = True
+```
+
+如果只需要重新打包：
+
+```python
+RUN_GFLOWNET_TRAINING = False
+RUN_ALPHA_EVAL = False
+RUN_LIGHTGBM = False
+PACKAGE_RESULTS = True
+```
+
+跳过阶段时 Notebook 会检查对应文件是否存在，缺失时立即报错，不会静默使用其他
+实验目录中的产物。
+
+### 10.3 因子矩阵验收
+
+Notebook 自动检查：
+
+- checkpoint、Alpha Pool、日频因子矩阵和 RAM 快照中的日频行情是否存在；
+- `date-code` 是否重复；
+- 是否存在因子列；
+- 每个因子覆盖率是否达到 `reward.min_coverage`，默认 80%；
+- 因子日期范围、股票数和交易日数；
+- 将 `alpha_factor_matrix.csv.gz` 转为 AlphaEval/LightGBM 可直接读取的 Pickle。
+
+转换结果为：
+
+```text
+results/minute_ppu_ddb_ram/alpha_factor_matrix.pkl
+```
+
+分钟原始数组和 RAM 快照不会进入后处理计算；后续全部在日频层运行。
+
+### 10.4 AlphaEval
+
+AlphaEval 使用 `configs/minute/ppu_ddb_ram.yaml` 中独立的 `alpha_eval` 配置，只评价
+2020–2023 样本内因子，输出：
+
+```text
+results/minute_ppu_ddb_ram/alpha_eval_result.csv
+```
+
+主要指标包括 RankIC、ICIR、Top 组合 Sharpe、滚动稳定性、扰动鲁棒性、复杂度、
+DPP 多样性和最终入选标记。默认 `dpp_k=30`。
+
+### 10.5 LightGBM
+
+LightGBM 使用 DPP 入选分钟因子，预测标签为：
+
+```text
+close(t+5) / close(t+1) - 1
+```
+
+训练与预测之间保留 5 个交易日 purge；2020–2023 提供训练历史，只输出
+2024–2026 的样本外分数：
+
+```text
+results/minute_ppu_ddb_ram/lightgbm/
+├── prediction_score.csv
+├── model_metrics.csv
+├── feature_importance.csv
+├── lgbm_model.joblib
+└── lgbm_window_*.joblib
+```
+
+### 10.6 打包和下载
+
+Notebook 最后生成：
+
+```text
+results/minute_ppu_ddb_ram/postprocess_manifest.json
+results/minute_ppu_ddb_ram/minute_ppu_artifacts.zip
+```
+
+压缩包包含：
+
+- 最佳 GFlowNet checkpoint；
+- 分钟 Alpha Pool；
+- AlphaEval 结果；
+- GFlowNet 训练与轨迹指标；
+- LightGBM 最新模型、模型指标、特征重要性和预测分数；
+- 本次配置和后处理 manifest。
+
+压缩包不会包含全量 RAM 快照、原始分钟数据或完整因子矩阵，避免下载几十至数百 GB
+数据。若需要在本地重新做 AlphaEval、相关性或风格归因，再单独下载
+`alpha_factor_matrix.csv.gz`。
+
+### 10.7 本地 RQAlphaPlus 回测
+
+把压缩包解压到仓库根目录，运行：
+
+```bash
+python -m rqalpha_strategy.run_backtest \
+  --config configs/minute/ppu_ddb_ram.yaml \
+  --bundle ~/.rqalpha-plus/bundle \
+  --predictions results/minute_ppu_ddb_ram/lightgbm/prediction_score.csv \
+  --output-dir results/minute_ppu_ddb_ram/backtest_report
+```
+
+RQAlphaPlus 只在本地授权环境运行，并会清除代理变量。回测读取的是分钟因子经
+AlphaEval 和 LightGBM 融合后的日频预测分数，不读取原始分钟数据。
+
+## 11. 当前边界
 
 本次完成的是图表 27–30 的表达式计算和 GFlowNet 搜索闭环。DolphinDB 远端表名、分区、字段类型和复权字段仍需在内网服务器做字段审计后再固化抽取脚本；大规模全市场分钟训练下一步应按研报方案接入 `(year, channel) -> (day, minute, stock)` MemMap/分块缓存，避免长表全量驻留内存。
