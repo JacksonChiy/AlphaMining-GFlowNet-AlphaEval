@@ -188,6 +188,9 @@ PACKAGE_RESULTS = True
 然后从上到下执行。分钟训练结束不是只保存模型：
 `src/gflownet/run_minute_training.py` 会重新加载最佳 checkpoint，生成 Alpha Pool，并把
 分钟表达式按日内 `r_*` 算子聚合为覆盖 2020–2026 的日频因子矩阵。
+训练入口还会把同一份 DDB 日频聚合结果独立保存为
+`results/minute_ppu_ddb_ram/daily_price.pkl`。该文件供 Reward、AlphaEval 和
+LightGBM 共用，不再依赖大型 RAM 快照是否成功落盘。
 
 ### 10.2 训练已经完成时继续后处理
 
@@ -207,6 +210,19 @@ RUN_GFLOWNET_TRAINING = False
 
 然后从“验收分钟训练产物并转换格式”单元格继续执行。这样不会重新读取 DDB、恢复
 700GB RAM 数据或重新训练 GFlowNet。
+
+旧版本训练可能没有独立的 `daily_price.pkl`。Notebook 会先尝试从旧 RAM 快照复制；
+如果快照中也没有，则自动执行：
+
+```bash
+python scripts/export_ddb_daily.py \
+  --config configs/minute/ppu_ddb_ram.yaml
+```
+
+该命令只在 DolphinDB 端分块聚合日频 OHLCV，不加载全量分钟数组、不生成 MemMap、
+不训练 GFlowNet。默认每次查询 20 个交易日，以避免 DDB 的分区数限制；仍超限时使用
+`--chunk-days 5`。输出为 `results/minute_ppu_ddb_ram/daily_price.pkl` 及其
+`.metadata.json` 审计文件。
 
 如果 AlphaEval 已经完成，只重新训练 LightGBM：
 
@@ -233,7 +249,7 @@ PACKAGE_RESULTS = True
 
 Notebook 自动检查：
 
-- checkpoint、Alpha Pool、日频因子矩阵和 RAM 快照中的日频行情是否存在；
+- checkpoint、Alpha Pool、日频因子矩阵和独立日频行情文件是否存在；
 - `date-code` 是否重复；
 - 是否存在因子列；
 - 每个因子覆盖率是否达到 `reward.min_coverage`，默认 80%；

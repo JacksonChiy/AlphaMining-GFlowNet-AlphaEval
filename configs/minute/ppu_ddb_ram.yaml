@@ -23,7 +23,8 @@ dataset:
     start_date: '2020-01-01'
     end_date: '2026-12-31'
     audit_chunk_days: 120
-    daily_aggregate_chunk_days: 120
+    # 限制单次DDB查询分区数；服务器限制更严格时可继续调小。
+    daily_aggregate_chunk_days: 20
     chunk_days: 1
     prices_are_adjusted: false
 
@@ -143,6 +144,8 @@ pipeline:
 
 outputs:
   log_dir: results/minute_ppu_ddb_ram/logs
+  # Reward、AlphaEval和LightGBM共用的独立日频面板，不依赖RAM快照是否保存。
+  daily_price: results/minute_ppu_ddb_ram/daily_price.pkl
   checkpoint: checkpoints/gflownet_minute_ppu_ddb_ram_best.pt
   metrics: results/minute_ppu_ddb_ram/gflownet_training_metrics.csv
   trajectory_metrics: results/minute_ppu_ddb_ram/gflownet_trajectory_metrics.csv

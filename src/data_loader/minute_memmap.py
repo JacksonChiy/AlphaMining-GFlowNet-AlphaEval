@@ -147,6 +147,32 @@ def _time_key(value: Any) -> str:
     return parsed.strftime("%H:%M:%S")
 
 
+def _ddb_minute_literal(value: str) -> str:
+    parsed = pd.Timestamp(f"2000-01-01 {value}")
+    if parsed.second or parsed.microsecond:
+        raise ValueError(f"Minute-grid values must align to whole minutes: {value}")
+    return parsed.strftime("%H:%M") + "m"
+
+
+def build_ddb_minute_time_filter(
+    minute_sessions: Sequence[Sequence[str]], minute_extra_times: Sequence[str]
+) -> str:
+    """Build the DDB predicate shared by RAM/MemMap loading and daily export."""
+    clauses = [
+        f"minute(time) = {_ddb_minute_literal(str(value))}"
+        for value in minute_extra_times
+    ]
+    clauses.extend(
+        "(minute(time) >= "
+        f"{_ddb_minute_literal(str(start))} and minute(time) <= "
+        f"{_ddb_minute_literal(str(end))})"
+        for start, end in minute_sessions
+    )
+    if not clauses:
+        raise ValueError("At least one minute session or extra time is required")
+    return " or ".join(clauses)
+
+
 def _source_fingerprint(
     loader: DolphinDBMinuteLoader,
     dates: Sequence[pd.Timestamp],
@@ -384,24 +410,13 @@ class DolphinDBMinuteMemMapBuilder:
         return configured
 
     def _ddb_time_filter_sql(self) -> str:
-        clauses = [
-            f"minute(time) = {self._ddb_minute_literal(value)}"
-            for value in self.config.minute_extra_times
-        ]
-        clauses.extend(
-            "(minute(time) >= "
-            f"{self._ddb_minute_literal(start)} and minute(time) <= "
-            f"{self._ddb_minute_literal(end)})"
-            for start, end in self.config.minute_sessions
+        return build_ddb_minute_time_filter(
+            self.config.minute_sessions, self.config.minute_extra_times
         )
-        return " or ".join(clauses)
 
     @staticmethod
     def _ddb_minute_literal(value: str) -> str:
-        parsed = pd.Timestamp(f"2000-01-01 {value}")
-        if parsed.second or parsed.microsecond:
-            raise ValueError(f"Minute-grid values must align to whole minutes: {value}")
-        return parsed.strftime("%H:%M") + "m"
+        return _ddb_minute_literal(value)
 
     def _build_year(
         self,

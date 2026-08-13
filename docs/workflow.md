@@ -41,7 +41,7 @@ flowchart LR
 5. 日频因子与未来收益计算 RankIC、LongIR、风险与覆盖率惩罚；
 6. GFlowNet 通过 TB loss 更新策略网络并输出分钟 Alpha 池。
 
-分离模式下，第 3 步完成后训练不再访问 DDB。PPU RAM 模式不使用 MemMap：首次从 DDB 加载全部数据进入内存并保存 NPY 快照；后续先校验配置指纹，命中后从本地快照全量恢复到内存。
+分离模式下，第 3 步完成后训练不再访问 DDB。PPU RAM 模式不使用 MemMap：首次从 DDB 加载全部数据进入内存并保存 NPY 快照；后续先校验配置指纹，命中后从本地快照全量恢复到内存。日频聚合数据另存为 `results/minute_ppu_ddb_ram/daily_price.pkl`，不依赖大型 RAM 快照；旧训练缺少该文件时可用 `scripts/export_ddb_daily.py` 单独补建，无需重训 GFlowNet。
 
 ## 指数增强流水线
 

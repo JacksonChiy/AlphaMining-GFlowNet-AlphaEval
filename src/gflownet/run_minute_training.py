@@ -19,6 +19,7 @@ from src.data_loader.minute_memmap import (
     MinuteMemMapConfig,
     MinuteMemMapStore,
 )
+from src.data_loader.daily_artifact import save_daily_price_artifact
 from src.gflownet.minute_factor_pool import (
     save_minute_alpha_pool,
     save_minute_alpha_pool_from_cache,
@@ -237,6 +238,27 @@ def _run_loaded_pipeline(
             raise ValueError(f"{label} input must contain date and code")
         frame["date"] = pd.to_datetime(frame["date"]).dt.normalize()
         frame["code"] = frame["code"].astype(str)
+    daily_output = config.get("outputs", {}).get("daily_price")
+    if daily_output:
+        memory = dataset.get("memory", {})
+        save_daily_price_artifact(
+            daily_data,
+            daily_output,
+            source=str(dataset.get("source", "local")),
+            minute_grid=(
+                memmap_store.minute_grid.astype(str).tolist()
+                if memmap_store is not None
+                else ()
+            ),
+            extra_metadata={
+                "mining_start_date": dataset.get("mining_start_date"),
+                "mining_end_date": dataset.get("mining_end_date"),
+                "out_of_sample_start_date": dataset.get("out_of_sample_start_date"),
+                "out_of_sample_end_date": dataset.get("out_of_sample_end_date"),
+                "minute_sessions": memory.get("minute_sessions", []),
+                "minute_extra_times": memory.get("minute_extra_times", []),
+            },
+        )
     mining_start = dataset.get("mining_start_date")
     mining_end = dataset.get("mining_end_date")
     daily_mining = slice_date_range(

@@ -49,6 +49,9 @@ def test_ppu_ddb_ram_notebook_configures_eager_disk_cache() -> None:
     assert "RUN_GFLOWNET_TRAINING" in code
     assert "src.alpha_eval.run_evaluation" in code
     assert "src.model.run_lightgbm" in code
+    assert "REBUILD_DAILY_PRICE_IF_MISSING" in code
+    assert "scripts/export_ddb_daily.py" in code
+    assert "outputs['daily_price']" in code
     assert "alpha_factor_matrix.csv.gz" not in code  # Paths must come from YAML.
     assert "postprocess_manifest" in code
     assert "zipfile.ZipFile" in code
@@ -67,4 +70,5 @@ def test_ppu_ddb_ram_config_contains_postprocessing_pipeline() -> None:
     assert config["backtest"]["stock_commission_multiplier"] == 1.0
     assert config["outputs"]["factor_matrix"].endswith(".csv.gz")
     assert config["outputs"]["factor_matrix_pickle"].endswith(".pkl")
+    assert config["outputs"]["daily_price"].endswith("daily_price.pkl")
     assert config["outputs"]["artifact_package"].endswith(".zip")
