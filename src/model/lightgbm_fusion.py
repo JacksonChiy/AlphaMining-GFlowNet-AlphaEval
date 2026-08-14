@@ -65,9 +65,6 @@ class LightGBMFusion:
         data = base.merge(
             factors[keys + self.feature_names], on=keys, how="inner", validate="one_to_one"
         ).sort_values(keys, kind="stable")
-        data[self.feature_names] = data.groupby("date", observed=True)[self.feature_names].transform(
-            self._cross_sectional_zscore
-        )
         dates = np.array(sorted(data["date"].unique()))
         predictions: list[pd.DataFrame] = []
         output_dir = Path(output_dir)
@@ -87,6 +84,11 @@ class LightGBMFusion:
             f"prediction_end={self.config.prediction_end_date}",
             flush=True,
         )
+        prediction_dates = dates[prediction_start_index:prediction_end_index]
+        self._validate_prediction_factor_variation(data, prediction_dates)
+        data[self.feature_names] = data.groupby(
+            "date", observed=True
+        )[self.feature_names].transform(self._cross_sectional_zscore)
 
         start = prediction_start_index
         window_index = 0
@@ -149,11 +151,18 @@ class LightGBMFusion:
                 train_target = self._ranking_relevance(train)
             model.fit(train[self.feature_names], train_target, **fit_kwargs)
             test["prediction_score"] = model.predict(test[self.feature_names])
-            predictions.append(test[keys + ["target", "prediction_score"]])
             valid = test.dropna(subset=["target", "prediction_score"]).copy()
-            daily_ic = valid.groupby("date", observed=True)[["prediction_score", "target"]].apply(
-                lambda x: x["prediction_score"].corr(x["target"], method="spearman")
-            ).dropna()
+            diagnostics = self._window_diagnostics(test)
+            if diagnostics["prediction_varying_dates"] == 0:
+                raise ValueError(
+                    "LightGBM prediction is cross-sectionally constant for every date in "
+                    f"{pd.Timestamp(test_dates[0]).date()}..{pd.Timestamp(test_dates[-1]).date()}. "
+                    "Do not use this window for backtesting. Audit the factor matrix by year "
+                    "with scripts/audit_lightgbm_inputs.py; the usual cause is an empty or "
+                    "constant OOS factor block."
+                )
+            predictions.append(test[keys + ["target", "prediction_score"]])
+            daily_ic = self._safe_daily_spearman(valid)
             valid["score_quantile"] = valid.groupby("date", observed=True)[
                 "prediction_score"
             ].transform(
@@ -186,6 +195,7 @@ class LightGBMFusion:
                 "last_mature_label_date": str(valid["date"].max().date()) if len(valid) else "",
                 "train_rows": float(len(train)),
                 "test_rows": float(len(test)),
+                **diagnostics,
             })
             self.models.append(model)
             if self.config.save_all_models:
@@ -195,7 +205,13 @@ class LightGBMFusion:
                 )
             print(
                 f"[LightGBM] window_complete index={window_index:03d} "
-                f"rank_ic={self.metrics[-1]['rank_ic']:.6f}",
+                f"rank_ic={self.metrics[-1]['rank_ic']:.6f} "
+                f"evaluable_dates={int(diagnostics['rank_ic_evaluable_dates'])}/"
+                f"{int(diagnostics['test_dates'])} "
+                f"constant_target_dates={int(diagnostics['constant_target_dates'])} "
+                f"constant_prediction_dates={int(diagnostics['constant_prediction_dates'])} "
+                f"active_factors_median={diagnostics['active_factors_median']:.1f}/"
+                f"{len(self.feature_names)} factor_finite={diagnostics['factor_finite_ratio']:.2%}",
                 flush=True,
             )
             start = test_end
@@ -249,6 +265,99 @@ class LightGBMFusion:
         )
         weights[train["target"].ge(cutoffs).to_numpy()] = multiplier
         return weights
+
+    def _window_diagnostics(self, test: pd.DataFrame) -> dict[str, float]:
+        """Explain whether a window is evaluable and whether its signal varies."""
+        grouped = test.groupby("date", observed=True, sort=True)
+        target_count = grouped["target"].count()
+        target_unique = grouped["target"].nunique(dropna=True)
+        prediction_count = grouped["prediction_score"].count()
+        prediction_unique = grouped["prediction_score"].nunique(dropna=True)
+        feature_values = test[self.feature_names].to_numpy(dtype=float, copy=False)
+        feature_std = grouped[self.feature_names].std(ddof=0)
+        active_factors = feature_std.gt(1e-12).sum(axis=1)
+        target_varying = target_unique.gt(1)
+        prediction_varying = prediction_unique.gt(1)
+        evaluable = target_varying & prediction_varying
+        return {
+            "test_dates": float(test["date"].nunique()),
+            "mature_label_dates": float(target_count.gt(0).sum()),
+            "target_varying_dates": float(target_varying.sum()),
+            "constant_target_dates": float(
+                (target_count.ge(2) & target_unique.le(1)).sum()
+            ),
+            "prediction_varying_dates": float(prediction_varying.sum()),
+            "constant_prediction_dates": float(
+                (prediction_count.ge(2) & prediction_unique.le(1)).sum()
+            ),
+            "rank_ic_evaluable_dates": float(evaluable.sum()),
+            "factor_finite_ratio": float(np.isfinite(feature_values).mean()),
+            "active_factors_min": float(active_factors.min()) if len(active_factors) else 0.0,
+            "active_factors_median": float(active_factors.median()) if len(active_factors) else 0.0,
+            "zero_active_factor_dates": float(active_factors.eq(0).sum()),
+        }
+
+    def _validate_prediction_factor_variation(
+        self, data: pd.DataFrame, prediction_dates: np.ndarray
+    ) -> None:
+        """Fail before model fitting when an OOS factor block cannot rank stocks."""
+        prediction = data.loc[data["date"].isin(prediction_dates)]
+        if prediction.empty:
+            raise ValueError("Prediction factor data is empty")
+        feature_std = prediction.groupby("date", observed=True)[
+            self.feature_names
+        ].std(ddof=0)
+        active = feature_std.gt(1e-12).sum(axis=1)
+        finite = prediction.assign(
+            _year=prediction["date"].dt.year
+        ).groupby("_year", observed=True)[self.feature_names].agg(
+            lambda values: float(np.isfinite(values.to_numpy(dtype=float)).mean())
+        ).mean(axis=1)
+        for year, year_active in active.groupby(active.index.year):
+            print(
+                f"[LightGBM] factor_audit year={int(year)} "
+                f"dates={len(year_active)} active_factors_min={int(year_active.min())} "
+                f"active_factors_median={float(year_active.median()):.1f}/"
+                f"{len(self.feature_names)} factor_finite={float(finite.get(year, np.nan)):.2%} "
+                f"zero_active_dates={int(year_active.eq(0).sum())}",
+                flush=True,
+            )
+        broken = active.index[active.eq(0)]
+        if len(broken):
+            examples = ",".join(str(pd.Timestamp(date).date()) for date in broken[:10])
+            raise ValueError(
+                f"Selected factors have no cross-sectional variation on {len(broken)} "
+                f"prediction dates (first={examples}). LightGBM would emit constant scores. "
+                "Audit/rebuild the OOS minute factor matrix before backtesting: "
+                "python scripts/audit_lightgbm_inputs.py"
+            )
+
+    @staticmethod
+    def _safe_daily_spearman(valid: pd.DataFrame) -> pd.Series:
+        """Calculate daily RankIC without emitting constant-input warnings."""
+        if valid.empty:
+            return pd.Series(dtype=float)
+        grouped = valid.groupby("date", observed=True, sort=True)
+        target_unique = grouped["target"].nunique(dropna=True)
+        prediction_unique = grouped["prediction_score"].nunique(dropna=True)
+        usable_dates = target_unique.index[
+            target_unique.gt(1) & prediction_unique.gt(1)
+        ]
+        if not len(usable_dates):
+            return pd.Series(dtype=float)
+        work = valid.loc[valid["date"].isin(usable_dates), [
+            "date", "prediction_score", "target"
+        ]].copy()
+        work["score_rank"] = work.groupby("date", observed=True)[
+            "prediction_score"
+        ].rank(method="average")
+        work["target_rank"] = work.groupby("date", observed=True)["target"].rank(
+            method="average"
+        )
+        correlations = {}
+        for date, group in work.groupby("date", observed=True, sort=True):
+            correlations[date] = group["score_rank"].corr(group["target_rank"])
+        return pd.Series(correlations, dtype=float).dropna()
 
     def _ranking_relevance(self, train: pd.DataFrame) -> pd.Series:
         """Convert continuous returns to integer relevance levels per date."""
@@ -304,7 +413,9 @@ class LightGBMFusion:
     def _cross_sectional_zscore(values: pd.Series) -> pd.Series:
         std = values.std(ddof=1)
         if not np.isfinite(std) or std <= 1e-12:
-            return pd.Series(0.0, index=values.index)
+            return pd.Series(
+                np.where(values.notna(), 0.0, np.nan), index=values.index
+            )
         return (values - values.mean()) / std
 
     @staticmethod

@@ -139,6 +139,61 @@ def test_fit_predict_outputs_only_configured_oos_dates(
     assert prediction["signal_date"].max() == daily_prices["date"].max()
     assert prediction["signal_date"].nunique() == 40
     assert (tmp_path / "prediction_score.csv").exists()
+    metrics = pd.read_csv(tmp_path / "model_metrics.csv")
+    assert metrics["prediction_varying_dates"].gt(0).all()
+    assert metrics["constant_prediction_dates"].eq(0).all()
+    assert metrics["active_factors_median"].gt(0).all()
+
+
+def test_safe_daily_spearman_skips_constant_dates_without_warning() -> None:
+    frame = pd.DataFrame({
+        "date": pd.to_datetime([
+            "2026-01-02", "2026-01-02", "2026-01-02",
+            "2026-01-05", "2026-01-05", "2026-01-05",
+        ]),
+        "prediction_score": [1.0, 2.0, 3.0, 1.0, 2.0, 3.0],
+        "target": [0.1, 0.2, 0.3, 0.0, 0.0, 0.0],
+    })
+
+    result = LightGBMFusion._safe_daily_spearman(frame)
+
+    assert result.index.tolist() == [pd.Timestamp("2026-01-02")]
+    assert np.isclose(result.iloc[0], 1.0)
+
+
+def test_window_diagnostics_distinguish_constant_target_and_prediction() -> None:
+    fusion = LightGBMFusion()
+    fusion.feature_names = ["factor_001"]
+    frame = pd.DataFrame({
+        "date": pd.to_datetime([
+            "2026-01-02", "2026-01-02", "2026-01-02",
+            "2026-01-05", "2026-01-05", "2026-01-05",
+        ]),
+        "factor_001": [-1.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        "prediction_score": [1.0, 2.0, 3.0, 1.0, 1.0, 1.0],
+        "target": [0.1, 0.2, 0.3, 0.0, 0.0, 0.0],
+    })
+
+    result = fusion._window_diagnostics(frame)
+
+    assert result["rank_ic_evaluable_dates"] == 1
+    assert result["constant_target_dates"] == 1
+    assert result["constant_prediction_dates"] == 1
+    assert result["zero_active_factor_dates"] == 1
+
+
+def test_cross_sectional_zscore_preserves_missing_values() -> None:
+    all_missing = pd.Series([np.nan, np.nan])
+    partly_missing_constant = pd.Series([1.0, 1.0, np.nan])
+
+    missing_result = LightGBMFusion._cross_sectional_zscore(all_missing)
+    constant_result = LightGBMFusion._cross_sectional_zscore(
+        partly_missing_constant
+    )
+
+    assert missing_result.isna().all()
+    assert constant_result.iloc[:2].eq(0.0).all()
+    assert pd.isna(constant_result.iloc[2])
 
 
 def test_saved_alpha_pool_executes_full_history_before_oos_slice(

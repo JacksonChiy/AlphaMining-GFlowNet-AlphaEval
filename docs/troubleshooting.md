@@ -8,6 +8,19 @@
 
 报错通常表示可用交易日不足以同时容纳 `min_train_days`、5 日 purge 和预测窗口。检查数据截止日期和有效样本数；快速验证可降低 `min_train_days`，正式实验应扩大训练期，不能取消 purge。
 
+## LightGBM 后期 `rank_ic=nan` 或 ConstantInputWarning
+
+不要把该警告直接理解为“未来标签尚未成熟”。它也可能表示样本外分钟因子在某个年度变成全空值或截面常数，导致 LightGBM 每天输出相同分数。先运行：
+
+```bash
+python scripts/audit_lightgbm_inputs.py \
+  --price results/minute_ppu_ddb_ram/daily_price.pkl \
+  --factors results/minute_ppu_ddb_ram/alpha_factor_matrix.pkl \
+  --evaluation results/minute_ppu_ddb_ram/alpha_eval_result.csv
+```
+
+重点看每年的 `active_factors_min`、`zero_active_factor_dates`、`target_varying_dates` 和 `last_mature_label_date`。`zero_active_factor_dates > 0` 时不得回测，应先重算对应年份的分钟因子块；只有目标尚未成熟而因子仍正常变化时，可以保留预测但不能计算该日期 RankIC。新版 LightGBM 会打印 `factor_audit` 和窗口级常数诊断，并拒绝输出整段截面常数预测。
+
 ## 已保存表达式无法导入或恢复
 
 确认仓库代码和 Colab 产物来自同一 commit，并从仓库根目录运行。旧环境若缺少新导出符号，先拉取对应分支并重启 Kernel，避免 Python 继续使用已缓存的旧模块。

@@ -49,6 +49,7 @@ def test_ppu_ddb_ram_notebook_configures_eager_disk_cache() -> None:
     assert "RUN_GFLOWNET_TRAINING" in code
     assert "src.alpha_eval.run_evaluation" in code
     assert "src.model.run_lightgbm" in code
+    assert "scripts/audit_lightgbm_inputs.py" in code
     assert "REBUILD_DAILY_PRICE_IF_MISSING" in code
     assert "scripts/export_ddb_daily.py" in code
     assert "outputs['daily_price']" in code
