@@ -54,8 +54,32 @@ def test_ppu_ddb_ram_notebook_configures_eager_disk_cache() -> None:
     assert "scripts/export_ddb_daily.py" in code
     assert "outputs['daily_price']" in code
     assert "alpha_factor_matrix.csv.gz" not in code  # Paths must come from YAML.
+    assert "RUN_INDEX_ALPHA_EVAL" in code
+    assert "RUN_INDEX_LIGHTGBM" in code
+    assert "src.alpha_eval.run_index_evaluation" in code
+    assert "src.index_enhancement.model_experiments" in code
+    assert "INDEX_BACKTEST_EXPERIMENT" in code
+    assert "benchmark_optimized" in code
+    assert "minute_index_backtest.yaml" in code
     assert "postprocess_manifest" in code
     assert "zipfile.ZipFile" in code
+
+    index_cell = next(
+        index for index, cell in enumerate(notebook["cells"])
+        if "INDEX_KEYS =" in "".join(cell.get("source", []))
+    )
+    global_lightgbm_cell = next(
+        index for index, cell in enumerate(notebook["cells"])
+        if "lightgbm_dir =" in "".join(cell.get("source", []))
+    )
+    package_cell = next(
+        index for index, cell in enumerate(notebook["cells"])
+        if any(
+            line.startswith("artifact_paths =")
+            for line in cell.get("source", [])
+        )
+    )
+    assert global_lightgbm_cell < index_cell < package_cell
 
 
 def test_ppu_ddb_ram_config_contains_postprocessing_pipeline() -> None:
