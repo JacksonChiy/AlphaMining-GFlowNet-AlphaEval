@@ -102,6 +102,53 @@ def test_lightgbm_uses_local_index_excess_labels(tmp_path) -> None:
     assert base.columns.tolist() == ["date", "code", "target"]
 
 
+def test_index_lightgbm_normalizes_ddb_codes_before_label_merge(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setitem(
+        sys.modules, "lightgbm", SimpleNamespace(LGBMRegressor=_DummyRegressor)
+    )
+    dates = pd.bdate_range("2024-01-02", periods=50)
+    label_rows = []
+    factor_rows = []
+    for date_index, date in enumerate(dates):
+        for code_index, (label_code, factor_code) in enumerate((
+            ("000001.XSHE", "000001.SZ"),
+            ("000002.XSHE", "000002.SZ"),
+        )):
+            label_rows.append({
+                "date": date,
+                "code": label_code,
+                "target_excess_return": -0.01 if code_index == 0 else 0.01,
+            })
+            factor_rows.append({
+                "date": date,
+                "code": factor_code,
+                "factor_001": float(date_index + code_index),
+            })
+    label_path = tmp_path / "labels.pkl"
+    pd.DataFrame(label_rows).to_pickle(label_path)
+    fusion = LightGBMFusion(LightGBMConfig(
+        horizon=5,
+        train_window_days=30,
+        min_train_days=20,
+        refit_interval_days=10,
+        prediction_start_date=str(dates[30].date()),
+        label_path=str(label_path),
+        target_type="excess_return",
+    ))
+
+    prediction = fusion.fit_predict(
+        pd.DataFrame(),
+        pd.DataFrame(factor_rows),
+        ["factor_001"],
+        output_dir=tmp_path / "model",
+    )
+
+    assert not prediction.empty
+    assert prediction["code"].str.endswith(".XSHE").all()
+
+
 class _DummyRegressor:
     def __init__(self, **kwargs) -> None:
         self.feature_importances_ = np.array([1.0])

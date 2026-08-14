@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 import yaml
 
+from src.index_enhancement.universe import normalize_order_book_id_series
 from src.model import LightGBMConfig, LightGBMFusion
 from src.utils import load_config
 
@@ -32,6 +33,18 @@ def run_experiments(
         raise ValueError(f"Unknown experiments: {unknown}")
     price = pd.read_pickle(price_path)
     factors = pd.read_pickle(factor_path)
+    for frame, label in ((price, "price"), (factors, "factors")):
+        frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
+        frame["code"] = normalize_order_book_id_series(frame["code"])
+        if frame.duplicated(["date", "code"]).any():
+            raise ValueError(f"{label} contains duplicate keys after code normalization")
+    print(
+        "[P2] normalized_inputs "
+        f"price={price['date'].min().date()}..{price['date'].max().date()} "
+        f"factors={factors['date'].min().date()}..{factors['date'].max().date()} "
+        f"factor_code_example={factors['code'].iloc[0]}",
+        flush=True,
+    )
     global_evaluation = pd.read_csv(global_evaluation_path)
     for index_key in indexes:
         index_evaluation = Path(alpha_eval_root) / index_key / "alpha_eval_result.csv"
@@ -43,6 +56,7 @@ def run_experiments(
             values = dict(config["lightgbm"])
             values.update(matrix["experiments"][experiment])
             values["label_path"] = str(Path(label_root) / index_key / "labels.pkl")
+            values["codes_are_normalized"] = True
             output = Path(output_root) / experiment / index_key
             print(
                 f"[P2] index={index_key} experiment={experiment} factors={len(selected)}",

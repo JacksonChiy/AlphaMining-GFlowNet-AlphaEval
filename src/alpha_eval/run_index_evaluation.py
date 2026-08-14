@@ -9,7 +9,19 @@ from pathlib import Path
 import pandas as pd
 
 from src.alpha_eval import AlphaEval, AlphaEvalConfig
+from src.index_enhancement.universe import normalize_order_book_id_series
 from src.utils import load_config, slice_date_range
+
+
+def _normalize_index_keys(frame: pd.DataFrame, label: str) -> pd.DataFrame:
+    result = frame.copy()
+    result["date"] = pd.to_datetime(result["date"], errors="coerce").dt.normalize()
+    result["code"] = normalize_order_book_id_series(result["code"])
+    if result[["date", "code"]].isna().any().any():
+        raise ValueError(f"{label} contains invalid date/code keys")
+    if result.duplicated(["date", "code"]).any():
+        raise ValueError(f"{label} contains duplicate keys after code normalization")
+    return result
 
 
 def run_index_alpha_eval(
@@ -27,6 +39,8 @@ def run_index_alpha_eval(
     values["horizon"] = int(config["dataset"]["horizon"])
     price = pd.read_pickle(price_path)
     factors = pd.read_pickle(factor_path)
+    price = _normalize_index_keys(price, "指数AlphaEval行情")
+    factors = _normalize_index_keys(factors, "指数AlphaEval因子")
     metadata = pd.read_csv(metadata_path)
     start = config["dataset"].get("mining_start_date")
     end = config["dataset"].get("mining_end_date")
@@ -36,12 +50,17 @@ def run_index_alpha_eval(
     manifest: dict[str, object] = {"target_column": target_column, "indexes": {}}
     for index_key in indexes:
         label_path = Path(label_root) / index_key / "labels.pkl"
-        labels = pd.read_pickle(label_path)
+        labels = _normalize_index_keys(pd.read_pickle(label_path), f"{index_key}标签")
         labels = slice_date_range(labels, start, end, label=f"{index_key}标签")
         valid_labels = labels.dropna(subset=[target_column])
         index_factors = factors.merge(
             valid_labels[["date", "code"]], on=["date", "code"], how="inner", validate="one_to_one"
         )
+        if index_factors.empty:
+            raise ValueError(
+                f"{index_key} labels and factors have no date/code overlap after "
+                "normalization; audit their date ranges and code formats"
+            )
         output_dir = Path(output_root) / index_key
         output_dir.mkdir(parents=True, exist_ok=True)
         output = output_dir / "alpha_eval_result.csv"

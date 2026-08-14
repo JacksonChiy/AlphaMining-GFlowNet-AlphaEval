@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from src.gflownet.reward import make_forward_return
+from src.index_enhancement.universe import normalize_order_book_id_series
 
 
 @dataclass
@@ -29,6 +30,7 @@ class LightGBMConfig:
     top_weight_quantile: float = 0.20
     top_weight_multiplier: float = 1.0
     save_all_models: bool = True
+    codes_are_normalized: bool = False
 
 
 class LightGBMFusion:
@@ -62,9 +64,38 @@ class LightGBMFusion:
         if missing:
             raise ValueError(f"Selected factors missing from matrix: {missing}")
         base = self._build_training_base(price)
+        factor_panel = factors[keys + self.feature_names].copy()
+        if self.config.label_path:
+            factor_panel["date"] = pd.to_datetime(
+                factor_panel["date"], errors="coerce"
+            ).dt.normalize()
+            if not self.config.codes_are_normalized:
+                factor_panel["code"] = normalize_order_book_id_series(
+                    factor_panel["code"]
+                )
+                if factor_panel.duplicated(keys).any():
+                    raise ValueError(
+                        "Factor matrix contains duplicate keys after code normalization"
+                    )
         data = base.merge(
-            factors[keys + self.feature_names], on=keys, how="inner", validate="one_to_one"
+            factor_panel, on=keys, how="inner", validate="one_to_one"
         ).sort_values(keys, kind="stable")
+        base_dates = pd.to_datetime(base["date"], errors="coerce")
+        factor_dates = pd.to_datetime(factor_panel["date"], errors="coerce")
+        merged_range = (
+            f"{pd.Timestamp(data['date'].min()).date()}.."
+            f"{pd.Timestamp(data['date'].max()).date()}"
+            if not data.empty else "empty"
+        )
+        print(
+            "[LightGBM] input_overlap "
+            f"labels={base_dates.min().date()}..{base_dates.max().date()} "
+            f"factors={factor_dates.min().date()}..{factor_dates.max().date()} "
+            f"merged={merged_range} merged_rows={len(data):,} "
+            f"label_code_example={base['code'].iloc[0] if len(base) else 'N/A'} "
+            f"factor_code_example={factor_panel['code'].iloc[0] if len(factor_panel) else 'N/A'}",
+            flush=True,
+        )
         dates = np.array(sorted(data["date"].unique()))
         predictions: list[pd.DataFrame] = []
         output_dir = Path(output_dir)
@@ -303,7 +334,20 @@ class LightGBMFusion:
         """Fail before model fitting when an OOS factor block cannot rank stocks."""
         prediction = data.loc[data["date"].isin(prediction_dates)]
         if prediction.empty:
-            raise ValueError("Prediction factor data is empty")
+            available = (
+                f"{pd.Timestamp(data['date'].min()).date()}.."
+                f"{pd.Timestamp(data['date'].max()).date()}"
+                if not data.empty else "empty"
+            )
+            requested = (
+                f"{self.config.prediction_start_date or 'auto'}.."
+                f"{self.config.prediction_end_date or 'latest'}"
+            )
+            raise ValueError(
+                "Prediction factor data is empty after label/factor merge. "
+                f"merged_date_range={available}, requested_prediction={requested}. "
+                "Check label coverage, factor coverage, and date/code normalization."
+            )
         feature_std = prediction.groupby("date", observed=True)[
             self.feature_names
         ].std(ddof=0)
@@ -399,6 +443,7 @@ class LightGBMFusion:
             raise ValueError(f"Index label file missing columns: {sorted(missing)}")
         base = labels[[*keys, target_column]].rename(columns={target_column: "target"})
         base["date"] = pd.to_datetime(base["date"]).dt.normalize()
+        base["code"] = normalize_order_book_id_series(base["code"])
         if base.duplicated(keys).any():
             raise ValueError("Index label file contains duplicate date/code rows")
         print(

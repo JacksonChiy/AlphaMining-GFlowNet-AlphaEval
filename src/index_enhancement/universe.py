@@ -37,6 +37,24 @@ def normalize_order_book_id(value: Any) -> str:
     return value
 
 
+def normalize_order_book_id_series(values: pd.Series) -> pd.Series:
+    """Vectorized canonicalization for large factor/label panels."""
+    result = values.astype(str).str.strip().str.upper()
+    if result.str.endswith((".XSHG", ".XSHE", ".XBSE")).all():
+        return result
+    result = result.str.replace(r"\.SH$", ".XSHG", regex=True)
+    result = result.str.replace(r"\.SZ$", ".XSHE", regex=True)
+    result = result.str.replace(r"\.BJ$", ".XBSE", regex=True)
+    raw = result.str.fullmatch(r"\d{6}")
+    shanghai = raw & result.str.startswith(("5", "6", "9"))
+    beijing = raw & result.str.startswith(("4", "8"))
+    shenzhen = raw & ~(shanghai | beijing)
+    result = result.mask(shanghai, result + ".XSHG")
+    result = result.mask(beijing, result + ".XBSE")
+    result = result.mask(shenzhen, result + ".XSHE")
+    return result
+
+
 def normalize_component_history(
     index_key: str,
     index_code: str,

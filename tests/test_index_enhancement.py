@@ -12,6 +12,7 @@ from src.index_enhancement.universe import (
     fetch_and_save_components,
     load_components,
     normalize_component_history,
+    normalize_order_book_id_series,
 )
 
 
@@ -40,6 +41,20 @@ def test_normalize_component_history_creates_point_in_time_long_table() -> None:
         "600000.XSHG",
         "000002.XSHE",
     }
+
+
+def test_normalize_order_book_id_series_handles_ddb_and_rqdata_formats() -> None:
+    values = pd.Series([
+        "600000.SH", "000001.SZ", "430001.BJ",
+        "600001", "000002.XSHE",
+    ])
+
+    result = normalize_order_book_id_series(values)
+
+    assert result.tolist() == [
+        "600000.XSHG", "000001.XSHE", "430001.XBSE",
+        "600001.XSHG", "000002.XSHE",
+    ]
 
 
 def test_component_download_is_persisted_once_and_reused(tmp_path) -> None:
