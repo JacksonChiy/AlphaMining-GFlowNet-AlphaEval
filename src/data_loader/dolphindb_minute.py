@@ -460,6 +460,8 @@ class DolphinDBMinuteLoader:
         self,
         start_date: str | pd.Timestamp | None = None,
         end_date: str | pd.Timestamp | None = None,
+        *,
+        time_filter_sql: str | None = None,
     ):
         """Yield normalized DDB chunks directly from memory without local minute files."""
         trade_dates = self.load_trade_dates(start_date, end_date)
@@ -469,7 +471,9 @@ class DolphinDBMinuteLoader:
             for index in range(0, len(trade_dates), days)
         ]
         for chunk_index, (start, end) in enumerate(chunks, start=1):
-            raw = self.session.run(self.build_data_sql(start, end))
+            raw = self.session.run(self.build_data_sql(
+                start, end, time_filter_sql=time_filter_sql
+            ))
             frame = normalize_dolphindb_minutes(pd.DataFrame(raw))
             print(
                 f"[DDBStream] chunk={chunk_index:03d}/{len(chunks):03d} "
@@ -484,12 +488,16 @@ class DolphinDBMinuteLoader:
         nodes,
         start: pd.Timestamp,
         end: pd.Timestamp,
+        *,
+        time_filter_sql: str | None = None,
     ) -> dict[str, pd.Series]:
         """Execute supported minute blocks in DDB and return daily indexed series only."""
         from src.expression.dolphindb_minute import DolphinDBMinuteCompiler
 
         compiler = DolphinDBMinuteCompiler(self.table_expression)
-        compiled = compiler.compile(nodes, start, end)
+        compiled = compiler.compile(
+            nodes, start, end, time_filter_sql=time_filter_sql
+        )
         frame = pd.DataFrame(self.session.run(compiled.script))
         if frame.empty:
             return {key: pd.Series(dtype=float) for key in compiled.aliases}
@@ -517,6 +525,8 @@ class DolphinDBMinuteLoader:
         nodes,
         start_date: str | pd.Timestamp | None = None,
         end_date: str | pd.Timestamp | None = None,
+        *,
+        time_filter_sql: str | None = None,
     ):
         """Push a block batch to DDB one trade-date chunk at a time."""
         trade_dates = self.load_trade_dates(start_date, end_date)
@@ -526,7 +536,9 @@ class DolphinDBMinuteLoader:
             for index in range(0, len(trade_dates), days)
         ]
         for chunk_index, (start, end) in enumerate(chunks, start=1):
-            values = self.execute_minute_blocks(nodes, start, end)
+            values = self.execute_minute_blocks(
+                nodes, start, end, time_filter_sql=time_filter_sql
+            )
             rows = max((len(value) for value in values.values()), default=0)
             print(
                 f"[DDBPushdown] chunk={chunk_index:03d}/{len(chunks):03d} "

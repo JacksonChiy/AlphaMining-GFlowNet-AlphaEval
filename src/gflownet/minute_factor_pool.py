@@ -176,6 +176,7 @@ def save_minute_alpha_pool_from_dolphindb_stream(
     metadata_path: str | Path = "results/minute_cpu_ddb/alpha_pool.csv",
     matrix_path: str | Path = "results/minute_cpu_ddb/alpha_factor_matrix.csv.gz",
     min_coverage: float = 0.80,
+    time_filter_sql: str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Compute selected report factors in one DDB scan; no raw minute file is written."""
     eligible = [
@@ -206,7 +207,12 @@ def save_minute_alpha_pool_from_dolphindb_stream(
     )
     if supported:
         try:
-            for _, _, computed in loader.iter_minute_blocks(supported, start_date, end_date):
+            for _, _, computed in loader.iter_minute_blocks(
+                supported,
+                start_date,
+                end_date,
+                time_filter_sql=time_filter_sql,
+            ):
                 for key, values in computed.items():
                     block_parts[key].append(values)
         except Exception as error:
@@ -223,7 +229,9 @@ def save_minute_alpha_pool_from_dolphindb_stream(
     chunks = 0
     if fallback:
         for chunks, (_, _, minute) in enumerate(
-            loader.iter_frames(start_date, end_date), start=1
+            loader.iter_frames(
+                start_date, end_date, time_filter_sql=time_filter_sql
+            ), start=1
         ):
             computed = executor_expression.execute_blocks(fallback, minute)
             for key, values in computed.items():

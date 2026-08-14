@@ -21,6 +21,48 @@ python scripts/audit_lightgbm_inputs.py \
 
 重点看每年的 `active_factors_min`、`zero_active_factor_dates`、`target_varying_dates` 和 `last_mature_label_date`。`zero_active_factor_dates > 0` 时不得回测，应先重算对应年份的分钟因子块；只有目标尚未成熟而因子仍正常变化时，可以保留预测但不能计算该日期 RankIC。新版 LightGBM 会打印 `factor_audit` 和窗口级常数诊断，并拒绝输出整段截面常数预测。
 
+如果只有某一段样本外因子全空（例如 2026 年），不需要重新训练 GFlowNet。保留原来的
+`alpha_pool.csv`，直接从 DolphinDB 重算该区间。首次运行先生成并验证修复副本，不覆盖
+原文件：
+
+```bash
+python scripts/repair_ppu_oos_factors.py \
+  --config configs/minute/ppu_ddb_ram.yaml \
+  --start-date 2026-01-01 \
+  --end-date 2026-07-31
+```
+
+脚本自动向前加载 60 个交易日，使日频时序算子有足够预热数据，并沿用 PPU 的 241 根
+分钟网格。验证通过后，使用 `--promote-existing` 发布已经生成的修复副本，不会再次
+查询 DolphinDB。程序会先备份原矩阵，再替换 `alpha_factor_matrix.pkl` 和
+`alpha_factor_matrix.csv.gz`。随后重新运行输入审计和 LightGBM：
+
+```bash
+python scripts/repair_ppu_oos_factors.py \
+  --config configs/minute/ppu_ddb_ram.yaml \
+  --start-date 2026-01-01 \
+  --end-date 2026-07-31 \
+  --promote-existing
+
+python scripts/audit_lightgbm_inputs.py \
+  --price results/minute_ppu_ddb_ram/daily_price.pkl \
+  --factors results/minute_ppu_ddb_ram/alpha_factor_matrix.pkl \
+  --evaluation results/minute_ppu_ddb_ram/alpha_eval_result.csv \
+  --horizon 5 \
+  --output results/minute_ppu_ddb_ram/lightgbm/input_audit.csv
+
+python -m src.model.run_lightgbm \
+  --config configs/minute/ppu_ddb_ram.yaml \
+  --price results/minute_ppu_ddb_ram/daily_price.pkl \
+  --factors results/minute_ppu_ddb_ram/alpha_factor_matrix.pkl \
+  --evaluation results/minute_ppu_ddb_ram/alpha_eval_result.csv \
+  --output-dir results/minute_ppu_ddb_ram/lightgbm
+```
+
+修复后的审计必须满足：2026 年 `factor_finite_ratio > 0`、
+`active_factors_min > 0`、`zero_active_factor_dates = 0`。其中任意一项不满足都不要进入
+回测。
+
 ## 已保存表达式无法导入或恢复
 
 确认仓库代码和 Colab 产物来自同一 commit，并从仓库根目录运行。旧环境若缺少新导出符号，先拉取对应分支并重启 Kernel，避免 Python 继续使用已缓存的旧模块。

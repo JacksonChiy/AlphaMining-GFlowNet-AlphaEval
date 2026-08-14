@@ -309,6 +309,18 @@ def test_ddb_compiler_pushes_supported_blocks_and_marks_complex_fallback() -> No
     assert compiler.supports(unsupported) is False
 
 
+def test_ddb_compiler_applies_configured_minute_filter() -> None:
+    compiler = DolphinDBMinuteCompiler('loadTable("dfs://minuteBars", "minuteKline")')
+    node = minute_expression_from_tokens(["r_mean", "close"]).block_nodes()[0]
+    compiled = compiler.compile(
+        [node],
+        pd.Timestamp("2024-01-02"),
+        pd.Timestamp("2024-01-02"),
+        time_filter_sql="minute(time) = 09:25m",
+    )
+    assert "date <= 2024.01.02, (minute(time) = 09:25m)" in compiled.script
+
+
 def test_streaming_factor_pool_writes_daily_csv_without_minute_pickle(tmp_path) -> None:
     session = FakeDolphinDBSession(_source_minutes())
     loader = DolphinDBMinuteLoader(_config(tmp_path), session)

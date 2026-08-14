@@ -39,7 +39,14 @@ class DolphinDBMinuteCompiler:
         except DolphinDBPushdownUnsupported:
             return False
 
-    def compile(self, nodes: Sequence[MinuteNode], start: pd.Timestamp, end: pd.Timestamp) -> CompiledMinuteBlocks:
+    def compile(
+        self,
+        nodes: Sequence[MinuteNode],
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+        *,
+        time_filter_sql: str | None = None,
+    ) -> CompiledMinuteBlocks:
         aliases: dict[str, str] = {}
         vector_columns: list[str] = []
         reductions: list[str] = []
@@ -58,10 +65,11 @@ class DolphinDBMinuteCompiler:
             raise ValueError("At least one minute block is required for DolphinDB pushdown")
         columns = "date, sym, time, open, high, low, close, volume, amount, tradeCount"
         start_literal, end_literal = start.strftime("%Y.%m.%d"), end.strftime("%Y.%m.%d")
+        time_filter = f", ({time_filter_sql})" if time_filter_sql else ""
         script = (
             "// ALPHAMINING_MINUTE_PUSHDOWN_V1\n"
             f"am_source = select {columns} from {self.table_expression} "
-            f"where date >= {start_literal}, date <= {end_literal} "
+            f"where date >= {start_literal}, date <= {end_literal}{time_filter} "
             "order by date, sym, time;\n"
             "am_vectors = select date, sym, time, " + ", ".join(vector_columns) +
             " from am_source context by date, sym csort time;\n"
